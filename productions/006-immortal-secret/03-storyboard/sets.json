@@ -1,0 +1,194 @@
+{
+  "sets": [
+    {
+      "id": "jungle-cliff-1961",
+      "master": "02-assets/scenes/jungle-cliff-1961/master.jpg",
+      "blocking": "02-assets/scenes/jungle-cliff-1961/blocking.jpg",
+      "axis": "石壁深处",
+      "marks": [
+        {
+          "id": "chongde",
+          "x": 0.55,
+          "y": 0.62,
+          "note": "凿眼"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    },
+    {
+      "id": "university-office",
+      "master": "02-assets/scenes/university-office/master.jpg",
+      "blocking": "02-assets/scenes/university-office/blocking.jpg",
+      "axis": "书桌",
+      "marks": [
+        {
+          "id": "lin",
+          "x": 0.42,
+          "y": 0.55,
+          "note": "桌后"
+        },
+        {
+          "id": "dean",
+          "x": 0.62,
+          "y": 0.62,
+          "note": "访客"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    },
+    {
+      "id": "village-entrance",
+      "master": "02-assets/scenes/village-entrance/master.jpg",
+      "blocking": "02-assets/scenes/village-entrance/blocking.jpg",
+      "axis": "村口",
+      "marks": [
+        {
+          "id": "lin",
+          "x": 0.38,
+          "y": 0.62,
+          "note": "路左"
+        },
+        {
+          "id": "sara",
+          "x": 0.62,
+          "y": 0.68,
+          "note": "水台"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    },
+    {
+      "id": "jungle-ridge",
+      "master": "02-assets/scenes/jungle-ridge/master.jpg",
+      "blocking": "02-assets/scenes/jungle-ridge/blocking.jpg",
+      "axis": "山脊",
+      "marks": [
+        {
+          "id": "sara",
+          "x": 0.48,
+          "y": 0.55,
+          "note": "前"
+        },
+        {
+          "id": "lin",
+          "x": 0.38,
+          "y": 0.64,
+          "note": "后"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    },
+    {
+      "id": "ruin-gate",
+      "master": "02-assets/scenes/ruin-gate/master.jpg",
+      "blocking": "02-assets/scenes/ruin-gate/blocking.jpg",
+      "axis": "石门",
+      "marks": [
+        {
+          "id": "lin",
+          "x": 0.46,
+          "y": 0.6,
+          "note": "门中"
+        },
+        {
+          "id": "sara",
+          "x": 0.68,
+          "y": 0.66,
+          "note": "门外"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    },
+    {
+      "id": "ruin-antechamber",
+      "master": "02-assets/scenes/ruin-antechamber/master.jpg",
+      "blocking": "02-assets/scenes/ruin-antechamber/blocking.jpg",
+      "axis": "前厅",
+      "marks": [
+        {
+          "id": "lin",
+          "x": 0.44,
+          "y": 0.58,
+          "note": "墙"
+        },
+        {
+          "id": "sara",
+          "x": 0.72,
+          "y": 0.7,
+          "note": "门槛"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    },
+    {
+      "id": "baset-apartment",
+      "master": "02-assets/scenes/baset-apartment/master.jpg",
+      "blocking": "02-assets/scenes/baset-apartment/blocking.jpg",
+      "axis": "书桌",
+      "marks": [
+        {
+          "id": "baset",
+          "x": 0.52,
+          "y": 0.6,
+          "note": "独坐"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    },
+    {
+      "id": "bangkok-office",
+      "master": "02-assets/scenes/bangkok-office/master.jpg",
+      "blocking": "02-assets/scenes/bangkok-office/blocking.jpg",
+      "axis": "地图墙",
+      "marks": [
+        {
+          "id": "somchai",
+          "x": 0.48,
+          "y": 0.58,
+          "note": "桌后"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.94,
+          "note": "中轴"
+        }
+      ]
+    }
+  ]
+}

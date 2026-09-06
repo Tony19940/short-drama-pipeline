@@ -1,0 +1,9 @@
+{
+  "status": "blocked",
+  "error_code": "InputImageSensitiveContentDetected.PrivacyInformation",
+  "error_message": "The request failed because the input image 'content[1]' may contain real person.",
+  "first_frame": "04-frames/SH001.jpg",
+  "note": "Official restyle first frame still fails Seedance privacy. Yesterday's more-illustrated probe .pipeline/seedance-probe/ai-stylized-sh001-input.jpg passed (cgt-20260904163106-gz4zf). Photoreal probe ai-real-sh001-input.jpg failed the same code. Do not retry the same SH001.jpg.",
+  "dest": "/Users/tony/vibe coding/short-drama-pipeline/productions/009-siem-reap/05-shots/SH001.mp4",
+  "updated_at": 1788542600
+}

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "storyboard",
+  "id": "暹粒-第1集分镜修订-1-01-1-19-可拍可生图可对时长",
+  "status": "complete",
+  "stage": "commit",
+  "artifacts": [
+    "dramas/暹粒/暹粒-第1集分镜修订-1-01-1-19-可拍可生图可对时长/storyboard-spec.md",
+    "dramas/暹粒/暹粒-第1集分镜修订-1-01-1-19-可拍可生图可对时长/storyboard.md",
+    "dramas/暹粒/暹粒-第1集分镜修订-1-01-1-19-可拍可生图可对时长/image-prompts.md",
+    "dramas/暹粒/暹粒-第1集分镜修订-1-01-1-19-可拍可生图可对时长/assets.json"
+  ],
+  "observations": [],
+  "updatedAt": "2026-09-03T03:41:59.932Z"
+}

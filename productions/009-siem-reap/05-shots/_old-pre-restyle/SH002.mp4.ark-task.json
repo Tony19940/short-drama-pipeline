@@ -1,0 +1,9 @@
+{
+  "task_id": "cgt-20260904144857-fkvbw",
+  "status": "succeeded",
+  "usage": {
+    "completion_tokens": 40594,
+    "total_tokens": 40594
+  },
+  "dest": "/Users/tony/vibe coding/short-drama-pipeline/productions/009-siem-reap/05-shots/SH002.mp4"
+}

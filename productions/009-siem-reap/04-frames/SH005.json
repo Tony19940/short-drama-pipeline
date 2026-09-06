@@ -1,0 +1,11 @@
+{
+  "shot": "SH005",
+  "slot": "first",
+  "dest": "04-frames/SH005.jpg",
+  "parent": "02-assets/scenes/ancient-shoal/master.jpg",
+  "src": "exec-983ecaf8-e2fc-4f2a-bd3d-90ea3e617c04.png",
+  "src_sha256": "e8018730d096c6e2750d763d807cd87e3ae1a7416e70dbd87afefb88eec4d527",
+  "placed_at": 1788513875,
+  "previous": "04-frames/SH005-v1.jpg",
+  "tool": "codex-imagegen"
+}

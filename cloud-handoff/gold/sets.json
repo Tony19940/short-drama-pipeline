@@ -1,0 +1,34 @@
+{
+  "episode": "ep01",
+  "note": "一场一条轴。light 是这一场的光位锁，本场每一镜的 look 都必须复述它 —— 光位不锁在场上，相邻镜就会变色温，这是 AI 味的头号来源之一。",
+  "sets": [
+    {
+      "id": "factory-floor",
+      "master": "02-assets/scenes/factory-floor/master.jpg",
+      "blocking": "02-assets/scenes/factory-floor/blocking.jpg",
+      "axis": "过道向车间深处，机位在近端，车缝在右",
+      "light": "头顶荧光冷白从上打，缝纫机工作灯暖黄从下打",
+      "marks": [
+        {"id": "sara",   "x": 0.62, "y": 0.70, "note": "前台车缝，哭、校服堆"},
+        {"id": "sophea", "x": 0.48, "y": 0.62, "note": "过道站她左边，挽袖"},
+        {"id": "piseth", "x": 0.28, "y": 0.48, "note": "从深处过来，瑕疵箱"},
+        {"id": "box",    "x": 0.50, "y": 0.82, "note": "砸在她脚边的箱"},
+        {"id": "camera", "x": 0.50, "y": 0.96, "note": "人眼高度，同一条轴"}
+      ]
+    },
+    {
+      "id": "factory-office",
+      "master": "02-assets/scenes/factory-office/master.jpg",
+      "blocking": "02-assets/scenes/factory-office/blocking.jpg",
+      "axis": "走廊向前门，玻璃在右，车间灯从玻璃里打出来",
+      "light": "走廊钠灯从上打，车间荧光从右侧玻璃透进来，玻璃上有雨痕",
+      "marks": [
+        {"id": "ros",    "x": 0.46, "y": 0.58, "note": "廊中，看玻璃，拐杖"},
+        {"id": "guard",  "x": 0.34, "y": 0.56, "note": "保镖后半步；资产未锁，见任务单 T2"},
+        {"id": "glass",  "x": 0.78, "y": 0.42, "note": "隔断，里是车缝灯"},
+        {"id": "sophea", "x": 0.84, "y": 0.52, "note": "玻璃里抬头"},
+        {"id": "camera", "x": 0.50, "y": 0.96, "note": "廊口向里，同一条轴"}
+      ]
+    }
+  ]
+}

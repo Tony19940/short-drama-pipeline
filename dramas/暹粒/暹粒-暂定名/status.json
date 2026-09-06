@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "kind": "script",
+  "id": "暹粒-暂定名",
+  "status": "complete",
+  "stage": "commit",
+  "artifacts": [
+    "dramas/暹粒/暹粒-暂定名/script-spec.md",
+    "dramas/暹粒/暹粒-暂定名/script.md"
+  ],
+  "observations": [],
+  "updatedAt": "2026-09-02T15:40:40.874Z"
+}

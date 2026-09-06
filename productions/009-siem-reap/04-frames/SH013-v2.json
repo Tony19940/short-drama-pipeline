@@ -1,0 +1,11 @@
+{
+  "shot": "SH013",
+  "slot": "first",
+  "dest": "04-frames/SH013.jpg",
+  "parent": "04-frames/SH012.jpg",
+  "src": "exec-04c55494-8b5f-4182-8403-3f4a3ed8c8ad.png",
+  "src_sha256": "bc67efb501c71d711376da44a151df24ce8f47cd6bf44bc643df7b5e1162682d",
+  "placed_at": 1788496146,
+  "previous": "04-frames/SH013-v1.jpg",
+  "tool": "codex-imagegen"
+}

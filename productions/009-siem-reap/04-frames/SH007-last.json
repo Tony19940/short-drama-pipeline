@@ -1,0 +1,11 @@
+{
+  "shot": "SH007",
+  "slot": "last",
+  "dest": "04-frames/SH007-last.jpg",
+  "parent": "04-frames/SH007.jpg",
+  "src": "exec-18f7def1-f001-49e3-8deb-cfa3d959f599.png",
+  "src_sha256": "cb2e23020d1413aa018a62da6a6191c34e66c0b66ed3b84e45626a9d255be28a",
+  "placed_at": 1788514247,
+  "previous": "04-frames/SH007-last-v1.jpg",
+  "tool": "codex-imagegen"
+}

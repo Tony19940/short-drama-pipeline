@@ -1,0 +1,56 @@
+{
+  "sets": [
+    {
+      "id": "factory-floor",
+      "master": "02-assets/scenes/factory-floor/master.jpg",
+      "blocking": "02-assets/scenes/factory-floor/blocking.jpg",
+      "axis": "Phnom Penh factory-floor, match LOOK.md, same marks as blocking, warm practical ",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "sophea",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "sophea"
+        },
+        {
+          "id": "sara",
+          "x": 0.46,
+          "y": 0.62,
+          "note": "sara"
+        }
+      ]
+    },
+    {
+      "id": "factory-office",
+      "master": "02-assets/scenes/factory-office/master.jpg",
+      "blocking": "02-assets/scenes/factory-office/blocking.jpg",
+      "axis": "Phnom Penh factory-office, match LOOK.md, same marks as blocking, warm practical",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "ros",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "ros"
+        },
+        {
+          "id": "bodyguard",
+          "x": 0.46,
+          "y": 0.62,
+          "note": "bodyguard"
+        }
+      ]
+    }
+  ]
+}

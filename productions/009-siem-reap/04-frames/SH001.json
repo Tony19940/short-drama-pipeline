@@ -1,0 +1,11 @@
+{
+  "shot": "SH001",
+  "slot": "first",
+  "dest": "04-frames/SH001.jpg",
+  "parent": "02-assets/scenes/modern-channel/master.jpg",
+  "src": "SH001.png",
+  "src_sha256": "ee82fc55067410da54b1a9755fb589dc12a663ce9c48586bc655c3a831977e81",
+  "placed_at": 1788628933,
+  "previous": "04-frames/SH001-v2.jpg",
+  "tool": "codex-imagegen"
+}

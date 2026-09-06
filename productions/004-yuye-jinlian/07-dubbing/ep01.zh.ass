@@ -1,0 +1,22 @@
+[Script Info]
+Title: ep01.zh
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,PingFang SC,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,96,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:06.00,Default,narrator,0,0,0,,金边夜里，金莲制衣厂还在赶工。厂妹索菲娅的同事萨拉，孩子发着高烧。
+Dialogue: 0,0:00:06.00,0:00:12.00,Default,sophea,0,0,0,,你去医院。这些校服，我替你做完。
+Dialogue: 0,0:00:12.00,0:00:24.00,Default,narrator,0,0,0,,线长皮萨最爱抓换工位。索菲娅把工号借给萨拉，只求别让她丢工。
+Dialogue: 0,0:00:24.00,0:00:32.00,Default,piseth,0,0,0,,谁允许你私自换工位？扣你三天工资，明天不用来了。
+Dialogue: 0,0:00:32.00,0:00:38.00,Default,sophea,0,0,0,,错在我，我认。孩子病了，不能等。
+Dialogue: 0,0:00:38.00,0:00:48.00,Default,narrator,0,0,0,,太祖母罗丝是金莲集团的老夫人。她今晚来看交期，不是来认孙女。
+Dialogue: 0,0:00:48.00,0:00:56.00,Default,ros,0,0,0,,这双眼睛……像极了阿莲。
+Dialogue: 0,0:00:56.00,0:01:04.00,Default,narrator,0,0,0,,索菲娅领口还挂着半枚莲花银铃。另一半，藏在维拉老宅。

@@ -1,0 +1,22 @@
+[Script Info]
+Title: ep01.km
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,PingFang SC,48,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,40,40,96,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:06.00,Default,narrator,0,0,0,,នៅភ្នំពេញពេលយប់ រោងចក្រគិនលៀននៅតែបន្តថែមម៉ោង។ សារ៉ាដែលជាមិត្តរួមការងាររបស់កូនកម្មការរោងចក្រសុភា កូនកំពុងតែក្ដៅខ្លួនខ្លាំង។
+Dialogue: 0,0:00:06.00,0:00:12.00,Default,sophea,0,0,0,,ទៅពេទ្យទៅ។ ឯកសណ្ឋានសាលាទាំងនេះ ខ្ញុំធ្វើជំនួសឱ្យចប់។
+Dialogue: 0,0:00:12.00,0:00:24.00,Default,narrator,0,0,0,,មេខ្សែពិសិដ្ឋ ចូលចិត្តតាមចាប់អ្នកប្តូរកន្លែងធ្វើការជាងគេបំផុត។ សុភាបានឱ្យកាតការងារទៅសារ៉ា ព្រោះតែមិនចង់ឱ្យនាងត្រូវបាត់បង់ការងារ។
+Dialogue: 0,0:00:24.00,0:00:32.00,Default,piseth,0,0,0,,អ្នកណាអនុញ្ញាតឱ្យឯងប្តូរកន្លែងធ្វើការតាមចិត្ត? កាត់ប្រាក់ខែឯងបីថ្ងៃ ថ្ងៃស្អែកមិនបាច់មកទៀតទេ!
+Dialogue: 0,0:00:32.00,0:00:38.00,Default,sophea,0,0,0,,កំហុសមកពីខ្ញុំ ខ្ញុំព្រមទទួល។ តែក្មេងឈឺ មិនអាចបង្អង់បានទេ។
+Dialogue: 0,0:00:38.00,0:00:48.00,Default,narrator,0,0,0,,យាយ រ៉ស់ គឺជាលោកស្រីធំនៃក្រុមហ៊ុនគិនលៀន។ យប់នេះគាត់មកពិនិត្យមើលកាលកំណត់ដឹកទំនិញ មិនមែនមកតាមរកចៅស្រីនោះឡើយ។
+Dialogue: 0,0:00:48.00,0:00:56.00,Default,ros,0,0,0,,កែវភ្នែកមួយគូនេះ... ដូចនារីបេះបិទ។
+Dialogue: 0,0:00:56.00,0:01:04.00,Default,narrator,0,0,0,,នៅត្រង់កអាវរបស់សុភា នៅតែមានពាក់កណ្ដឹងប្រាក់ផ្កាឈូកកន្លះចំហៀង។ ចំណែកពាក់កណ្តាលទៀត គឺលាក់ទុកនៅឯផ្ទះចាស់គ្រួសារវីរ៉ា។

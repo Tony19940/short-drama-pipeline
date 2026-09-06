@@ -1,0 +1,11 @@
+{
+  "shot": "SH017",
+  "slot": "first",
+  "dest": "04-frames/SH017.jpg",
+  "parent": "02-assets/scenes/granary/master.jpg",
+  "src": "exec-aa89054e-bef1-4c74-86db-995b03b6a8bb.png",
+  "src_sha256": "f874aab1122e03ea4adaa3e66d644742abfbf0eaad1fe9eb87f712efc596348a",
+  "placed_at": 1788539362,
+  "previous": "04-frames/SH017-v2.jpg",
+  "tool": "codex-imagegen"
+}

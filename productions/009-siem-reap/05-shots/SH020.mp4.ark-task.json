@@ -1,0 +1,10 @@
+{
+  "status": "blocked",
+  "idempotency_key": "/Users/tony/vibe coding/short-drama-pipeline/productions/009-siem-reap/05-shots/SH020.mp4",
+  "dest": "/Users/tony/vibe coding/short-drama-pipeline/productions/009-siem-reap/05-shots/SH020.mp4",
+  "updated_at": 1788543731,
+  "error_code": "InputImageSensitiveContentDetected.PrivacyInformation",
+  "error_message": "The request failed because the input image 'content[1]' may contain real person.",
+  "first_frame": "04-frames/SH020.jpg",
+  "note": "SH020 i2v blocked on first_frame (content[1]). Do not retry the same SH020.jpg."
+}

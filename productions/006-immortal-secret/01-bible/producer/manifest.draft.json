@@ -1,0 +1,29 @@
+{
+  "shot_count": 1,
+  "seconds": 6,
+  "characters": [
+    "lin",
+    "sara",
+    "baset",
+    "somchai",
+    "anu",
+    "chongde",
+    "chenmo",
+    "dean",
+    "yiey"
+  ],
+  "scenes": [
+    "jungle-cliff-1961",
+    "university-office",
+    "village-entrance",
+    "jungle-ridge",
+    "ruin-gate",
+    "ruin-antechamber",
+    "baset-apartment",
+    "bangkok-office"
+  ],
+  "tasks": [],
+  "task_count": 0,
+  "filmable": true,
+  "budget_note": "人物主图/脸/联络板先齐；三人以上复杂走位才考虑 Blender 白模。"
+}

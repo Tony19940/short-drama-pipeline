@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "kind": "storyboard",
+  "id": "暹粒",
+  "status": "complete",
+  "stage": "commit",
+  "artifacts": [
+    "dramas/暹粒/storyboard-spec.md",
+    "dramas/暹粒/storyboard.md",
+    "dramas/暹粒/image-prompts.md",
+    "dramas/暹粒/assets.json"
+  ],
+  "observations": [],
+  "updatedAt": "2026-09-02T16:38:54.286Z"
+}

@@ -1,0 +1,11 @@
+{
+  "status": "blocked",
+  "idempotency_key": "/Users/tony/vibe coding/short-drama-pipeline/productions/009-siem-reap/05-shots/SH003.mp4",
+  "dest": "/Users/tony/vibe coding/short-drama-pipeline/productions/009-siem-reap/05-shots/SH003.mp4",
+  "updated_at": 1788543392,
+  "error_code": "InputImageSensitiveContentDetected.PrivacyInformation",
+  "error_message": "The request failed because the input image 'content[2]' may contain real person.",
+  "first_frame": "04-frames/SH003.jpg",
+  "last_frame": "04-frames/SH003-last.jpg",
+  "note": "SH003 flf2v blocked on last_frame (content[2]). Do not retry the same SH003-last.jpg. First frame was not named in the Ark error."
+}

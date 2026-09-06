@@ -1,0 +1,68 @@
+{
+  "sets": [
+    {
+      "id": "angkor-causeway",
+      "master": "02-assets/scenes/angkor-causeway/master.jpg",
+      "blocking": "02-assets/scenes/angkor-causeway/blocking.jpg",
+      "axis": "left-bridge-right-gate",
+      "marks": [
+        {
+          "id": "dara",
+          "x": 0.42,
+          "y": 0.62,
+          "note": "bridge head"
+        },
+        {
+          "id": "monk",
+          "x": 0.38,
+          "y": 0.7,
+          "note": "in smoke"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "dusk"
+        },
+        {
+          "id": "reat",
+          "x": 0.62,
+          "y": 0.58,
+          "note": "wall guard"
+        },
+        {
+          "id": "teya",
+          "x": 0.72,
+          "y": 0.64,
+          "note": "west gate / oxcart"
+        }
+      ]
+    },
+    {
+      "id": "east-gallery",
+      "master": "02-assets/scenes/east-gallery/master.jpg",
+      "blocking": "02-assets/scenes/east-gallery/blocking.jpg",
+      "axis": "left-dara-right-wall",
+      "marks": [
+        {
+          "id": "dara",
+          "x": 0.45,
+          "y": 0.6,
+          "note": "seventh wall"
+        },
+        {
+          "id": "monk",
+          "x": 0.58,
+          "y": 0.62,
+          "note": "half step back"
+        },
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "night"
+        }
+      ]
+    }
+  ]
+}

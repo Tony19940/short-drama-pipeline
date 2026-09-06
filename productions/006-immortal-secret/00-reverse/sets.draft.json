@@ -1,0 +1,194 @@
+{
+  "sets": [
+    {
+      "id": "jungle-cliff-1961",
+      "master": "02-assets/scenes/jungle-cliff-1961/master.jpg",
+      "blocking": "02-assets/scenes/jungle-cliff-1961/blocking.jpg",
+      "axis": "Phnom Penh jungle-cliff-1961, match LOOK.md, same marks as blocking, warm practi",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "chongde",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "chongde"
+        }
+      ]
+    },
+    {
+      "id": "university-office",
+      "master": "02-assets/scenes/university-office/master.jpg",
+      "blocking": "02-assets/scenes/university-office/blocking.jpg",
+      "axis": "Phnom Penh university-office, match LOOK.md, same marks as blocking, warm practi",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "lin",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "lin"
+        },
+        {
+          "id": "dean",
+          "x": 0.46,
+          "y": 0.62,
+          "note": "dean"
+        }
+      ]
+    },
+    {
+      "id": "village-entrance",
+      "master": "02-assets/scenes/village-entrance/master.jpg",
+      "blocking": "02-assets/scenes/village-entrance/blocking.jpg",
+      "axis": "Phnom Penh village-entrance, match LOOK.md, same marks as blocking, warm practic",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "lin",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "lin"
+        },
+        {
+          "id": "sara",
+          "x": 0.46,
+          "y": 0.62,
+          "note": "sara"
+        }
+      ]
+    },
+    {
+      "id": "jungle-ridge",
+      "master": "02-assets/scenes/jungle-ridge/master.jpg",
+      "blocking": "02-assets/scenes/jungle-ridge/blocking.jpg",
+      "axis": "Phnom Penh jungle-ridge, match LOOK.md, same marks as blocking, warm practical l",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "lin",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "lin"
+        },
+        {
+          "id": "sara",
+          "x": 0.46,
+          "y": 0.62,
+          "note": "sara"
+        }
+      ]
+    },
+    {
+      "id": "ruin-gate",
+      "master": "02-assets/scenes/ruin-gate/master.jpg",
+      "blocking": "02-assets/scenes/ruin-gate/blocking.jpg",
+      "axis": "Phnom Penh ruin-gate, match LOOK.md, same marks as blocking, warm practical ligh",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "lin",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "lin"
+        },
+        {
+          "id": "sara",
+          "x": 0.46,
+          "y": 0.62,
+          "note": "sara"
+        }
+      ]
+    },
+    {
+      "id": "ruin-antechamber",
+      "master": "02-assets/scenes/ruin-antechamber/master.jpg",
+      "blocking": "02-assets/scenes/ruin-antechamber/blocking.jpg",
+      "axis": "Phnom Penh ruin-antechamber, match LOOK.md, same marks as blocking, warm practic",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "lin",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "lin"
+        },
+        {
+          "id": "sara",
+          "x": 0.46,
+          "y": 0.62,
+          "note": "sara"
+        }
+      ]
+    },
+    {
+      "id": "baset-apartment",
+      "master": "02-assets/scenes/baset-apartment/master.jpg",
+      "blocking": "02-assets/scenes/baset-apartment/blocking.jpg",
+      "axis": "Phnom Penh baset-apartment, match LOOK.md, same marks as blocking, warm practica",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "baset",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "baset"
+        }
+      ]
+    },
+    {
+      "id": "bangkok-office",
+      "master": "02-assets/scenes/bangkok-office/master.jpg",
+      "blocking": "02-assets/scenes/bangkok-office/blocking.jpg",
+      "axis": "Phnom Penh bangkok-office, match LOOK.md, same marks as blocking, warm practical",
+      "marks": [
+        {
+          "id": "camera",
+          "x": 0.5,
+          "y": 0.95,
+          "note": "与空镜同一轴"
+        },
+        {
+          "id": "somchai",
+          "x": 0.28,
+          "y": 0.62,
+          "note": "somchai"
+        }
+      ]
+    }
+  ]
+}

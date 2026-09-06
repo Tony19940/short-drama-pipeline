@@ -1,0 +1,101 @@
+{
+  "characters": {
+    "sophea": {
+      "name_zh": "索菲娅·萨恩",
+      "name_km": "សូភា សាន",
+      "role": "女主",
+      "age": 22,
+      "root_face": "92eebdb0-8af7-4cf5-978f-6bfd38ad5ef2",
+      "root_full": "92eebdb0-8af7-4cf5-978f-6bfd38ad5ef2",
+      "notes": "清纯甜美，浅蓝制衣厂工装+花logo，银铃，低马尾"
+    },
+    "sara": {
+      "name_zh": "萨拉",
+      "name_km": "សារ៉ា",
+      "role": "工友/好友",
+      "root": "1b382ab7-b631-4a85-9981-41583e449788"
+    },
+    "piseth": {
+      "name_zh": "皮萨",
+      "name_km": "ពិសិដ្ឋ",
+      "role": "主管/线长",
+      "root": "807b8451-2db5-4495-a8be-09a2dda60101"
+    },
+    "ros": {
+      "name_zh": "罗丝·维拉",
+      "name_km": "រ៉ូស វីរ៉ា",
+      "role": "老太太/老夫人",
+      "root": "bec2c8f3-2133-406b-a2c9-70cc4d7b8ef9"
+    },
+    "malis": {
+      "name_zh": "玛莉·森",
+      "name_km": "ម៉ាលីស សែន",
+      "role": "反派继母",
+      "root": "25ac88ca-cd3e-48e0-bcae-1fab687c46d4"
+    },
+    "nita": {
+      "name_zh": "妮塔·维拉",
+      "name_km": "នីតា វីរ៉ា",
+      "role": "女二",
+      "root": "8f620f30-b21d-47e0-b410-76c6b6cc7446"
+    },
+    "davi": {
+      "name_zh": "达维·基里",
+      "name_km": "ដាវី គីរី",
+      "role": "男主/法务",
+      "root": "3b2f96ac-4751-4beb-9ba9-8b39d54ff416"
+    },
+    "sokha": {
+      "name_zh": "维拉·索卡",
+      "name_km": "សុខា វីរ៉ា",
+      "role": "生父/董事长",
+      "root": "3edc5727-0161-42e3-8184-3fb5cbe9933a"
+    },
+    "neary": {
+      "name_zh": "阿莲（生母）",
+      "name_km": "នារី",
+      "role": "生母",
+      "root": "5ae40e33-a569-4417-88f5-fde6e5c6221c"
+    },
+    "som": {
+      "name_zh": "索姆（养母）",
+      "name_km": "សម",
+      "role": "养母",
+      "root": "9c1fa0c6-18be-4bec-9b3c-72be94d13d86"
+    },
+    "pov": {
+      "name_zh": "帕乌（养父）",
+      "name_km": "ពៅ",
+      "role": "养父",
+      "root": "c777ee51-020a-4c88-af50-34b26f2e62f3"
+    },
+    "chando": {
+      "name_zh": "钱多",
+      "name_km": "ចាន់ដូ",
+      "role": "关键证人",
+      "root": "cf0908e0-4b34-4a26-aec6-1d027f09ae8b"
+    },
+    "guard": {
+      "name_zh": "保镖",
+      "name_km": "អ្នកការពារ",
+      "role": "保镖",
+      "root": "c32835b1-4c76-4b2a-8681-02df08d4a2ac"
+    }
+  },
+  "scenes": {
+    "factory-floor": {
+      "master": "0a0d090a-287c-4537-bc78-9fa45a2e672d",
+      "blocking": "68881381-f563-48c3-a7e2-066d577b9019"
+    },
+    "factory-office": {
+      "master": "91fed708-69fa-45e9-9aca-3103e196f38f",
+      "blocking": "35c289a8-4b15-46e1-983f-132bcc712707"
+    },
+    "factory-gate": {
+      "master": "56748800-44d5-4b33-bc8a-789abd5526da"
+    },
+    "vira-house": {
+      "master": "374bdf31-77fe-4328-9471-fcd9eca526be"
+    }
+  }
+}

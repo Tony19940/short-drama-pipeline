@@ -1,0 +1,9 @@
+[
+  {"shot": "SH001", "file": "sea-loop.wav", "vol": 0.20, "loop": true, "until": "SH009"},
+  {"shot": "SH002", "file": "wood.wav", "vol": 0.38, "delay": 0.12},
+  {"shot": "SH005", "file": "wave-soft.wav", "vol": 0.48, "delay": 0.05},
+  {"shot": "SH007", "file": "splash.wav", "vol": 0.42, "delay": 0.08},
+  {"shot": "SH008", "file": "sip.wav", "vol": 0.40, "delay": 0.20},
+  {"shot": "SH009", "file": "chime-soft.wav", "vol": 0.26, "delay": 0.15},
+  {"shot": "SH010", "file": "steps.wav", "vol": 0.30, "delay": 0.10}
+]
