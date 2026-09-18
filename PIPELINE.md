@@ -48,12 +48,12 @@
 | 反推 | `00-reverse/` | 参考 mp4、切点、关键帧、转写。隐藏路径，不锁定、不出片 |
 | A | `01-bible/` | `ep01.md`、`confirm.md`、`blueprint.md`；勾完 `CULTURE.md` |
 | P | `01-bible/producer/` | `plan.md` + `manifest.json`。只列缺 master/face/sheet 的任务 |
-| B | `02-assets/` | 角色 master+face；双人有身高图；场景空镜 master |
+| B | `02-assets/` | 角色 master+face；双人有身高图；场景空镜 master（3/4 机位、一个锚点物、一套光逻辑）。锁 master 前 10 张压力测试 ≥9/10；每角色一句 `descriptor`（不写年龄），有台词的带 `voice_card`；`sets.json` 每场 `geo_zh` |
 | S | `03-storyboard/sets.json` + `blocking.jpg` | 每场有人站哪；内部检查，人锁导演 Agent |
 | C | `03-storyboard/` | `coverage.md` `beats.md` `shots.json`。`check_prod.py` 必须过 |
 | D/E | `04-frames/` `05-shots/` | 设计首帧 FL2VA；同机位续才吃 `{from}-last.jpg`；设计尾帧走 `end_frame`；Ref2VA 未安装就停 |
-| E+ | `07-dubbing/sfx/` `06-export/preview-*-vo.mp4` `07-dubbing/` | 先 `mix_episode_sfx.py` 按 `key_sfx` 混音效床，再 `mix_review_track.py` + 声音合同。无声切不能当审剧情 |
-| F | `06-export/ep01.mp4` `08-qc/` | 审片报告。脚本判过关；无视觉模型时 `inconclusive` |
+| E+ | `07-dubbing/sfx/` `06-export/preview-*-vo.mp4` `07-dubbing/` | 先 `mix_episode_sfx.py` 按 `key_sfx` 混音效床，再 `mix_review_track.py` + 声音合同。中文对白是 Seedance 原声（`speech_mode=seedance_native`），声音岗只清理对齐，原声缺 / H3 镜才重录。无声切不能当审剧情 |
+| F | `06-export/ep01.mp4` `08-qc/` | 审片报告。脚本判过关；无视觉模型时 `inconclusive`。高棉语配音 / 字幕在这一关（`DUBBING.md`） |
 
 未通过不进入下一关。Agent 只写 `*.draft.*`，人点「接受并锁定」才进正式文件。Gate A 讨论期间不生图。  
 硬规则 **R1–R14** 见 `QUALITY.md`。文化词典见 `CULTURE.md`。出片路由见 `VIDEO.md`。  
@@ -121,16 +121,17 @@ python3 scripts/mix_episode_sfx.py --prod productions/<slug> --dry-run
 4. **设计尾帧可选。** `end_frame` 指向一张人审过的静帧（`04-frames/SHxxx-end.jpg`）。生成后抽出的 `{id}-last.jpg` 只给下一镜同场续用，不能回填成这一镜的尾帧。
 5. **防换脸靠参考外挂。** `sheet.jpg` / `face.jpg` 走 Ref2VA 节点，挂在首帧外面，采样仍走 FL2VA。不许用参考图替代第 0 秒。
 6. ffmpeg concat 同分辨率同帧率。
-7. 不赌对白口型。角色参考图仍校验存在；CompShare 提交时丢掉参考图。
+7. 中文对白走 Seedance 原声唇同步：台词只在 `audio_block`（声线卡逐字 → 引号台词 + 语种 + 语气 → 只说这一句 → 不说话的人嘴闭着 → 环境声、无音乐、无字幕）；说话时的动作和表情在紧跟的【表演】句里。有词镜 `dialogue_delivery=on_camera`；写 `post` 的镜退成 `post_dub`（不出原声）。H3 / Hailuo 路线没有原声，对白后期叠。角色参考图仍校验存在；CompShare 提交时丢掉参考图。
+8. 首帧 = 动作起点状态（可已起手，禁结果）；motion 从 0.0s 就在动，只写肯定句，段首粘本场 `geo_layout`。
 8. 默认 Hailuo Fast 无声；`tier=h3` 每集不超过 3 镜。
 
 ### 旁白与声音
 
 1. 都市短剧：C2 就写 `line` / `caption` / `line_kind` / `speaker`。种类是口述、心里、旁白、出场简介、短信。出完画面立刻 `mix_review_track.py`。
 2. 神话集：整段一次 TTS，画面跟人声气口走。见 `productions/khmer-stories/SOUND.md`。
-3. 成片高棉语是 Gate F，中文工作轨是 Gate E+。两套都要，不能用工作轨冒充成片。
-4. 都市短剧走无声画面配音：先 `scripts/mix_episode_sfx.py` 混音效床，再 `scripts/dub_silent_episode.py` 贴对白。见 `DUBBING.md`。
-5. **R12** BGM 高棉流行或婚礼锣鼓。H3 人声不当配音。云端出的环境声也不当成品声。音效只落实锁定表 `key_sfx[]`。
+3. 成片高棉语是 Gate F，中文工作轨是 Gate E+。两套都要，不能用工作轨冒充成片。中文工作轨对白由 Seedance 原声唇同步（`speech_mode=seedance_native`），声音岗只降噪、统一音色、放进空间；Seedance 没有高棉语，高棉语只能配音 / 字幕。
+4. 都市短剧：先 `scripts/mix_episode_sfx.py` 混音效床，再 `scripts/dub_silent_episode.py` 贴高棉语对白。见 `DUBBING.md`。
+5. **R12** BGM 高棉流行或婚礼锣鼓。H3 人声不当配音。Seedance 原声对白核对等于原句后是中文工作轨成品声；即兴碎话、自带音乐不进成片，环境床仍只落实锁定表 `key_sfx[]`。
 6. **R1–R2** 人名不译。
 
 

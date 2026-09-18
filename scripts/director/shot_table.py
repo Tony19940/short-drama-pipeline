@@ -1076,6 +1076,11 @@ def validate_shot_table(
 
     errors.extend(orientation_errors(shots))
 
+    # Acting is behavior: feeling words in expression / business / muscle / change only warn.
+    from .acting import acting_warnings
+
+    warnings.extend(acting_warnings(shots))
+
     # Director layer: only when the table carries scene cards / visual grammar (or asks for it).
     from .direction import film_grade_checks, has_direction
 
@@ -1084,6 +1089,22 @@ def validate_shot_table(
         errors.extend(direction_errors)
         warnings.extend(direction_warnings)
     return errors, warnings
+
+
+def _table_speaks_natively(data: dict) -> bool:
+    """Declared `speech_mode` wins; otherwise the target model decides (Seedance 2.x can lip-sync, H3 cannot)."""
+    declared = _t(data.get("speech_mode"))
+    if declared:
+        return declared == "seedance_native"
+    model = _t(data.get("target_model"))
+    if not model:
+        return False
+    try:
+        from .video_profiles import get_profile
+
+        return bool(get_profile(model).get("native_dialogue_audio"))
+    except Exception:
+        return False
 
 
 def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
@@ -1138,7 +1159,8 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
         if not shot["dialogue_ref"]:
             shot["dialogue_delivery"] = "none"
         elif not _t(shot.get("dialogue_delivery")):
-            shot["dialogue_delivery"] = "post"
+            # Native speech table: the model speaks the line (on_camera). Otherwise the line is dubbed later.
+            shot["dialogue_delivery"] = "on_camera" if _table_speaks_natively(data) else "post"
         coverage = _t(shot.get("coverage_type"))
         coverage_alias = {"medium": "single", "ms": "single", "ws": "master", "wide_shot": "master", "cu": "close"}
         if coverage in coverage_alias:
@@ -1177,6 +1199,10 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
             shot.pop("emotion_level", None)
         if not _t(shot.get("action_ref")):
             shot["action_ref"] = _t(shot.get("one_action"))
+        if shot.get("acting") is not None:
+            from .acting import normalize_acting
+
+            shot["acting"] = normalize_acting(shot.get("acting"))
         state = normalize_state(shot.get("state"))
         if state is not None:
             for item in (state.get("characters") or {}).values():
@@ -1429,9 +1455,19 @@ def render_shot_table_md(
         lines.append(f"- **运动**：{move}" + (f"。{_t(shot.get('move_reason'))}" if _t(shot.get("move_reason")) else "。固定"))
         lines.append(f"- **调度**：左 {_t(shot.get('left')) or '—'} / 右 {_t(shot.get('right')) or '—'}；视线 {_t(shot.get('eyeline')) or '—'}")
         lines.append(f"- **光**：{light['day_night']}，{light['key_light_dir']}，{light['quality']}" + (f"，{light['color_mood']}" if light["color_mood"] else ""))
+        acting = shot.get("acting") if isinstance(shot.get("acting"), dict) else {}
+        if acting:
+            from .acting import acting_sentence, normalize_acting
+
+            played = "".join(acting_sentence(who, item) for who, item in normalize_acting(acting).items())
+            if played:
+                lines.append(f"- **表演**：{played}")
         dialogue = shot.get("dialogue_ref") or []
         if dialogue:
-            spoken = " / ".join(f"{_t(d.get('character'))}：{_t(d.get('line'))}" for d in dialogue)
+            spoken = " / ".join(
+                f"{_t(d.get('character'))}：{_t(d.get('line'))}" + (f"（{_t(d.get('manner'))}）" if _t(d.get("manner")) else "")
+                for d in dialogue
+            )
             lines.append(f"- **对白**：{spoken}（{_t(shot.get('dialogue_delivery')) or 'post'}）")
         if shot.get("key_sfx"):
             lines.append(f"- **声**：{'、'.join(_t(s) for s in shot.get('key_sfx') or [])}")

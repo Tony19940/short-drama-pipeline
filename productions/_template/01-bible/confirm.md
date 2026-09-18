@@ -7,4 +7,4 @@
 | 画风 | |
 | 画幅 | 16:9 |
 | 旁白方案 | 工作轨： / 成片轨： |
-| 对白 | 不赌口型 |
+| 对白 | 中文工作轨 Seedance 原声唇同步（`speech_mode=seedance_native`）/ 高棉语 Gate F 配音 + 字幕 |

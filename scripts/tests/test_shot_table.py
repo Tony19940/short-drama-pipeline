@@ -758,14 +758,14 @@ class ShotState(unittest.TestCase):
         # Prompts carry the note.
         first = compile_keyframe_prompt_zh({}, wide)
         self.assertIn("连戏必须照做：反剪麻绳仍在。", first)
-        self.assertIn("画动作尚未发生的那一格", first)
+        self.assertIn("画动作起点的那一格：可以已经起手，结果还没发生", first)
         self.assertNotIn("画面：暹罗前队踏上浅滩人仰马翻", first)
-        self.assertIn("连戏不变：反剪麻绳仍在。", compile_seedance_motion_from_spec({}, wide))
+        self.assertIn("【连戏】反剪麻绳仍在。", compile_seedance_motion_from_spec({}, wide))
         cut_motion = compile_seedance_motion_from_spec(
             {"in_from": "她还盯工牌", "out_to": "立刻切她的怕", "action_now": "从肩后看见透光", "duration_sec": 4},
             {"internal_cuts": [{"at_sec": 3, "scale": "full", "one_action": "波帕已全身盖脚"}]},
         )
-        self.assertIn("从起幅开始：她还盯工牌。", cut_motion)
+        self.assertIn("首帧已起手：她还盯工牌", cut_motion)
         self.assertNotIn("立刻切", cut_motion)
         self.assertNotIn("片内切", cut_motion)
         self.assertNotIn("片内切到", cut_motion)
@@ -939,7 +939,11 @@ class DesignContext(unittest.TestCase):
         self.assertEqual(by_id["SH013"]["continuity"]["binding"], "wrists_behind")
         self.assertEqual(by_id["SH019"]["asset_refs"], ["LOC_GRANARY_V1"])
         self.assertIn("连戏必须照做", by_id["SH010"]["image_prompt"])
-        self.assertIsNone(data.get("warnings"))
+        # 009 mixes on_camera and post lines on purpose; the only allowed note is the post→post_dub mapping.
+        other = [w for w in data.get("warnings") or [] if "dialogue_delivery=post under speech_mode=seedance_native" not in w]
+        self.assertEqual(other, [])
+        self.assertEqual(by_id["SH003"]["speech_mode"], "post_dub")
+        self.assertEqual(by_id["SH003"]["dialogue_delivery"], "post")
         self.assertEqual(by_id["SH001"]["prompt_language"], "zh")
         self.assertEqual(by_id["SH004"]["gen_mode"], "flf2v")
         self.assertEqual(by_id["SH015"]["gen_mode"], "video_extend")

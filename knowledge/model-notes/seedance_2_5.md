@@ -13,7 +13,7 @@ QC 回写只保留下面 `## 种子`。本页 `## 能力` 是编包合同，回�
 | HTTP 400：first_frame 和 reference_image 同在 | 首帧 / 首尾帧 / 多模态参考三种模式互斥 | 硬首帧只发 first_frame；身份靠 6.1 父图链。要多参考就走 reference_image，用提示词写「首帧为图片N」，不要 role=first_frame |
 | 首帧任务传 ratio=16:9 被拒 | 2.5 首帧、首尾帧、编辑、延长只许 ratio=adaptive | 包里仍写画幅 16:9；提交改 adaptive，让输出跟首帧像素走 |
 | 默认定长或超 15 秒 | 2.5 duration 默认 -1，上限 30；2.0 上限 15 | 本集按 4–15 整数编。不要编 -1。编辑任务才必须 -1 |
-| 成片里出现模型人声 | generate_audio 默认 true | 本剧后期叠声，提交必须 false |
+| 成片里出现即兴碎话、音乐、不说话的人张嘴 | generate_audio 默认 true，提示词没写 audio_block 就由模型自由发挥 | 中文工作轨走原声唇同步（speech_mode=seedance_native），audio_block 写明每人只说引号里的话、不说话的人嘴闭着、只有环境声没有音乐没有字幕；无对白镜也写环境声句 |
 | 参考图被拒（真人人脸） | 2.0 / 2.5 都不接受直接上传真人人脸参考 | 本剧锁数字电影 CG；真人参考改虚拟人像库 `asset://` 或已授权素材 |
 
 ## 能力
@@ -88,7 +88,7 @@ QC 回写只保留下面 `## 种子`。本页 `## 能力` 是编包合同，回�
 - `camera_fixed`：2.5 / 2.0 **都不支持**。固定机位写进 `motion_prompt`，不要当 API 开关。
 - `draft`：2.5 / 2.0 **都不支持**。
 - `seed`：2.x catalog 标不支持。
-- 本剧 confirm：对白后期叠、不赌口型 → 包里 `dialogue_delivery=post`，提交 `generate_audio=false`。不要为 2.5 打开 `on_camera`。
+- 本剧（2026-09-18 起）：中文工作轨 `speech_mode=seedance_native`，提交 `generate_audio=true`，台词放「」里 + 语种 + 语气，走 `audio_block`（声线卡 → 台词 + 语种 + 语气 → 只说这一句 → 不说话的人嘴闭着 → 环境声；动作和表情在【表演】句）。原生中 / 英 / 日 / 韩 / 西 / 法 / 德，**无高棉语**，高棉语仍 Gate F。`reference_audio` 与 `first_frame` 互斥，不为口型丢硬首帧。H3 fallback 镜没有原声。
 
 ### 片内切 / 多镜头
 
@@ -113,7 +113,7 @@ API **没有** `internal_cuts` 或「最多切几次」枚举。多镜头是提�
 | `image_prompt` | 中文静帧；`[图N]` 只服务 6.1 | 同 | 不改语法 |
 | `motion` | 中文动作；默认不写片内切 | 同；可写更长段落但本集不必 | 对白写「后期另叠」 |
 | `refs` / `asset_refs` | 参考模式最多 9 张；**不能和 first/last 同发** | 参考模式最多 30 张；互斥相同 | 硬首帧：refs 不进 Ark content |
-| `audio` / `generate_audio` | 默认 true；本剧关 | 同 | 关 |
+| `audio` / `generate_audio` | 默认 true；本剧开，对白走 `audio_block` | 同 | 开（`speech_mode=seedance_native`） |
 | `gen_mode` | `i2v_first` / `flf2v`；`video_extend` 无类型字段 | 同上，另加 `omni_reference_task_type` | 不要为 ep01 编 extend |
 | `target_model` | `seedance_2_0` | `seedance_2_5` → `doubao-seedance-2-5-260628` | confirm 锁 2.0 |
 
@@ -130,7 +130,7 @@ API **没有** `internal_cuts` 或「最多切几次」枚举。多镜头是提�
 | `V2V4KCompletion` | 含视频输入 4K | 无 | 0.016 | 无 |
 | `NV2V4KCompletion` | 不含视频输入 4K | 无 | 0.026 | 无 |
 
-`V2V*` / `NV2V*` 是「含 / 不含视频输入」两档，**不是** `generate_audio` 有声/静音。2.x 价目没有单独的有声/静音 ChargeItem；关配音不换更便宜的档。硬首帧 I2V（无参考视频）走不含视频输入（`NV2V*`，单价更高）。本剧关 `generate_audio` 是口型/后期叠声，不是省钱。2.5 比 2.0 全量贵；默认出片口仍是 **2.0-mini**。2.5 的 `State=Available`，但本账号还没有视频 Endpoint。
+`V2V*` / `NV2V*` 是「含 / 不含视频输入」两档，**不是** `generate_audio` 有声/静音。2.x 价目没有单独的有声/静音 ChargeItem；开关配音不换档。硬首帧 I2V（无参考视频）走不含视频输入（`NV2V*`，单价更高）。本剧开 `generate_audio` 是为中文原声唇同步，和价格无关。2.5 比 2.0 全量贵；默认出片口仍是 **2.0-mini**。2.5 的 `State=Available`，但本账号还没有视频 Endpoint。
 
 ### 干跑
 

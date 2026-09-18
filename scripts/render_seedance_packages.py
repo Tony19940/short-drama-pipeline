@@ -34,6 +34,8 @@ from director.pipeline import (
     validate_keyframes,
     validate_packages,
 )
+from director.prompts import MAX_ZH_PROMPT_CHARS
+from director.speech import DEFAULT_DIALOGUE_LANGUAGE, DEFAULT_SPEECH_MODE, SpeechLanguageError, check_dialogue_language
 from director.video_fallback import render_seedance_or_h3_fallback
 from video_backends.seedance_ark import SeedanceArk
 
@@ -211,6 +213,17 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
     prompt = _text(pkg.get("motion_prompt"))
     if not prompt:
         errors.append("missing motion_prompt")
+    speech_mode = _text(pkg.get("speech_mode")) or DEFAULT_SPEECH_MODE
+    dialogue_language = _text(pkg.get("dialogue_language")) or DEFAULT_DIALOGUE_LANGUAGE
+    lines = [_text(item) for item in (pkg.get("dialogue_lines") or []) if _text(item)]
+    if not lines and _text(pkg.get("dialogue_line")):
+        lines = [_text(pkg.get("dialogue_line"))]
+    try:
+        # first_frame path: Khmer needs reference_audio, which Ark rejects next to first_frame.
+        check_dialogue_language(dialogue_language, speech_mode=speech_mode, shot_id=sid)
+    except SpeechLanguageError as exc:
+        errors.append(str(exc))
+    native_speech = speech_mode == "seedance_native" and bool(lines)
     seconds = render_seconds_for_package(pkg)
     refs = identity_ref_paths(prod, pkg, assets, first) if first.exists() else []
     return {
@@ -219,6 +232,7 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         "seedance_mode": seedance_mode(gen_mode),
         "keyframe_plan": plan,
         "prompt": prompt,
+        "prompt_chars": len(prompt),
         "duration_sec": seconds,
         "paper_duration_sec": pkg.get("paper_duration_sec"),
         "render_duration_sec": seconds,
@@ -231,6 +245,12 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         "overwrite_designed_last": False,
         "hardest": False,
         "generate_audio": bool(pkg.get("generate_audio", True)),
+        "speech_mode": speech_mode,
+        "dialogue_language": dialogue_language,
+        "dialogue_lines": lines,
+        "native_speech": native_speech,
+        # H3 fallback has no native dialogue: a face-blocked shot with lines loses them.
+        "loses_lines_on_h3": native_speech,
         "errors": errors,
         "ok": not errors,
         "exists": (prod / dest_rel).exists() and (prod / dest_rel).stat().st_size > 1024,
@@ -293,6 +313,9 @@ def build_plan(prod: Path, only: Optional[list[str]] = None, episode=1) -> dict:
         "first_last_count": sum(1 for item in shots if item.get("use_last_frame")),
         "missing_first": sum(1 for item in shots if any("missing first" in err for err in (item.get("errors") or []))),
         "hardest": [item["shot_id"] for item in shots if item.get("hardest")],
+        "native_speech_count": sum(1 for item in shots if item.get("native_speech")),
+        "h3_line_loss": [item["shot_id"] for item in shots if item.get("loses_lines_on_h3")],
+        "max_prompt_chars": max((int(item.get("prompt_chars") or 0) for item in shots), default=0),
         "writes_shots_json": False,
         "overwrites_designed_last": False,
         "overwrites_unsuffixed_shots": dest_dir == "05-shots",
@@ -394,6 +417,10 @@ def write_markdown(prod: Path, plan: dict, *, force: bool = False) -> Path:
     )
     title_ep = handoff_markdown_name(episode).replace("HANDOFF-VIDEO-", "").replace(".md", "")
     title = f"# {title_ep} 6.2 出片准备（Seedance 2.0 Mini 720p）"
+    native_count = plan.get("native_speech_count") or 0
+    loss = plan.get("h3_line_loss") or []
+    loss_ids = "、".join(loss) if loss else "无"
+    prompt_limit = MAX_ZH_PROMPT_CHARS
     lines = [
         title,
         "",
@@ -425,12 +452,14 @@ def write_markdown(prod: Path, plan: dict, *, force: bool = False) -> Path:
         f"- 最难：{', '.join(plan['hardest']) or '—'}",
         "- 模型 / 分辨率：Seedance 2.0 Mini **720p**（`1280×720`）。只在 create 被判人脸拦截（`PrivacyInformation`）时，这一镜改走官方 MiniMax-H3 768p，本机 ffmpeg 缩到 1280×720。配额 / 超时 / 风控词 / poll 失败不 fallback。",
         "- 秒数：纸面 `paper_duration_sec` 可短于 4（开场 1s、反应 2s）。提交用 `render_duration_sec`（不足 4 秒抬到模型下限）。成片按纸面 2–4 秒裁，assemble 是另一次 PM 指令。",
-        "- 声音：Seedance `generate_audio=true`。H3 fallback 不对口型、不重做对白。旧 `07-dubbing/sfx/ep01-sfx.m4a` 是 29 镜 191s，对不上 67 镜 v2；旧 SRT 也没重映射，不要叠。",
+        f"- 声音：**Seedance 原声中文唇同步**（`speech_mode=seedance_native`，`dialogue_language=zh`，`generate_audio=true`）。台词以引号原句写进提示词的 `audio_block`，说话人带 `voice_card`，其余在画角色嘴闭着；无音乐、无字幕。有原声对白的镜：{native_count}（下表「原声对白」列 ★）。**H3 fallback 不会有原声对白**：★ 镜若被脸拦改走 H3，对白会丢，得后期补配——{loss_ids}。高棉语不能原生口播（`km` 走 reference_audio，与 first_frame 互斥），本轮不选。",
+        "- 旧声音资产：旧 `07-dubbing/sfx/ep01-sfx.m4a` 是 29 镜 191s，对不上 67 镜 v2；旧 SRT 也没重映射，不要叠。新 SFX 床 / SRT 是成片后另一次 PM 指令。",
+        f"- 提示词：中文 ≤{prompt_limit} 字软上限（本集最长 {plan.get('max_prompt_chars') or '—'} 字）。每镜前缀同场一致的 GEO 空间锁，动作从 0.0s 起就在动，只写正向句。",
         "- **不要**对无后缀 `05-shots/SH*.mp4` 用 `--force`。`--episode 1` 仍指向 29 镜锁画。本命令必须带 `--episode ep01-v2`。",
         "- 成片后的 assemble / 剪辑 / 新 SFX 床是另一次 PM 指令。本命令只落到分集目录。",
         "",
-        "| 镜 | 模式 | 渲秒 | 纸面秒 | 首帧 | 设计尾帧 | 身份参考 | 最难 | 状态 |",
-        "|---|---|---:|---:|---|---|---|---|---|",
+        "| 镜 | 模式 | 渲秒 | 纸面秒 | 首帧 | 设计尾帧 | 身份参考 | 原声对白 | 最难 | 状态 |",
+        "|---|---|---:|---:|---|---|---|---|---|---|",
     ]
     for item in plan["shots"]:
         refs = ", ".join(f"`{rel}`" for rel in item.get("refs") or []) or "—"
@@ -440,19 +469,21 @@ def write_markdown(prod: Path, plan: dict, *, force: bool = False) -> Path:
             status = "已有 mp4，--force 将先归档再覆盖" if force else "已有 mp4，将跳过"
         paper = item.get("paper_duration_sec")
         paper_s = "—" if paper in (None, "") else paper
+        spoken = "★ " + " / ".join(item.get("dialogue_lines") or []) if item.get("native_speech") else "—"
         lines.append(
-            f"| {item['shot_id']} | {item.get('gen_mode')}→{item.get('seedance_mode')} | {item.get('duration_sec')} | {paper_s} | `{item.get('first_frame')}` | `{last}` | {refs} | {'是' if item.get('hardest') else ''} | {status} |"
+            f"| {item['shot_id']} | {item.get('gen_mode')}→{item.get('seedance_mode')} | {item.get('duration_sec')} | {paper_s} | `{item.get('first_frame')}` | `{last}` | {refs} | {spoken} | {'是' if item.get('hardest') else ''} | {status} |"
         )
     lines.extend(
         [
             "",
             "flf 镜只交首尾帧：Ark 拒 last_frame 和 reference_image 混用。身份参考只给 i2v 镜，且正式出片不上传护照图（人脸拦）。",
-            "首帧 = t=0，motion 从 one_action 之后才动，不要把首帧当成已经做完的动作。",
+            "首帧 = 动作起点：可以已经起手，结果不在首帧里；motion 从 0.0s 就在动（`action_timing` 两拍：0.0–1.5s 起手 / 1.5s–落幅，气还没平）。",
             "",
             "## 剩下的 blocker",
             "",
             "- 帧：无。67 首帧 + 21 尾帧都在 `04-frames/ep01-v2/`，包不引用无后缀 `04-frames/SH*-last.jpg`。",
             "- 出片本身：等 PM 跑上面那条命令。本交接没有提交 Ark / H3。",
+            "- 原声对白：靠 Seedance 一次出对；★ 镜被脸拦走 H3 就没有对白，要另补配音。",
             "- 成片后：assemble、新 SFX、SRT 重映射都还没做，需要另下指令。",
             "",
         ]
@@ -491,6 +522,9 @@ def main() -> None:
         "first_last_count",
         "missing_first",
         "hardest",
+        "native_speech_count",
+        "h3_line_loss",
+        "max_prompt_chars",
         "writes_shots_json",
         "overwrites_designed_last",
         "overwrites_unsuffixed_shots",

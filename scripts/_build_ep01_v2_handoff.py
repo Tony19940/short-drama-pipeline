@@ -201,7 +201,7 @@ def write_dialogue_md(table: dict) -> None:
         "- **开场**：SH001–SH003 无词（3 秒异常钩子）",
         "- **出场自报**：琳=SH005 / 春安=SH007 / 波帕=SH030",
         "- **硬句**：十五天=SH035 / 别认=SH063 / 不签=SH067",
-        "- 台词是工作轨，不进画面。禁止金句。",
+        "- 台词是工作轨，禁止金句。走 Seedance 原声中文唇同步（speech_mode=seedance_native）：原句进 audio_block，说话人带 voice_card；H3 fallback 没有原声对白。",
         "",
     ]
     for shot in table["shots"]:

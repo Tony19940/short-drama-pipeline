@@ -487,10 +487,14 @@ class FrameDescriptions(unittest.TestCase):
             frame_desc=desc,
             slot="first",
         )
-        self.assertIn("画动作尚未发生的那一格", prompt)
-        self.assertTrue(any(token in prompt for token in ("禁止", "尚未", "不要画已", "不要画成已完成")), prompt)
-        self.assertIn("本镜之后才会发生", prompt)
-        head = prompt.split("本镜之后才会发生")[0]
+        self.assertIn("画动作起点的那一格：可以已经起手，结果还没发生", prompt)
+        self.assertIn("尚未", prompt)
+        # onset allowed, result named once as "not yet" — no 禁止 litany
+        self.assertIn("本镜要做的动作（首帧只画起手，结果留给视频）", prompt)
+        self.assertEqual(prompt.count("首帧是动作起点"), 1)
+        self.assertNotIn("禁止", prompt)
+        self.assertNotIn("。。", prompt)
+        head = prompt.split("本镜要做的动作")[0]
         self.assertNotIn("已在手里", head)
         self.assertNotIn("离地入手", head)
         self.assertNotIn("画面：琳弯腰捡起", prompt)

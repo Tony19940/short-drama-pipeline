@@ -1744,7 +1744,8 @@ class DirectorTests(unittest.TestCase):
         )
         self.assertIn("速卡蹲在石槽前", prompt)
         self.assertNotIn("integrated_multimodal_description", prompt)
-        self.assertIn("对白不进画面", prompt)
+        self.assertIn("说：“水往哪走，河床都替你记着。”", prompt)
+        self.assertNotIn("对白不进画面", prompt)
 
     def test_gate_c_accepts_v2_shot_list_without_legacy_shots(self) -> None:
         from director.gates import gate_file_ready, inspect_files, v2_storyboard_ready
@@ -1858,8 +1859,8 @@ class SeedanceMotionOneSetupTests(unittest.TestCase):
         self.assertNotIn("立刻切", motion)
         self.assertNotIn("片内切", motion)
         self.assertNotIn("切到", motion)
-        self.assertIn("整段停在本机位", motion)
-        self.assertIn("从起幅开始：她还盯工牌。", motion)
+        self.assertIn("全程同一机位", motion)
+        self.assertIn("首帧已起手：她还盯工牌", motion)
 
 
 if __name__ == "__main__":

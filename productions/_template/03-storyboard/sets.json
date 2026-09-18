@@ -5,6 +5,8 @@
       "master": "02-assets/scenes/<slug>/master.jpg",
       "blocking": "02-assets/scenes/<slug>/blocking.jpg",
       "axis": "",
+      "geo_zh": "",
+      "sound_bed_zh": "",
       "marks": [
         {"id": "camera", "x": 0.5, "y": 0.95, "note": "与空镜同一轴"}
       ]

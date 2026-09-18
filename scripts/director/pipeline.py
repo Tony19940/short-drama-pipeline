@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any, Optional
 
 from .production import load_json, save_json
 from .store import load_approvals, save_approvals
+
+logger = logging.getLogger(__name__)
 
 PIPELINE = ".pipeline"
 
@@ -938,6 +941,19 @@ def episode_shot_dir(episode: Any = 1) -> str:
     return "05-shots" if not label else f"05-shots/{label}"
 
 
+def load_sets_for_episode(prod: Path, episode: Any = 1) -> dict:
+    """`03-storyboard/sets.json` for EP01, `sets.epNN.json` for later episodes (falls back to sets.json)."""
+    try:
+        ep = int(episode or 1)
+    except (TypeError, ValueError):
+        ep = 1
+    if ep != 1:
+        data = load_json(prod, f"03-storyboard/sets.ep{ep:02d}.json", {})
+        if data.get("sets"):
+            return data
+    return load_json(prod, "03-storyboard/sets.json", {"sets": []})
+
+
 def compile_packages_from_specs(
     prod: Path,
     target_model: Optional[str] = None,
@@ -1003,8 +1019,46 @@ def compile_packages_from_specs(
     if frame_descriptions is None:
         frame_descriptions = read_artifact(prod, episode_artifact_name("frame_descriptions.json", episode_no)) or read_artifact(prod, "frame_descriptions.json")
     descriptions = index_by_shot(frame_descriptions)
+    # Hell Grind grafts: GEO block per set, voice / descriptor cards per character, native speech.
+    from .acting import compile_acting_zh, merge_acting, text_acting_warnings
+    from .continuity_hard import resolve_costume_token
+    from .frame_desc import acting_text_fields, normalize_item as normalize_frame_item
+
+    def frame_item_acting_warnings(item: dict) -> list[str]:
+        norm = normalize_frame_item(item)
+        return text_acting_warnings(norm["shot_id"], acting_text_fields(norm))
+    from .prompts import (
+        MAX_ZH_PROMPT_CHARS,
+        TRIM_LABEL_ZH,
+        compile_seedance_motion_detail,
+        geo_layout_for,
+        load_ban_dictionary,
+        shot_dialogue_items,
+    )
+    from .shot_table import cast_names
+    from .speech import (
+        DEFAULT_DIALOGUE_LANGUAGE,
+        cards_by_name,
+        check_dialogue_language,
+        compile_audio_block,
+        descriptor_for,
+        load_character_cards,
+        sound_bed_for,
+        speech_mode_for,
+        voice_card_for,
+    )
+
+    sets = load_sets_for_episode(prod, episode_no)
+    cast = cast_names(writer)
+    cast_id_by_name = {name: cid for cid, name in cast.items() if name}
+    cards = cards_by_name(load_character_cards(prod), cast)
+    ban_dictionary = load_ban_dictionary(prod)
+    speech_mode = speech_mode_for(shot_list, profile) if lang == "zh" else "post_dub"
+    table_language = _text(shot_list.get("dialogue_language")) or DEFAULT_DIALOGUE_LANGUAGE
+    geo_warned: set[str] = set()
     warnings: list[str] = []
     compile_errors: list[str] = []
+    post_under_native: list[str] = []
     packages = []
     for spec in specs.get("shot_specs") or []:
         sid = spec.get("shot_id")
@@ -1026,8 +1080,62 @@ def compile_packages_from_specs(
                 episode=episode_no,
             )
             gen_mode, plan = package_gen_mode(spec, table_shot, profile)
+            raw_dur = spec.get("duration_sec") or table_shot.get("duration_sec") or min_sec
+            try:
+                paper_sec = float(raw_dur)
+            except (TypeError, ValueError):
+                paper_sec = float(min_sec)
+            render_sec = int(round(max(float(min_sec), min(float(max_sec), paper_sec))))
+            duration_sec = paper_sec if shot_list.get("keep_paper_duration") else render_sec
+            # Who is in frame (display names), who speaks, what each looks like.
+            in_frame = [_text(name) for name in (table_shot.get("characters") or []) if _text(name)]
+            if not in_frame and state:
+                in_frame = [cast.get(cid, cid) for cid, item in state["characters"].items() if item.get("in_frame", True)]
+            lines = shot_dialogue_items(spec, table_shot)
+            speakers = [item["character"] for item in lines if item.get("character")]
+            # dialogue_delivery is the per-shot switch: on_camera = the model speaks it (native),
+            # post = dubbed later. Under a native table a `post` shot opts out to post_dub.
+            delivery = _text(table_shot.get("dialogue_delivery")) or ("post" if lines else "none")
+            shot_speech_mode = speech_mode
+            if lines and speech_mode == "seedance_native" and delivery == "post":
+                shot_speech_mode = "post_dub"
+                post_under_native.append(_text(sid))
+            dialogue_language = _text(table_shot.get("dialogue_language")) or table_language
+            dialogue_language = check_dialogue_language(dialogue_language, speech_mode=shot_speech_mode, shot_id=_text(sid))
+            if frame_desc:
+                warnings.extend(frame_item_acting_warnings(frame_desc))
+            descriptors: list[str] = []
+            for name in in_frame:
+                cid = cast_id_by_name.get(name, name)
+                declared = ((state or {}).get("characters") or {}).get(cid, {}).get("costume", "") if state else ""
+                sentence = descriptor_for(name, cards, resolve_costume_token(hard, cid, episode_no, declared))
+                if sentence:
+                    descriptors.append(sentence)
+            geo_layout = geo_layout_for(location_id or spec.get("location_state_id"), sets) if lang == "zh" else ""
+            loc_key = _text(location_id or spec.get("location_state_id"))
+            known_set = any(isinstance(s, dict) and _text(s.get("id")) == loc_key for s in sets.get("sets") or [])
+            if lang == "zh" and known_set and not geo_layout and loc_key not in geo_warned:
+                geo_warned.add(loc_key)
+                warnings.append(f"set {loc_key} has no geo_zh / axis in sets.json; shots there carry no GEO block")
+            voice_card = {name: voice_card_for(name, cards) for name in speakers}
+            audio_block = ""
+            acting_lines: list[str] = []
             if lang == "zh":
-                image_prompt = compile_keyframe_prompt_zh(spec, table_shot, frame_desc=frame_desc, slot="first")
+                audio_block = compile_audio_block(
+                    lines if shot_speech_mode == "seedance_native" else [],
+                    cards=cards,
+                    in_frame=in_frame,
+                    key_sfx=list(spec.get("key_sfx") or table_shot.get("key_sfx") or []),
+                    sound_bed=sound_bed_for(loc_key, sets),
+                    language=dialogue_language,
+                )
+                acting_lines = compile_acting_zh(
+                    table_shot, spec, in_frame=in_frame, speakers=speakers, override=(frame_desc or {}).get("acting")
+                )
+            if lang == "zh":
+                image_prompt = compile_keyframe_prompt_zh(
+                    spec, table_shot, frame_desc=frame_desc, slot="first", geo_layout=geo_layout, descriptors=descriptors
+                )
                 if len(refs) > 1 and not has_reference_roles(image_prompt):
                     image_prompt += compile_reference_roles_zh(refs, assets)
             else:
@@ -1043,23 +1151,37 @@ def compile_packages_from_specs(
                     image_prompt.rstrip()
                     + "底板无高棉文、无汉字；厂牌拉丁文可留；不要让模型在招牌或工牌上新写高棉文。"
                 )
-            motion = (
-                compile_seedance_motion_from_spec(spec, table_shot, profile)
-                if lang == "zh"
-                else _text(spec.get("move_detail") or spec.get("action_now"))
-            )
+            motion_detail: dict = {}
+            if lang == "zh":
+                motion_detail = compile_seedance_motion_detail(
+                    spec,
+                    table_shot,
+                    profile,
+                    geo_layout=geo_layout,
+                    descriptors=descriptors,
+                    acting_lines=acting_lines,
+                    audio_block=audio_block,
+                    speech_mode=shot_speech_mode,
+                    render_sec=render_sec,
+                    ban_dictionary=ban_dictionary,
+                )
+                motion = motion_detail["prompt"]
+                if motion_detail.get("dropped"):
+                    dropped = "、".join(TRIM_LABEL_ZH.get(t, t) for t in motion_detail["dropped"])
+                    warnings.append(f"{sid} motion prompt trimmed ({dropped}); now {motion_detail['chars']} chars")
+                if motion_detail.get("over_limit"):
+                    warnings.append(
+                        f"{sid} motion prompt {motion_detail['chars']} chars > {MAX_ZH_PROMPT_CHARS} after trim; "
+                        "line / voice card / GEO / timing kept"
+                    )
+                    logger.warning("%s motion prompt %s chars > %s after trim", sid, motion_detail["chars"], MAX_ZH_PROMPT_CHARS)
+            else:
+                motion = _text(spec.get("move_detail") or spec.get("action_now"))
             pov_state = None
             if state:
                 pov_id = pov_cast_id(shot_list, writer)
                 pov_state = state["characters"].get(pov_id) or next(iter(state["characters"].values()), None)
             hard_list = hard_items_for_state(hard, episode_no, state) if state else []
-            raw_dur = spec.get("duration_sec") or table_shot.get("duration_sec") or min_sec
-            try:
-                paper_sec = float(raw_dur)
-            except (TypeError, ValueError):
-                paper_sec = float(min_sec)
-            render_sec = int(round(max(float(min_sec), min(float(max_sec), paper_sec))))
-            duration_sec = paper_sec if shot_list.get("keep_paper_duration") else render_sec
             from .codex_stills import StillPackError, missing_costume_state_files, pack_codex_still_refs
             from .prompts import rewrite_still_prompt
 
@@ -1130,7 +1252,18 @@ def compile_packages_from_specs(
                 "state_note": state_sentence(state, bible) if state else "",
                 "frame_description": _text((frame_desc or {}).get("one_paragraph")),
                 "dialogue_line": spec.get("dialogue_line") or "",
-                "dialogue_language": "zh" if spec.get("dialogue_line") else "",
+                "dialogue_lines": [item["line"] for item in lines],
+                "dialogue_language": dialogue_language,
+                "speech_mode": shot_speech_mode,
+                "dialogue_delivery": delivery,
+                "voice_card": voice_card,
+                "audio_block": audio_block,
+                "geo_layout": geo_layout,
+                "descriptor": descriptors,
+                "acting": merge_acting(table_shot.get("acting"), (frame_desc or {}).get("acting")),
+                "action_timing": motion_detail.get("beats") or [],
+                "motion_prompt_chars": len(motion),
+                "motion_prompt_trimmed": motion_detail.get("dropped") or [],
                 "parent_hint": _text(table_shot.get("still_parent")),
                 "paper_duration_sec": paper_sec,
                 "render_duration_sec": render_sec,
@@ -1184,7 +1317,16 @@ def compile_packages_from_specs(
         "status": "draft",
         "confirmed": False,
         "origin": origin,
+        "speech_mode": speech_mode,
+        "dialogue_language": table_language,
+        "prompt_char_limit": MAX_ZH_PROMPT_CHARS,
     }
+    if post_under_native:
+        warnings.append(
+            f"{len(post_under_native)} shots with lines carry dialogue_delivery=post under speech_mode=seedance_native → "
+            f"those shots are post_dub (no native line): {', '.join(post_under_native)}. "
+            "Write on_camera on the shot (or leave it unset) to have Seedance speak the line."
+        )
     if warnings:
         payload["warnings"] = warnings
     if compile_errors:

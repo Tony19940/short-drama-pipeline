@@ -1,7 +1,8 @@
-"""First still = second 0 of the written action.
+"""First still = the onset of the written action (Hell Grind: complex action never sits in the middle).
 
-`one_action` is the motion contract. The first-frame still must show the world
-BEFORE that verb has happened. No VLM: regex tables on transform verbs.
+`one_action` is the motion contract. 首帧 = 动作起点状态：可以已经起手（手已伸出 /
+身已前倾 / 已在挥 / 脚已离地 / 门已在裂），禁止结果已完成（已入手 / 已落地 / 柜已开 /
+已入袋）。Motion then starts at 0.0s from that onset. No VLM: regex tables on transform verbs.
 """
 
 from __future__ import annotations
@@ -11,75 +12,99 @@ from typing import Any, Optional
 
 STILL_KEYS = ("pose", "holding", "prop_state", "one_paragraph")
 
+# Onset states any first still may show: the verb has started, its result has not landed.
+ONSET_OK: tuple[str, ...] = (
+    "已起手",
+    "手已伸出",
+    "手已伸向",
+    "手已抬",
+    "手已搭上",
+    "手已扬起",
+    "身已前倾",
+    "身已探",
+    "已在挥",
+    "已在拉",
+    "已在推",
+    "脚已离地",
+    "已弯腰",
+    "已探身",
+    "已举起",
+    "门已在裂",
+    "拇指已按上",
+    "已贴到",
+    "已扬起",
+)
+
 # Longest verb first. post/pre are searched on first-still text only.
 TRANSFORM_RULES: tuple[dict[str, Any], ...] = (
     {
         "id": "pick",
         "verb": "捡",
         "verbs": ("捡起", "拾起", "捡"),
-        "pre": ("地上", "脚边", "尚未弯腰", "还在地上", "仍在地上", "仍在脚边", "未捡", "未弯"),
+        "pre": ("地上", "脚边", "尚未弯腰", "还在地上", "仍在地上", "仍在脚边", "未捡", "未弯", "已弯腰", "手已伸向", "身已前倾"),
         "post": ("已在手里", "已在右手", "已在左手", "已入手", "入手", "离地", "地上无", "一手拿"),
     },
     {
         "id": "throw",
         "verb": "扔",
         "verbs": ("扔掉", "丢掉", "抛出", "扔到", "扔"),
-        "pre": ("手里", "手中", "尚未出手", "还在她手里", "还在手里", "未出手"),
+        "pre": ("手里", "手中", "尚未出手", "还在她手里", "还在手里", "未出手", "已起手", "手已扬起", "已在挥"),
         "post": ("已落地", "落地后", "转完身", "离手落", "停在脚边", "钥匙在地上", "在地上"),
     },
     {
         "id": "open",
         "verb": "开",
         "verbs": ("拉开", "打开", "开柜"),
-        "pre": ("虚掩", "未拉开", "未开", "关着", "看不见"),
+        "pre": ("虚掩", "未拉开", "未开", "关着", "看不见", "手已搭上", "已在拉", "门已在裂"),
         "post": ("已打开", "已开", "柜门已开", "柜已开", "露出", "从看不见到"),
     },
     {
         "id": "close",
         "verb": "关",
         "verbs": ("关上", "合上", "关柜"),
-        "pre": ("开着", "未关", "仍开"),
+        "pre": ("开着", "未关", "仍开", "手已搭上", "已在推"),
         "post": ("已关", "关上了", "合上了"),
     },
     {
         "id": "pocket",
         "verb": "塞进",
         "verbs": ("塞进", "塞入"),
-        "pre": ("仍在手里", "还在手里", "未入袋", "未塞", "尚未塞"),
+        "pre": ("仍在手里", "还在手里", "未入袋", "未塞", "尚未塞", "手已伸向", "已起手"),
         "post": ("已入袋", "口袋略鼓", "塞完", "不在手里"),
     },
     {
         "id": "take_out",
         "verb": "拿出",
         "verbs": ("拿出", "取出"),
-        "pre": ("在袋里", "在柜里", "尚未拿出", "未拿出"),
+        "pre": ("在袋里", "在柜里", "尚未拿出", "未拿出", "手已探", "身已探"),
         "post": ("已拿出", "拿在手里"),
     },
     {
         "id": "wipe",
         "verb": "抹",
         "verbs": ("一抹", "抹掉", "抹去", "抹灰"),
-        "pre": ("灰皮", "灰还在", "未抹", "字面未清", "碰到灰", "灰仍在"),
+        "pre": ("灰皮", "灰还在", "未抹", "字面未清", "碰到灰", "灰仍在", "拇指已按上", "已起手"),
         "post": ("灰掉", "已抹", "抹净", "字面已清", "读清"),
     },
     {
         "id": "pass_through",
         "verb": "穿",
         "verbs": ("穿进", "穿过", "穿出"),
-        "pre": ("贴到身前", "尚未穿", "未叠身", "身前", "尚未叠"),
+        "pre": ("贴到身前", "尚未穿", "未叠身", "身前", "尚未叠", "已贴到", "脚已离地"),
         "post": ("已叠身", "已穿过", "穿出", "肩贴入", "再向画右穿出"),
     },
     {
         "id": "fling",
         "verb": "甩",
         "verbs": ("甩开", "甩"),
-        "pre": ("尚未甩", "手里"),
+        "pre": ("尚未甩", "手里", "已扬起", "已起手", "已在挥"),
         "post": ("已甩", "甩在地上", "布面铺开"),
     },
 )
 
 _NEGATION = re.compile(r"(尚未|还未|还没|没有|未|仍未|并不)")
 _GENERIC_PRE = re.compile(r"(尚未|还未|还没|未|仍|还在)")
+_ONSET = re.compile("|".join(re.escape(token) for token in ONSET_OK))
 _COMPLETED = (
     "已在手里",
     "已入手",
@@ -195,8 +220,17 @@ def _find_unnegated(blob: str, token: str) -> bool:
         start = at + 1
 
 
+def is_onset_state(text: str) -> bool:
+    """True when the still text says the verb has started (手已伸出 / 已起手…) — allowed at t=0."""
+    return bool(_ONSET.search(_t(text)))
+
+
 def start_still_errors(shot: dict, frame_desc: Optional[dict]) -> list[str]:
-    """Machine check: transform verb + first-still already shows the result."""
+    """Machine check: transform verb + first-still already shows the *result*.
+
+    Onset states (`ONSET_OK`) pass: the first frame may already be mid-gesture,
+    it may not show the finished result.
+    """
     sid = _t(shot.get("shot_id")) or "?"
     action = _t(shot.get("one_action") or shot.get("action_now") or shot.get("action_ref"))
     span = action_span(action)
@@ -212,16 +246,24 @@ def start_still_errors(shot: dict, frame_desc: Optional[dict]) -> list[str]:
     if posts:
         errors.append(
             f"{sid} first still is mid/result of 「{span['verb']}」 ({'、'.join(posts[:3])}); "
-            f"t=0 must be before the verb. in_from={in_from or '—'}"
+            f"t=0 may be the onset, not the finished result. in_from={in_from or '—'}"
         )
-    pre_hit = any(token and token in blob for token in span["pre"]) or bool(_GENERIC_PRE.search(blob))
+    pre_hit = (
+        any(token and token in blob for token in span["pre"])
+        or bool(_GENERIC_PRE.search(blob))
+        or is_onset_state(blob)
+    )
     if blob and not pre_hit:
         errors.append(
-            f"{sid} first still missing pre-state of 「{span['verb']}」 "
-            f"(need one of { ' / '.join(span['pre'][:4]) } or 尚未)"
+            f"{sid} first still missing onset/pre-state of 「{span['verb']}」 "
+            f"(need one of { ' / '.join(span['pre'][:4]) }, 尚未, or an onset like 已起手)"
         )
     if in_from and blob:
-        in_has_pre = any(token and token in in_from for token in span["pre"]) or bool(_GENERIC_PRE.search(in_from))
+        in_has_pre = (
+            any(token and token in in_from for token in span["pre"])
+            or bool(_GENERIC_PRE.search(in_from))
+            or is_onset_state(in_from)
+        )
         if in_has_pre and posts:
             errors.append(
                 f"{sid} in_from is t=0 (「{in_from}」) but first-still text already asserts the result"
@@ -253,10 +295,17 @@ def issues_for_table(shots: list[dict], descriptions_by_id: dict) -> list[str]:
     return out
 
 
-def forbidden_result_clause(one_action: str) -> str:
-    """Negative list for the first-frame brief."""
+def result_tokens(one_action: str, limit: int = 6) -> list[str]:
+    """Result states of the transform verb — the things a first still must not show."""
     span = action_span(one_action)
     if not span:
-        return "禁止把 one_action 的结果画进首帧。"
-    posts = "、".join(span["post"][:6])
-    return f"禁止画进首帧：{posts}。画动作尚未发生的那一格。"
+        return []
+    return [token for token in span["post"] if token][:limit]
+
+
+def forbidden_result_clause(one_action: str) -> str:
+    """First-frame brief, stated once: onset allowed, result not yet."""
+    posts = result_tokens(one_action)
+    if not posts:
+        return "首帧是动作起点：可以已经起手，结果还没发生。"
+    return f"首帧是动作起点：可以已经起手，这些结果还没发生：{'、'.join(posts)}。"

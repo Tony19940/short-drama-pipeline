@@ -3,8 +3,8 @@
 本文件是 **API 路线**（`render_shots.py` 自动吃末帧）。  
 在 grok.com/imagine 画布上手工出图出片走 **`GROK-CANVAS.md`**，导演层规则完全一致，只换执行工具。
 
-默认 **Hailuo 2.3 Fast 无声图生视频**，后期叠 BGM / 环境声 / 旁白。  
-**H3 只打精品镜**（近景脸、关键仪式、必须卡环境声的动作），每集最多 3 镜。
+正式成片默认 **Seedance 2.0 Mini 720p**（见下「出片」一节）；中文对白走 **Seedance 原声唇同步**（`speech_mode=seedance_native`，见「对白」一节），BGM、高棉语后期。  
+MiniMax 路线保留：**Hailuo 2.3 Fast 无声图生视频**打普通镜，**H3 只打精品镜 / 人脸拦截 fallback**（近景脸、关键仪式、必须卡环境声的动作），每集最多 3 镜。这两条路都没有原声对白。
 
 关掉角色配音 **不会让 H3 更便宜**（按输出秒数计费）。要省钱就走 Fast 无声，不要为背景音去买 H3。
 
@@ -38,7 +38,8 @@ H3 是开源全模态视频模型，官方也提供按量 API。
 2. 6.1 锁首帧后，6.2 按镜 POST /contents/generations/tasks。
 3. role=first_frame 必带；有设计尾帧才加 last_frame；角色/场景参考挂在首帧外面。
 4. 禁止文生视频进 05-shots/。
-5. motion 写本机位怎么动；落幅是这个机位的结束状态，不是下一镜的机位。
+5. motion 写本机位怎么动；落幅是这个机位的结束状态，不是下一镜的机位。首帧是动作起点状态（可已起手），motion 从 0.0s 接着动，ACTION TIMING 按秒两拍，只写肯定句；段首粘本场 `geo_layout`。
+6. 对白只在 `audio_block`（见下「对白」一节），不进动作句。
 
 ```bash
 export ARK_API_KEY=你的方舟密钥
@@ -73,11 +74,35 @@ python3 scripts/render_seedance_packages.py --prod productions/010-gongpai --onl
 
 真人脸拦没有官方预检接口（内容安全 ImageModeration / `+understand` / `doctor +verify-origin` 都不是这套 `PrivacyInformation` 分类器）。出图后跑 `python3 scripts/check_seedance_frame.py --prod productions/<slug> --image 04-frames/SHxxx.jpg`：只发 first_frame、480p、最短 4 秒；**submit 400 就是检查**（无 task id，审核失败不收费）；200 立刻 DELETE（仅 queued 能取消，已 running 的 4s 480p 仍可能出片计费）。1–2 秒非法，会被参数拒，测不到脸。
 
+### 拦截来源与方舟授信（探针，未采纳）
+
+拦截在字节模型侧，不是提示词问题。Higgsfield《Hell Grind》写实脸能过，是因为脸由平台自家模型（Soul Cinema）生成，平台信任本账号内自家模型的产物。字节两边对应：BytePlus ModelArk 明说**同账号、30 天内、Seedance 2.0 / 2.5 视频及其尾帧、Seedream 5.0 lite 文生图的原始产物**可作输入不触发拦截，**压缩、编辑过就不算**；火山方舟叫「特定模型生成内容授信 / 隐形数字护照」，另有公共虚拟人像库（`asset://`）、私域虚拟人像库、真人认证入库。
+
+我们的静帧是 Codex 外部生成，写实即拦；`place_codex_frame.py` 缩放和父图链 edit 也破授信。所以**主路径仍是 CG 画风 + 人脸拦截才 H3**，下面只是探针，谁跑了把结果写回 `knowledge/model-notes/seedance_2_0.md` 种子表：
+
+1. 方舟 Seedream 5.0 lite 文生一张写实脸，原图不动直接当 `first_frame` → 看 `PrivacyInformation` 是否触发。
+2. 私域虚拟人像库入库一个角色 → 首帧含同一张脸是否放行。
+3. Seedance 出片的尾帧直接作下一镜 `first_frame`（同机位续吃末帧）→ 是否天然可信。
+
+三条都过了再谈换路由；一条不过就维持现状。
+
 **待实测**：方舟文档称首帧图生视频 / 首尾帧 / 多模态参考三种模式互斥；`seedance_ark.py` 目前在 i2v 同时发 `first_frame` + `reference_image`，可能被拒（400）或参考图被忽略。冒烟视频派出时验证（见 `productions/010-gongpai/04-frames/smoke-test.md`「顺带要验的」）；若互斥，改为「硬首帧 = 不带身份参考（身份靠 6.1 父图链），参考模式 = 软首帧，不进 05-shots/」。
 
 
 都市短剧（`002-sophea-tent`）9 镜、58 秒。神话旁白集可以更长。先用 API 验证脸会不会漂，再决定要不要养机器。积分空了就停，不要用 Ken Burns 冒充 H3。
 
+## 对白：Seedance 原声（中文工作轨）
+
+2026-09-18 起，中文工作轨的对白由 Seedance 自己说、自己对口型，不再后期重录。生成包 `speech_mode=seedance_native`（默认），提交 `generate_audio=true`。
+
+- 台词只在 `audio_block` 里，顺序固定：`voice_card` 逐字 → 「引号台词」+ 语种 + 语气（怎么说，不是什么心情）→ 只说这一句 → 不说话的人嘴闭着 → 环境声、无音乐、无字幕。说话时的动作和表情（肌肉）在紧跟的【表演】句里，不进 `audio_block`；动作句里不出现台词。
+- 每镜开关是 `dialogue_delivery`：`on_camera` = 模型说这句（原声），`post` = 后期配。原声表（`speech_mode=seedance_native`，或目标模型能唇同步且表未声明）里没写的有词镜默认 `on_camera`；写了 `post` 的镜单独退成 `post_dub`，编包会列出来。全表都是 `post` 的老表按 `post_dub` 处理，不报。
+- 块尾一句写死：每人只说引号里的那句话，不说话的人**嘴闭着**；只有环境声，**没有音乐，没有字幕**。不写这句模型会加碎话、哼唱和配乐。
+- 原生语种：中 / 英 / 日 / 韩 / 西 / 法 / 德。**没有高棉语**——高棉语仍是配音 / 字幕轨（Gate F，`DUBBING.md`）。`reference_audio` 能驱动口型，但它属多模态参考模式，与 `first_frame` 互斥；不为口型丢掉硬首帧。
+- 中文提示词 ≤500 字软闸，只写肯定句（否定句被忽略或反做，`ban_dictionary` 翻成正向替代）。
+- **H3 fallback 镜没有原声**：被脸拦改走 H3 的那一镜，这句对白回后期叠声（该镜 `speech_mode=post_dub`），声音岗按 `voice_card` 重录该句。Hailuo Fast 同理。
+- 声音岗只清理原声（降噪、统一音色、放进空间），核对等于原句后才算成品；即兴碎话、自带音乐不进成片。
+- `assemble.sh` 仍 `-c copy`：原声镜和 H3 镜拼接前对齐 aac stereo、同尺寸。
 
 ## 万相 3.0（阿里云百炼）
 

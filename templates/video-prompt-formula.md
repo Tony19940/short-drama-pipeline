@@ -1,6 +1,8 @@
 # 单镜提示词公式
 
-给脚本专家第 4 步和分镜页 `video_prompt` 用。不是可灵/即梦整段广告词。
+给脚本专家第 4 步和分镜页 `video_prompt` 用（MiniMax / H3 英文路线）。不是可灵/即梦整段广告词。
+
+Seedance 中文路线不用这条公式：5.2 编译 `motion_prompt`，顺序 `geo_layout` → 每人一句 `descriptor` → 起点状态 + ACTION TIMING 按秒两拍（从 0.0s 就动）→ 运镜一句 → `audio_block`（声线卡 → 引号台词 → 动作 → 表情；不说话的人嘴闭着，只有环境声）→ 连戏句。只写肯定句，≤500 字。见 `knowledge/pipeline-pack/prompts/06_生成包_5.2.md`。
 
 ## 公式
 

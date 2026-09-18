@@ -152,6 +152,57 @@ def validate_episode(prod: Path, episode: int, table: Optional[dict] = None) -> 
     return errors, warnings, table
 
 
+VIDEO_READY_PACKAGE_KEYS = ("first_frame", "last_frame", "video_resolution", "ark_resolution", "official_dest")
+VIDEO_READY_HEADER_KEYS = ("video_ready", "official_dest_dir", "video_resolution", "ark_resolution", "notes")
+MACHINE_FRAME_DESC_ORIGIN = "compiled-from-shot-table"
+
+
+def carry_video_ready_fields(previous: dict, packages: dict) -> dict:
+    """Recompile never invents frames: pointers the video-ready pass wrote stay as they were.
+
+    Per shot: first_frame / last_frame / official_dest / resolution. Header: video_ready,
+    official_dest_dir, notes. Missing before → missing after.
+    """
+    old_by_id = {
+        str(item.get("shot_id")): item
+        for item in ((previous or {}).get("packages") or [])
+        if isinstance(item, dict) and item.get("shot_id")
+    }
+    for item in packages.get("packages") or []:
+        old = old_by_id.get(str(item.get("shot_id")))
+        if not old:
+            continue
+        for key in VIDEO_READY_PACKAGE_KEYS:
+            if key in old:
+                item[key] = old[key]
+    for key in VIDEO_READY_HEADER_KEYS:
+        if key in (previous or {}):
+            packages[key] = previous[key]
+    return packages
+
+
+def refresh_frame_descriptions(prod: Path, episode, table: dict, *, write: bool) -> dict:
+    """Machine-compiled frame descriptions follow the table; designer-written ones are left alone."""
+    name = episode_artifact_name("frame_descriptions.json", episode)
+    current = read_artifact(prod, name)
+    if current.get("items") and str(current.get("origin") or "") != MACHINE_FRAME_DESC_ORIGIN:
+        return current
+    from director.frame_desc import compile_frame_descriptions_from_table, render_frame_descriptions_md
+
+    fresh = compile_frame_descriptions_from_table(table)
+    if write:
+        write_artifact(prod, name, fresh)
+        ep_no, label = parse_episode(episode)
+        md_name = "03-storyboard/frame-descriptions.draft.md" if not label else f"03-storyboard/frame-descriptions.{label}.md"
+        dest = prod / md_name
+        if dest.exists():
+            dest.write_text(
+                render_frame_descriptions_md(fresh, title=f"第 {ep_no:02d} 集" + (f" · {label}" if label else "")),
+                encoding="utf-8",
+            )
+    return fresh
+
+
 def compile_episode(
     prod: Path,
     episode,
@@ -167,14 +218,18 @@ def compile_episode(
     if errors and from_table:
         warnings = list(warnings) + [f"[from-table] {item}" for item in errors]
     specs = compile_specs_from_shot_table(table, aspect=table.get("aspect") or "16:9")
+    frame_descriptions = refresh_frame_descriptions(prod, episode, table, write=write)
+    previous_packages = read_artifact(prod, episode_artifact_name("gen_packages.json", episode))
     packages = compile_packages_from_specs(
         prod,
         target_model=table.get("target_model") or "seedance_2_0",
         table=table,
         specs=specs,
         writer=load_writer(prod, episode, table),
-        frame_descriptions=read_artifact(prod, episode_artifact_name("frame_descriptions.json", episode)),
+        frame_descriptions=frame_descriptions,
     )
+    carry_video_ready_fields(previous_packages, packages)
+    package_warnings = list(packages.get("warnings") or [])
     if confirm:
         packages["confirmed"] = True
         packages["status"] = "ready"
@@ -203,11 +258,18 @@ def compile_episode(
         "shot_count": len(table.get("shots") or []),
         "package_count": len(packages.get("packages") or []),
         "confirmed": packages_confirmed(packages),
+        "package_warnings": package_warnings,
         "table": table,
         "specs": specs,
         "packages": packages,
     }
     if write:
+        from director.speech import load_character_cards, write_voice_cards
+
+        cards = load_character_cards(prod)
+        if cards:
+            write_voice_cards(prod, cards)
+        result["voice_cards"] = len(cards)
         table_out = dict(table)
         table_out["status"] = "ready"
         table_out["agent"] = "design"
@@ -364,7 +426,7 @@ def main() -> int:
     result = compile_episode(
         prod, args.episode, confirm=not args.no_confirm, write=True, from_table=args.from_table
     )
-    printable = {k: result[k] for k in ("ok", "episode", "errors", "warnings", "shot_count", "package_count", "confirmed", "wrote") if k in result}
+    printable = {k: result[k] for k in ("ok", "episode", "errors", "warnings", "package_warnings", "shot_count", "package_count", "confirmed", "voice_cards", "wrote") if k in result}
     print(json.dumps(printable, ensure_ascii=False, indent=2))
     if not result.get("ok"):
         return 1

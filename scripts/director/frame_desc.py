@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+from .acting import normalize_acting, text_acting_warnings
 from .shot_table import OTC_COVERAGE, _t as _shot_t, facing_class, turn_is_written
 from .still_t0 import normalize_still, still_t0_errors
 
@@ -59,7 +60,44 @@ def normalize_item(item: Any) -> dict:
         "last_paragraph": last_paragraph,
         "still_start": still_start,
         "still_end": still_end,
+        # 7a may write acting for the people in frame; it lays over the table row field by field.
+        "acting": normalize_acting(raw.get("acting")),
     }
+
+
+def acting_text_fields(item: dict) -> dict[str, str]:
+    """The free-text fields of one normalized item that must not carry emotion adjectives."""
+    fields: dict[str, str] = {
+        "one_paragraph": item.get("one_paragraph", ""),
+        "last_paragraph": item.get("last_paragraph", ""),
+        "subject.micro_expression": (item.get("subject") or {}).get("micro_expression", ""),
+    }
+    for slot in ("still_start", "still_end"):
+        for key, value in (item.get(slot) or {}).items():
+            if value:
+                fields[f"{slot}.{key}"] = value
+    for who, acting in (item.get("acting") or {}).items():
+        for key in ("business", "muscle", "change"):
+            if acting.get(key):
+                fields[f"acting.{who}.{key}"] = acting[key]
+    # normalize_item mirrors one_paragraph into still_start; the same text should warn once.
+    seen: set[str] = set()
+    out: dict[str, str] = {}
+    for key, value in fields.items():
+        if value and value not in seen:
+            seen.add(value)
+            out[key] = value
+    return out
+
+
+def frame_description_warnings(data: dict) -> list[str]:
+    """`acting_adjective` warnings across every 7a item. Warning, not error: the still is not bricked."""
+    out: list[str] = []
+    items = (data or {}).get("items")
+    for raw in items if isinstance(items, list) else []:
+        item = normalize_item(raw)
+        out.extend(text_acting_warnings(item["shot_id"], acting_text_fields(item)))
+    return out
 
 
 def validate_frame_descriptions(
@@ -222,8 +260,13 @@ def render_frame_descriptions_md(data: dict, title: str = "") -> str:
 
 
 def compile_frame_desc_from_shot(shot: dict) -> dict:
-    """Deterministic first/last still text from a v2 table row. No LLM."""
-    from .still_t0 import forbidden_result_clause
+    """Deterministic first/last still text from a v2 table row. No LLM.
+
+    The face is described only by what is visible (琳眼瞪大 / 咬牙); feeling words
+    in `expression` are dropped (acting is behavior, not adjectives).
+    """
+    from .acting import physical_expression
+    from .still_t0 import result_tokens
 
     sid = _t(shot.get("shot_id"))
     still = _t(shot.get("still_start") or shot.get("in_from"))
@@ -238,18 +281,18 @@ def compile_frame_desc_from_shot(shot: dict) -> dict:
     quality = _t(light.get("quality"))
     color = _t(light.get("color"))
     no_face = (not expr) or ("无脸" in expr)
-    face = expr if no_face else f"夸张表情：{expr}"
+    face = expr if no_face else physical_expression(expr)
     para = "。".join(part.rstrip("。") for part in (still, face, in_from) if part)
     extra = "数字电影 CG，16:9，板上无汉字无高棉文。"
     one = (para + "。" + extra).replace("。。", "。")
     if len(one) > MAX_PARAGRAPH:
-        one = (still + "。" + face + "。" + extra).replace("。。", "。")[:MAX_PARAGRAPH]
+        one = "。".join(part.rstrip("。") for part in (still, face) if part)
+        one = (one + "。" + extra).replace("。。", "。")[:MAX_PARAGRAPH]
     last_para = ""
     if _t(shot.get("keyframe_plan")) == "first_last":
         last_para = "。".join(part.rstrip("。") for part in (out_to, "动作已完成的那一格") if part)[:MAX_PARAGRAPH]
     forbidden = ["汉字", "可读高棉文", "真人", "photoreal"]
-    if action:
-        forbidden.append(forbidden_result_clause(action))
+    forbidden.extend(result_tokens(action))
     return normalize_item({
         "shot_id": sid,
         "layers": {
@@ -267,7 +310,7 @@ def compile_frame_desc_from_shot(shot: dict) -> dict:
             "facing": facing or ("无人" if no_face else "朝镜头"),
             "hands": "无人" if no_face and "手" not in expr else (still or "尚未做本镜动作"),
             "holding": _holding_from_still(still, action),
-            "micro_expression": expr or "无脸",
+            "micro_expression": face or ("无脸" if no_face else ""),
         },
         "composition": {
             "weight": left or "主体在轴上",

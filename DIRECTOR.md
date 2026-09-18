@@ -35,6 +35,7 @@ shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（
 对白镜跟台词走；邻镜写成动作对；video_prompt 必须含本镜 action。
 续镜第 0 秒 start 必须已经在动作中间，不能站好再开始。
 对白/心里台词后插 1.2–2.0 秒无台词反应镜。
+首帧 = 动作起点状态（动词可已起手，禁结果）；motion 从 0.0s 就在动，ACTION TIMING 按秒两拍。复杂动作开场就在进行中，走近是另一镜。
 每镜合同带 handle=2 / render_seconds=seconds+2，给以后的 EDL 留修剪余地；assemble.sh 这期仍全长拼接。纸面目标 14–18 镜/分；要上 16–18 必须按纸面秒裁。
 写字模型只填句。没有密钥时启发式填 start/action/landing，禁止按剧情关键词写死英文。
 
@@ -51,7 +52,8 @@ shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（
 3. **每场 N 版**（`scene` × N，默认 3）：覆盖派 / 主观派 / 少切派各拆一版，各自过机器校验，不过带错误清单重来一次。风格不许破卡。
 4. **评审**（`critic`）：七维打分（揭示顺序、那一颗、节奏、静音、卡的承接、连戏、模型风险），挑一版，写为什么、写合并建议。评审不可用就机器兜底。
 5. **人选**：`03-storyboard/shot-candidates.draft.md` 并排看；导演台「选这版」换版不花 token。正式表只收被选的那版。
-6. **画面描述**（`frame_desc`，一场一次）：每镜一段能画的画——三层、光位、手、构图重心、机高意味、不得出现。关键帧岗照这段画，生成包 `image_prompt` 带它。
+6. **画面描述**（`frame_desc`，一场一次）：每镜一段能画的画——三层、光位、手、构图重心、机高意味、不得出现；每个在画人物一组 `acting {want, hide, business, muscle, change}`，写行为不写情绪（情绪形容词 = `acting_adjective` 警告，自检用 `07a` 的 15 条坏演技图谱）。关键帧岗照这段画，生成包 `image_prompt` 带它。
+   生成包（5.2）编译时前置本场 `geo_layout`（`sets.json.geo_zh`）和每人一句 `descriptor`，对白进 `audio_block`（`speech_mode=seedance_native`），只写肯定句、中文 ≤500 字。
 7. **animatic**：`scripts/animatic.py` 把锁定首帧按秒数切成审片片，看节奏。不是成片路径。
 
 **一镜一机位。** 默认不片内切。换机位、换景别合同、切反应，都开新镜。`in_from` / `out_to` 只写本机位起幅和落幅，不写「立刻切下一镜」。能力档 `max_internal_cuts=0`；要开片内切是未来某剧的 opt-in，不是本仓库默认。
