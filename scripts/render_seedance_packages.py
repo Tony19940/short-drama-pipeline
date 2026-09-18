@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -19,14 +22,19 @@ if str(SCRIPTS) not in sys.path:
 
 from director.paths import load_dotenv, productions_root, safe_under
 from director.pipeline import (
-    assert_keyframes_passed,
-    assert_packages_confirmed,
-    duration_for_shot,
+    episode_artifact_name,
+    episode_frame_dir,
+    episode_label,
+    episode_number,
+    episode_shot_dir,
     packages_confirmed,
     read_artifact,
+    raise_if,
     uses_pipeline,
+    validate_keyframes,
     validate_packages,
 )
+from director.video_fallback import render_seedance_or_h3_fallback
 from video_backends.seedance_ark import SeedanceArk
 
 SEEDANCE_MODE = {
@@ -36,6 +44,38 @@ SEEDANCE_MODE = {
 }
 FACE_TYPES = {"character", "costume_state"}
 MAX_REFS = 4
+ARCHIVE_SKIP_TOKENS = ("/smoke", "smoke-", "h3-staging", "animatic", "archive-")
+ARCHIVE_DIRNAME = "archive-before-force"
+
+
+def archive_existing_official(dest: Path, *, now: Optional[datetime] = None) -> Optional[Path]:
+    """Copy an official 05-shots/SHxxx.mp4 aside before --force overwrite.
+
+    Smoke, h3-staging, animatic, and files already inside an archive/ stay put.
+    Sidecars like ``SHxxx.mp4.clip.json`` are copied next to the archived mp4.
+    """
+    if dest.suffix.lower() != ".mp4":
+        return None
+    if not dest.exists() or dest.stat().st_size <= 1024:
+        return None
+    posix = dest.as_posix().lower()
+    if any(token in posix for token in ARCHIVE_SKIP_TOKENS):
+        return None
+    if dest.parent.name == ARCHIVE_DIRNAME:
+        return None
+    stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    archive_dir = dest.parent / ARCHIVE_DIRNAME
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archived = archive_dir / f"{dest.stem}-{stamp}{dest.suffix}"
+    if archived.exists():
+        archived = archive_dir / f"{dest.stem}-{stamp}-{os.getpid()}{dest.suffix}"
+    shutil.copy2(dest, archived)
+    for sidecar in dest.parent.glob(dest.name + ".*"):
+        if not sidecar.is_file():
+            continue
+        extra = sidecar.name[len(dest.name) :]
+        shutil.copy2(sidecar, archive_dir / f"{archived.name}{extra}")
+    return archived
 
 
 def _prod(path: str) -> Path:
@@ -49,13 +89,43 @@ def _text(value) -> str:
     return str(value or "").strip()
 
 
-def _packages(prod: Path) -> list[dict]:
-    data = read_artifact(prod, "gen_packages.json")
+def render_seconds_for_package(pkg: dict) -> int:
+    """Legal Seedance/H3 seconds. Paper can be 1–3s; render bumps to model min."""
+    min_sec = int(pkg.get("seedance_min_sec") or 4)
+    max_sec = int(pkg.get("seedance_max_sec") or 15)
+    raw = pkg.get("render_duration_sec")
+    if raw in (None, ""):
+        raw = pkg.get("duration_sec") or min_sec
+    try:
+        seconds = int(round(float(raw)))
+    except (TypeError, ValueError):
+        seconds = min_sec
+    if seconds < min_sec:
+        seconds = min_sec
+    if seconds > max_sec:
+        seconds = max_sec
+    return seconds
+
+
+def handoff_markdown_name(episode) -> str:
+    label = episode_label(episode)
+    if not label:
+        return f"HANDOFF-VIDEO-EP{episode_number(episode):02d}.md"
+    return f"HANDOFF-VIDEO-{label.replace('ep', 'EP', 1)}.md"
+
+
+def _rel_under_episode(rel: str, folder: str) -> bool:
+    posix = _text(rel).replace("\\", "/")
+    return bool(posix) and posix.startswith(folder.rstrip("/") + "/")
+
+
+def _packages(prod: Path, episode: int = 1) -> list[dict]:
+    data = read_artifact(prod, episode_artifact_name("gen_packages.json", episode))
     return list(data.get("packages") or data.get("gen_packages") or [])
 
 
-def _keyframes(prod: Path) -> dict[str, dict]:
-    data = read_artifact(prod, "keyframes.json")
+def _keyframes(prod: Path, episode: int = 1) -> dict[str, dict]:
+    data = read_artifact(prod, episode_artifact_name("keyframes.json", episode))
     return {item.get("shot_id"): item for item in (data.get("keyframes") or []) if item.get("shot_id")}
 
 
@@ -103,34 +173,45 @@ def seedance_mode(gen_mode: str) -> str:
     return mode
 
 
-def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, dict]) -> dict:
+def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, dict], episode=1) -> dict:
     sid = _text(pkg.get("shot_id"))
     kf = frames.get(sid) or {}
     qc = kf.get("qc") or {}
-    first_rel = _text(kf.get("first_frame_file")) or f"04-frames/{sid}.jpg"
-    last_rel = _text(kf.get("last_frame_file"))
+    frame_prefix = episode_frame_dir(episode)
+    shot_prefix = episode_shot_dir(episode)
+    first_rel = _text(kf.get("first_frame_file")) or _text(pkg.get("first_frame")) or f"{frame_prefix}/{sid}.jpg"
+    last_rel = _text(kf.get("last_frame_file")) or _text(pkg.get("last_frame"))
     gen_mode = _text(pkg.get("gen_mode"))
     plan = _text(pkg.get("keyframe_plan"))
     first = safe_under(prod, first_rel)
     last = safe_under(prod, last_rel) if last_rel else None
-    dest_rel = f"05-shots/{sid}.mp4"
-    extracted_rel = f"05-shots/{sid}-last.jpg"
+    dest_rel = f"{shot_prefix}/{sid}.mp4"
+    extracted_rel = f"{shot_prefix}/{sid}-last.jpg"
     errors: list[str] = []
     if not pkg.get("confirmed"):
         errors.append("package not confirmed")
     if _text(qc.get("status")) != "pass":
         errors.append("keyframe not passed")
+    if first_rel and not _rel_under_episode(first_rel, frame_prefix):
+        errors.append(f"first_frame outside episode folder: {first_rel}")
+    if last_rel and not _rel_under_episode(last_rel, frame_prefix):
+        errors.append(f"last_frame outside episode folder: {last_rel}")
     if not first.exists():
         errors.append(f"missing first frame {first_rel}")
-    if gen_mode == "flf2v" or plan == "first_last":
+    wants_last = gen_mode == "flf2v" or plan == "first_last"
+    if wants_last:
         if not last_rel:
             errors.append("flf2v / first_last missing last_frame_file")
         elif last is None or not last.exists():
             errors.append(f"missing last frame {last_rel}")
+    elif last_rel:
+        # first-only shots must not send a leftover designed last (including 29-shot 04-frames/).
+        last_rel = ""
+        last = None
     prompt = _text(pkg.get("motion_prompt"))
     if not prompt:
         errors.append("missing motion_prompt")
-    seconds = int(round(duration_for_shot(prod, sid, float(pkg.get("duration_sec") or 4))))
+    seconds = render_seconds_for_package(pkg)
     refs = identity_ref_paths(prod, pkg, assets, first) if first.exists() else []
     return {
         "shot_id": sid,
@@ -139,34 +220,48 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         "keyframe_plan": plan,
         "prompt": prompt,
         "duration_sec": seconds,
+        "paper_duration_sec": pkg.get("paper_duration_sec"),
+        "render_duration_sec": seconds,
         "first_frame": first_rel,
-        "last_frame": last_rel,
-        "use_last_frame": bool(gen_mode == "flf2v" and last_rel),
+        "last_frame": last_rel if wants_last else "",
+        "use_last_frame": bool(wants_last and last_rel),
         "refs": [str(path.relative_to(prod)) for path in refs],
         "dest": dest_rel,
         "extracted_last": extracted_rel,
         "overwrite_designed_last": False,
         "hardest": False,
+        "generate_audio": bool(pkg.get("generate_audio", True)),
         "errors": errors,
         "ok": not errors,
         "exists": (prod / dest_rel).exists() and (prod / dest_rel).stat().st_size > 1024,
     }
 
 
-def build_plan(prod: Path, only: Optional[list[str]] = None) -> dict:
+def build_plan(prod: Path, only: Optional[list[str]] = None, episode=1) -> dict:
     if not uses_pipeline(prod):
         raise SystemExit("这个项目不是 pipeline 岗，不要走 render_seedance_packages.py")
-    packages = _packages(prod)
-    frames = _keyframes(prod)
+    packages = _packages(prod, episode)
+    frames = _keyframes(prod, episode)
     assets = _assets(prod)
-    table = read_artifact(prod, "shot_list.json")
-    pkg_errors = validate_packages(read_artifact(prod, "gen_packages.json"), read_artifact(prod, "assets.json"), read_artifact(prod, "shot_specs.json"))
+    table_name = episode_artifact_name("shot_list.json", episode)
+    pkg_name = episode_artifact_name("gen_packages.json", episode)
+    spec_name = episode_artifact_name("shot_specs.json", episode)
+    kf_name = episode_artifact_name("keyframes.json", episode)
+    table = read_artifact(prod, table_name)
+    pkg_errors = validate_packages(read_artifact(prod, pkg_name), read_artifact(prod, "assets.json"), read_artifact(prod, spec_name))
     if pkg_errors:
         raise SystemExit("生成包未过校验：" + pkg_errors[0])
-    if not packages_confirmed(read_artifact(prod, "gen_packages.json")):
+    if not packages_confirmed(read_artifact(prod, pkg_name)):
         raise SystemExit("生成包还没 confirmed=true")
-    assert_packages_confirmed(prod)
-    assert_keyframes_passed(prod)
+    raise_if(
+        validate_keyframes(
+            read_artifact(prod, kf_name),
+            packages=read_artifact(prod, pkg_name),
+            specs=read_artifact(prod, spec_name),
+            table=table,
+            prod=prod,
+        )
+    )
     order = _shot_ids(table) or [_text(item.get("shot_id")) for item in packages]
     by_id = {_text(item.get("shot_id")): item for item in packages}
     want = set(only or [])
@@ -179,20 +274,28 @@ def build_plan(prod: Path, only: Optional[list[str]] = None) -> dict:
         if not pkg:
             shots.append({"shot_id": sid, "ok": False, "errors": ["missing gen_package"]})
             continue
-        item = plan_shot(prod, pkg, frames, assets)
+        item = plan_shot(prod, pkg, frames, assets, episode=episode)
         item["hardest"] = sid in hardest
         shots.append(item)
     missing = sorted(want - {item["shot_id"] for item in shots}) if want else []
     if missing:
         raise SystemExit("没有这些镜头：" + ", ".join(missing))
+    dest_dir = episode_shot_dir(episode)
     return {
         "prod": str(prod.relative_to(ROOT)) if ROOT in prod.parents or prod == ROOT else str(prod),
+        "episode": episode_label(episode) or episode_number(episode),
+        "episode_no": episode_number(episode),
+        "episode_label": episode_label(episode),
+        "dest_dir": dest_dir,
         "shots": shots,
         "count": len(shots),
         "ok_count": sum(1 for item in shots if item.get("ok")),
+        "first_last_count": sum(1 for item in shots if item.get("use_last_frame")),
+        "missing_first": sum(1 for item in shots if any("missing first" in err for err in (item.get("errors") or []))),
         "hardest": [item["shot_id"] for item in shots if item.get("hardest")],
         "writes_shots_json": False,
         "overwrites_designed_last": False,
+        "overwrites_unsuffixed_shots": dest_dir == "05-shots",
     }
 
 
@@ -200,98 +303,161 @@ def _extract_last(video: Path, dest: Path) -> None:
     import subprocess
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.check_call(
-        ["ffmpeg", "-y", "-sseof", "-0.05", "-i", str(video), "-frames:v", "1", str(dest)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    # -0.05 can miss the last packet on short H3-scaled clips (ffmpeg 234).
+    for seek in ("-0.05", "-0.5", "-1"):
+        rc = subprocess.call(
+            ["ffmpeg", "-y", "-sseof", seek, "-i", str(video), "-frames:v", "1", str(dest)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if rc == 0 and dest.exists() and dest.stat().st_size > 0:
+            return
+    print(f"  warn: could not extract last frame from {video.name}; official clip kept", flush=True)
 
 
 def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
     load_dotenv()
     backend = SeedanceArk()
-    out_dir = prod / "05-shots"
+    out_dir = prod / (plan.get("dest_dir") or episode_shot_dir(plan.get("episode") or 1))
     out_dir.mkdir(parents=True, exist_ok=True)
     for item in plan["shots"]:
         sid = item["shot_id"]
         if not item.get("ok"):
             raise SystemExit(f"{sid} 还不能出片：" + "; ".join(item.get("errors") or []))
         dest = prod / item["dest"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
         if skip_existing and item.get("exists"):
             print(f"  {sid} already has {item['dest']}, skip")
             continue
+        if not skip_existing:
+            archived = archive_existing_official(dest)
+            if archived:
+                print(f"  archived existing {dest.name} -> {archived}", flush=True)
         image = safe_under(prod, item["first_frame"])
         last = safe_under(prod, item["last_frame"]) if item.get("use_last_frame") and item.get("last_frame") else None
         # Character portraits are listed on the plan for humans. Seedance 2.0
         # treats simulated faces as real-person privacy, so do not upload them.
         refs: list = []
-        backend.render(
-            image,
-            item["prompt"],
-            int(item["duration_sec"]),
-            dest,
-            refs=refs,
-            mode=item["seedance_mode"],
-            last_frame=last,
-            force=not skip_existing,
-        )
+        if item.get("force_h3_fallback"):
+            from director.video_fallback import official_h3_fallback
+
+            record = official_h3_fallback(
+                image,
+                item["prompt"],
+                int(item["duration_sec"]),
+                dest,
+                last_frame=last,
+                mode=item["seedance_mode"],
+                force=not skip_existing,
+            )
+        else:
+            record = render_seedance_or_h3_fallback(
+                backend,
+                image,
+                item["prompt"],
+                int(item["duration_sec"]),
+                dest,
+                refs=refs,
+                mode=item["seedance_mode"],
+                last_frame=last,
+                force=not skip_existing,
+                generate_audio=item.get("generate_audio", True),
+            )
+        item["clip"] = record
         extracted = prod / item["extracted_last"]
         _extract_last(dest, extracted)
         print(f"  extracted last {extracted.relative_to(prod)} (designed still untouched)")
 
 
-def write_manifest(prod: Path, plan: dict) -> Path:
-    dest = prod / ".pipeline" / "seedance_render_plan.json"
+def write_manifest(prod: Path, plan: dict, *, force: bool = False) -> Path:
+    episode = plan.get("episode_label") or plan.get("episode") or 1
+    name = episode_artifact_name("seedance_render_plan.json", episode)
+    dest = prod / ".pipeline" / name
     dest.parent.mkdir(parents=True, exist_ok=True)
     body = dict(plan)
     body["status"] = "dry-run"
+    body["force"] = bool(force)
     dest.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return dest
 
 
-def write_markdown(prod: Path, plan: dict) -> Path:
-    dest = prod / "03-storyboard" / "HANDOFF-VIDEO-EP01.md"
+def write_markdown(prod: Path, plan: dict, *, force: bool = False) -> Path:
+    episode = plan.get("episode_label") or plan.get("episode") or 1
+    dest = prod / "03-storyboard" / handoff_markdown_name(episode)
+    rel_prod = plan.get("prod") or str(prod)
+    dest_dir = plan.get("dest_dir") or episode_shot_dir(episode)
+    ep_flag = episode_label(episode) or str(episode_number(episode))
+    cmd = (
+        "python3 scripts/render_seedance_packages.py \\\n"
+        f"  --prod {rel_prod} \\\n"
+        f"  --episode {ep_flag}"
+    )
+    title_ep = handoff_markdown_name(episode).replace("HANDOFF-VIDEO-", "").replace(".md", "")
+    title = f"# {title_ep} 6.2 出片准备（Seedance 2.0 Mini 720p）"
     lines = [
-        "# 第 1 集 6.2 出片准备（Seedance 2.0 Mini 480P）",
+        title,
         "",
         "本文件是正式出片前的交接，不是成片。**不要写 `shots.json`。**",
         "",
-        "入口：",
+        "## 一键出片",
+        "",
+        "会提交 Seedance。先 `--dry-run` 核对 67 镜、0 缺帧、dest 在分集目录。",
         "",
         "```bash",
-        "python3 scripts/render_seedance_packages.py \\",
-        "  --prod productions/009-siem-reap \\",
-        "  --dry-run",
+        "set -a && source .env && set +a",
+        "export ARK_API_KEY=你的方舟密钥",
+        "export ARK_SEEDANCE_MODEL=doubao-seedance-2-0-mini-260615   # 或控制台接入点",
+        "export ARK_RESOLUTION=720p",
+        "export MINIMAX_API_KEY=人脸拦截才用的官方 H3 密钥   # 缺了则该镜 fail：face-blocked, no H3 key",
+        cmd,
         "```",
         "",
-        "真出片时去掉 `--dry-run`，可加 `--only SH001`。抽出的尾帧写到 `05-shots/SHxxx-last.jpg`，不覆盖 `04-frames/SHxxx-last.jpg`。",
+        "核对不发任务：同一条命令加 `--dry-run`。只重跑一镜加 `--only SH001`。",
+        "已知该镜已被脸拦、跳过 Seedance：加 `--h3-fallback`（必须带 `--only`，禁止整集倒给 H3）。",
+        f"抽出的尾帧写到 `{dest_dir}/SHxxx-last.jpg`，不覆盖 `04-frames/` 设计尾帧。",
+        "",
+        "## 范围",
         "",
         f"- 镜头数：{plan['count']}",
         f"- 可派：{plan['ok_count']}",
+        f"- 首尾帧（flf / first_last）：{plan.get('first_last_count') if plan.get('first_last_count') is not None else '—'}",
+        f"- 成片目录：`{dest_dir}/SHxxx.mp4`（新建分集夹，不覆盖 `05-shots/SH001.mp4`–`SH029.mp4`）",
         f"- 最难：{', '.join(plan['hardest']) or '—'}",
-        "- 模型 / 分辨率：以 `.env` 的 `ARK_SEEDANCE_MODEL` / `ARK_RESOLUTION` 为准（当前约定 Mini + 480P）",
+        "- 模型 / 分辨率：Seedance 2.0 Mini **720p**（`1280×720`）。只在 create 被判人脸拦截（`PrivacyInformation`）时，这一镜改走官方 MiniMax-H3 768p，本机 ffmpeg 缩到 1280×720。配额 / 超时 / 风控词 / poll 失败不 fallback。",
+        "- 秒数：纸面 `paper_duration_sec` 可短于 4（开场 1s、反应 2s）。提交用 `render_duration_sec`（不足 4 秒抬到模型下限）。成片按纸面 2–4 秒裁，assemble 是另一次 PM 指令。",
+        "- 声音：Seedance `generate_audio=true`。H3 fallback 不对口型、不重做对白。旧 `07-dubbing/sfx/ep01-sfx.m4a` 是 29 镜 191s，对不上 67 镜 v2；旧 SRT 也没重映射，不要叠。",
+        "- **不要**对无后缀 `05-shots/SH*.mp4` 用 `--force`。`--episode 1` 仍指向 29 镜锁画。本命令必须带 `--episode ep01-v2`。",
+        "- 成片后的 assemble / 剪辑 / 新 SFX 床是另一次 PM 指令。本命令只落到分集目录。",
         "",
-        "| 镜 | 模式 | 秒 | 首帧 | 设计尾帧 | 身份参考 | 最难 | 状态 |",
-        "|---|---|---:|---|---|---|---|---|",
+        "| 镜 | 模式 | 渲秒 | 纸面秒 | 首帧 | 设计尾帧 | 身份参考 | 最难 | 状态 |",
+        "|---|---|---:|---:|---|---|---|---|---|",
     ]
     for item in plan["shots"]:
         refs = ", ".join(f"`{rel}`" for rel in item.get("refs") or []) or "—"
         last = item.get("last_frame") or "—"
         status = "可派" if item.get("ok") else "; ".join(item.get("errors") or ["blocked"])
         if item.get("exists"):
-            status = "已有 mp4，将跳过"
+            status = "已有 mp4，--force 将先归档再覆盖" if force else "已有 mp4，将跳过"
+        paper = item.get("paper_duration_sec")
+        paper_s = "—" if paper in (None, "") else paper
         lines.append(
-            f"| {item['shot_id']} | {item.get('gen_mode')}→{item.get('seedance_mode')} | {item.get('duration_sec')} | `{item.get('first_frame')}` | `{last}` | {refs} | {'是' if item.get('hardest') else ''} | {status} |"
+            f"| {item['shot_id']} | {item.get('gen_mode')}→{item.get('seedance_mode')} | {item.get('duration_sec')} | {paper_s} | `{item.get('first_frame')}` | `{last}` | {refs} | {'是' if item.get('hardest') else ''} | {status} |"
         )
     lines.extend(
         [
             "",
-            "建议顺序：先 SH001 看脸和左右轴，再最难三镜 SH004 / SH013 / SH019，不要一次派 21 镜。",
-            "flf 镜只交首尾帧：Ark 拒 last_frame 和 reference_image 混用。身份参考只给 i2v 镜。",
+            "flf 镜只交首尾帧：Ark 拒 last_frame 和 reference_image 混用。身份参考只给 i2v 镜，且正式出片不上传护照图（人脸拦）。",
+            "首帧 = t=0，motion 从 one_action 之后才动，不要把首帧当成已经做完的动作。",
+            "",
+            "## 剩下的 blocker",
+            "",
+            "- 帧：无。67 首帧 + 21 尾帧都在 `04-frames/ep01-v2/`，包不引用无后缀 `04-frames/SH*-last.jpg`。",
+            "- 出片本身：等 PM 跑上面那条命令。本交接没有提交 Ark / H3。",
+            "- 成片后：assemble、新 SFX、SRT 重映射都还没做，需要另下指令。",
             "",
         ]
     )
-    dest.write_text("\n".join(lines), encoding="utf-8")
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return dest
 
 
@@ -301,26 +467,54 @@ def main() -> None:
     parser.add_argument("--only", nargs="*")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="已有 mp4 也重跑")
+    parser.add_argument(
+        "--h3-fallback",
+        action="store_true",
+        help="skip Seedance; official MiniMax-H3 + local scale to 1280x720 for --only shots",
+    )
+    parser.add_argument(
+        "--episode",
+        default="1",
+        help="集数或标签：1、2、ep01-v2。标签成片落到 05-shots/<label>/，不覆盖无后缀 05-shots/",
+    )
     args = parser.parse_args()
     prod = _prod(args.prod)
     if not prod.is_dir():
         raise SystemExit(f"没有这个项目：{prod}")
-    plan = build_plan(prod, args.only)
+    plan = build_plan(prod, args.only, episode=args.episode)
+    summary_keys = (
+        "prod",
+        "episode",
+        "dest_dir",
+        "count",
+        "ok_count",
+        "first_last_count",
+        "missing_first",
+        "hardest",
+        "writes_shots_json",
+        "overwrites_designed_last",
+        "overwrites_unsuffixed_shots",
+    )
     if not args.only:
-        manifest = write_manifest(prod, plan)
-        handoff = write_markdown(prod, plan)
-        print(json.dumps({k: plan[k] for k in ("prod", "count", "ok_count", "hardest", "writes_shots_json", "overwrites_designed_last")}, ensure_ascii=False, indent=2))
+        manifest = write_manifest(prod, plan, force=args.force)
+        handoff = write_markdown(prod, plan, force=args.force)
+        print(json.dumps({k: plan[k] for k in summary_keys}, ensure_ascii=False, indent=2))
         print(f"wrote {manifest.relative_to(ROOT)}")
         print(f"wrote {handoff.relative_to(ROOT)}")
     else:
-        print(json.dumps({k: plan[k] for k in ("prod", "count", "ok_count", "hardest", "writes_shots_json", "overwrites_designed_last")}, ensure_ascii=False, indent=2))
-        print("only=" + ",".join(args.only) + "; left full seedance_render_plan.json / HANDOFF-VIDEO-EP01.md alone")
+        print(json.dumps({k: plan[k] for k in summary_keys}, ensure_ascii=False, indent=2))
+        print("only=" + ",".join(args.only) + "; left full seedance_render_plan / HANDOFF-VIDEO alone")
     blocked = [item for item in plan["shots"] if not item.get("ok")]
     if blocked:
         raise SystemExit("还不能出片：" + ", ".join(item["shot_id"] + "(" + ";".join(item["errors"]) + ")" for item in blocked))
     if args.dry_run:
         print("dry-run only; no Ark task submitted")
         return
+    if args.h3_fallback:
+        if not args.only:
+            raise SystemExit("--h3-fallback needs --only SHxxx (do not dump a whole episode onto H3)")
+        for item in plan["shots"]:
+            item["force_h3_fallback"] = True
     render_plan(prod, plan, skip_existing=not args.force)
 
 

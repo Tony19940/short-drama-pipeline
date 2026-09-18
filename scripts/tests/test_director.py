@@ -539,6 +539,21 @@ class DirectorTests(unittest.TestCase):
                 paths.PRODUCTIONS = old
 
 
+    def test_default_aspect_is_widescreen(self) -> None:
+        from director.defaults import DEFAULT_ASPECT, production_aspect
+
+        self.assertEqual(DEFAULT_ASPECT, "16:9")
+        self.assertEqual(production_aspect(), "16:9")
+        self.assertEqual(production_aspect(explicit="9:16"), "9:16")
+        self.assertEqual(
+            production_aspect(ROOT / "productions" / "004-yuye-jinlian"),
+            "9:16",
+        )
+        self.assertEqual(
+            production_aspect(ROOT / "productions" / "010-gongpai"),
+            "16:9",
+        )
+
     def test_vocab_templates_compile_legal_moves(self) -> None:
         from director.inbox import task_for_asset
         from director.prompts import camera_for_move, compose_video_prompt, character_sheet_prompt, load_template
@@ -547,7 +562,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("slow push in on one subject", camera_for_move("push"))
         self.assertIn("no orbit", camera_for_move("static"))
         formula = load_template("video-prompt-formula.md")
-        self.assertIn("9:16 photoreal Khmer", formula)
+        self.assertIn("16:9 photoreal Khmer", formula)
         self.assertIn("orbit", load_template("camera-moves.md"))
         prompt = compose_video_prompt(
             {
@@ -560,7 +575,7 @@ class DirectorTests(unittest.TestCase):
                 "look": "same factory-floor axis",
             }
         )
-        self.assertIn("Vertical 9:16", prompt)
+        self.assertIn("Widescreen 16:9", prompt)
         self.assertIn("slow push in", prompt)
         self.assertNotIn("orbit the subject", prompt)
         sheet = character_sheet_prompt("sophea", "sheet")
@@ -926,6 +941,46 @@ class DirectorTests(unittest.TestCase):
             self.assertEqual(last["dest"], "04-frames/SH004-last.jpg")
             self.assertEqual(last["parent"], "04-frames/SH004.jpg")
 
+    def test_codex_frame_defaults_to_prev_first_and_rejects_master(self) -> None:
+        from PIL import Image
+        from director.pipeline import write_artifact
+        from place_codex_frame import parent_chain_errors, place
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = Path(tmp) / "010"
+            (prod / "04-frames").mkdir(parents=True)
+            plate = prod / "02-assets" / "scenes" / "storeroom" / "master.jpg"
+            plate.parent.mkdir(parents=True)
+            Image.new("RGB", (128, 72), (10, 10, 10)).save(plate)
+            src = Path(tmp) / "frame.png"
+            Image.new("RGB", (128, 72), (40, 80, 40)).save(src)
+            write_artifact(
+                prod,
+                "shot_list.json",
+                {
+                    "schema": "shot-table-v2",
+                    "shots": [
+                        {"shot_id": "SH007", "scene_id": "EP01_SC02"},
+                        {"shot_id": "SH008", "scene_id": "EP01_SC02"},
+                    ],
+                },
+            )
+            place(prod, "SH007", "first", src, parent="02-assets/scenes/storeroom/master.jpg")
+            place(prod, "SH007", "last", src)
+            landed = place(prod, "SH008", "first", src)
+            self.assertEqual(landed["parent"], "04-frames/SH007-last.jpg")
+            with self.assertRaises(ValueError):
+                place(prod, "SH008", "first", src, parent="02-assets/scenes/storeroom/master.jpg")
+            self.assertEqual(parent_chain_errors(prod), [])
+            meta = json.loads((prod / "04-frames" / "SH008.json").read_text(encoding="utf-8"))
+            meta["parent"] = "02-assets/scenes/storeroom/master.jpg"
+            meta["allow_master"] = False
+            (prod / "04-frames" / "SH008.json").write_text(json.dumps(meta), encoding="utf-8")
+            self.assertTrue(any("SH008 parent is scene master" in e for e in parent_chain_errors(prod)))
+            allowed = place(prod, "SH008", "first", src, parent="02-assets/scenes/storeroom/master.jpg", allow_master=True)
+            self.assertEqual(allowed["parent"], "02-assets/scenes/storeroom/master.jpg")
+            self.assertEqual(parent_chain_errors(prod), [])
+
     def test_start_required_and_cannot_copy_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             prod = Path(tmp) / "003"
@@ -1234,8 +1289,8 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("FL2VA", block)
         self.assertNotIn("千军", block)
         writer = prompt_block("writer")
-        self.assertIn("前 5 秒", writer)
-        self.assertIn("小三幕", writer)
+        self.assertIn("先让人站住", writer)
+        self.assertIn("只升级一件事", writer)
         director = prompt_block("director")
         self.assertIn("宫格", director)
         self.assertIn("摄影机契约", director)
@@ -1484,6 +1539,9 @@ class DirectorTests(unittest.TestCase):
         self.assertTrue(text_configured())
         self.assertEqual(text_backend(), "grok-subscription")
         self.assertEqual(parse_json_content('{"ok": true}'), {"ok": True})
+        premature = '{"shots":[{"shot_id":"SH001","duration_sec":4}] ,{"shot_id":"SH002","duration_sec":5}]}'
+        recovered = parse_json_content(premature)
+        self.assertEqual([s["shot_id"] for s in recovered["shots"]], ["SH001", "SH002"])
         os.environ["DIRECTOR_DISABLE_GROK_SUBSCRIPTION"] = "1"
         try:
             self.assertFalse(text_configured())
@@ -1505,13 +1563,16 @@ class DirectorTests(unittest.TestCase):
             old = os.environ.get("ARK_API_KEY")
             old_model = os.environ.get("ARK_SEEDANCE_MODEL")
             old_res = os.environ.get("ARK_RESOLUTION")
+            old_audio = os.environ.get("ARK_GENERATE_AUDIO")
             os.environ["ARK_API_KEY"] = "test-key"
             os.environ["ARK_SEEDANCE_MODEL"] = "doubao-seedance-2-0-mini-260615"
             os.environ["ARK_RESOLUTION"] = "480p"
+            os.environ.pop("ARK_GENERATE_AUDIO", None)
             try:
                 backend = SeedanceArk()
                 payload = backend.build_payload(image, "中文动作", 6, refs=[ref], mode="flf", last_frame=end)
                 i2v = backend.build_payload(image, "中文动作", 4, refs=[ref], mode="i2v")
+                silent = backend.build_payload(image, "中文动作", 4, mode="i2v", generate_audio=False)
             finally:
                 if old is not None:
                     os.environ["ARK_API_KEY"] = old
@@ -1525,6 +1586,10 @@ class DirectorTests(unittest.TestCase):
                     os.environ["ARK_RESOLUTION"] = old_res
                 else:
                     os.environ.pop("ARK_RESOLUTION", None)
+                if old_audio is not None:
+                    os.environ["ARK_GENERATE_AUDIO"] = old_audio
+                else:
+                    os.environ.pop("ARK_GENERATE_AUDIO", None)
             roles = [item.get("role") for item in payload["content"] if item.get("type") == "image_url"]
             self.assertEqual(payload["model"], "doubao-seedance-2-0-mini-260615")
             self.assertEqual(payload["resolution"], "480p")
@@ -1533,10 +1598,46 @@ class DirectorTests(unittest.TestCase):
             self.assertIn("first_frame", roles)
             self.assertIn("last_frame", roles)
             self.assertFalse(payload["watermark"])
-            self.assertFalse(payload["generate_audio"])
+            self.assertTrue(payload["generate_audio"])
+            self.assertTrue(i2v["generate_audio"])
+            self.assertFalse(silent["generate_audio"])
             i2v_roles = [item.get("role") for item in i2v["content"] if item.get("type") == "image_url"]
             self.assertIn("reference_image", i2v_roles)
             self.assertNotIn("last_frame", i2v_roles)
+
+    def test_backends_refuse_out_of_range_seconds_instead_of_clamping(self) -> None:
+        from unittest import mock
+
+        from video_backends.compshare_h3 import CompShareH3
+        from video_backends.seedance_ark import SeedanceArk
+
+        env = {"ARK_API_KEY": "test-key", "ARK_SEEDANCE_MODEL": "doubao-seedance-2-0-mini-260615", "COMPSHARE_API_KEY": "sk-ml-test"}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env):
+            image = Path(tmp) / "first.jpg"
+            image.write_bytes(b"fakejpg")
+            backend = SeedanceArk()
+            self.assertEqual(backend.clamp_duration(15), 15)
+            self.assertEqual(backend.build_payload(image, "中文动作", 4, mode="i2v")["duration"], 4)
+            with self.assertRaises(RuntimeError) as ctx:
+                backend.build_payload(image, "中文动作", 20, mode="i2v")
+            self.assertEqual(str(ctx.exception), "秒数 20 不在 doubao-seedance-2-0-mini-260615 档内 [4,15]，改分镜表，不替人改")
+            with self.assertRaises(RuntimeError):
+                backend.clamp_duration(0)
+            # render names the shot and stops before any ticket or task is written
+            dest = Path(tmp) / "SH003.mp4"
+            backend.submit = lambda *a, **k: self.fail("must not submit")  # type: ignore[method-assign]
+            with self.assertRaises(RuntimeError) as ctx:
+                backend.render(image, "prompt", 3, dest)
+            self.assertTrue(str(ctx.exception).startswith("SH003 秒数 3 不在 "))
+            self.assertFalse(dest.with_suffix(".mp4.ark-task.json").exists())
+            h3 = CompShareH3()
+            self.assertEqual(h3.clamp_duration(6), 6)
+            with self.assertRaises(RuntimeError) as ctx:
+                h3.clamp_duration(16, shot_id="SH010")
+            self.assertEqual(str(ctx.exception), "SH010 秒数 16 不在 MiniMax-H3 档内 [4,15]，改分镜表，不替人改")
+            h3.points = lambda: self.fail("must not spend points")  # type: ignore[method-assign]
+            with self.assertRaises(RuntimeError):
+                h3.render(image, "prompt", 2, Path(tmp) / "SH011.mp4")
 
     def test_seedance_render_resumes_ticket_instead_of_resubmitting(self) -> None:
         from video_backends.seedance_ark import SeedanceArk
@@ -1560,6 +1661,24 @@ class DirectorTests(unittest.TestCase):
                     os.environ.pop("ARK_API_KEY", None)
             self.assertEqual(called["submit"], 0)
             self.assertTrue(dest.exists())
+
+    def test_seedance_cancel_and_create_task_parse_empty_body(self) -> None:
+        from unittest import mock
+
+        from video_backends.seedance_ark import SeedanceArk
+
+        class FakeResp:
+            def __init__(self, status_code: int, text: str = "") -> None:
+                self.status_code = status_code
+                self.text = text
+
+            def json(self):
+                raise ValueError("empty")
+
+        with mock.patch.dict(os.environ, {"ARK_API_KEY": "test-key"}):
+            backend = SeedanceArk()
+        self.assertEqual(backend._json_body(FakeResp(200, "")), {})
+        self.assertEqual(backend._json_body(FakeResp(400, "not-json"))["error"]["code"], "InvalidJSON")
 
     def test_seedance_render_uses_existing_task_id(self) -> None:
         from video_backends.seedance_ark import SeedanceArk
@@ -1626,6 +1745,122 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("速卡蹲在石槽前", prompt)
         self.assertNotIn("integrated_multimodal_description", prompt)
         self.assertIn("对白不进画面", prompt)
+
+    def test_gate_c_accepts_v2_shot_list_without_legacy_shots(self) -> None:
+        from director.gates import gate_file_ready, inspect_files, v2_storyboard_ready
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = Path(tmp) / "v2show"
+            (prod / ".pipeline").mkdir(parents=True)
+            (prod / "03-storyboard").mkdir(parents=True)
+            table = {
+                "schema": "shot-table-v2",
+                "status": "locked",
+                "target_model": "seedance_2_0",
+                "shots": [{"shot_id": "SH001"}],
+            }
+            (prod / ".pipeline" / "shot_list.json").write_text(
+                json.dumps(table, ensure_ascii=False), encoding="utf-8"
+            )
+            with patch("director.pipeline.validate_shot_list", return_value=[]):
+                ok, reason = v2_storyboard_ready(prod)
+                self.assertTrue(ok, reason)
+                ready, ready_reason = gate_file_ready(prod, "C", inspect_files(prod))
+                self.assertTrue(ready, ready_reason)
+                self.assertFalse((prod / "03-storyboard" / "shots.json").exists())
+                self.assertFalse((prod / "03-storyboard" / "coverage.md").exists())
+
+    def test_gate_d_accepts_pipeline_keyframes_without_shots_json(self) -> None:
+        from director.gates import gate_file_ready, inspect_files
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = Path(tmp) / "v2show"
+            (prod / ".pipeline").mkdir(parents=True)
+            (prod / "04-frames").mkdir(parents=True)
+            Image.new("RGB", (32, 18)).save(prod / "04-frames" / "SH001.jpg")
+            table = {"schema": "shot-table-v2", "status": "locked", "shots": [{"shot_id": "SH001", "scale": "wide"}]}
+            packages = {"packages": [{"shot_id": "SH001", "keyframe_plan": "first"}]}
+            kf = {
+                "reviewed_by": "tonyteacher",
+                "keyframes": [
+                    {
+                        "shot_id": "SH001",
+                        "first_frame_file": "04-frames/SH001.jpg",
+                        "qc": {
+                            "status": "pass",
+                            "face": "pass",
+                            "costume": "pass",
+                            "location": "pass",
+                            "left_right": "pass",
+                            "composition": "pass",
+                            "aspect_ratio": "pass",
+                            "light_matches_spec": "pass",
+                            "state_match": "pass",
+                        },
+                    }
+                ],
+            }
+            (prod / ".pipeline" / "shot_list.json").write_text(json.dumps(table), encoding="utf-8")
+            (prod / ".pipeline" / "gen_packages.json").write_text(json.dumps(packages), encoding="utf-8")
+            (prod / ".pipeline" / "keyframes.json").write_text(json.dumps(kf), encoding="utf-8")
+            files = inspect_files(prod)
+            self.assertEqual(files["shot_count"], 1)
+            self.assertEqual(files["locked_frame_count"], 1)
+            self.assertFalse((prod / "03-storyboard" / "shots.json").exists())
+            ready, reason = gate_file_ready(prod, "D", files)
+            self.assertTrue(ready, reason)
+
+    def test_gate_e_requires_animatic_only_for_official_videos(self) -> None:
+        from director.gates import gate_file_ready, inspect_files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = Path(tmp) / "v2show"
+            (prod / ".pipeline").mkdir(parents=True)
+            (prod / "04-frames").mkdir(parents=True)
+            (prod / ".pipeline" / "shot_list.json").write_text(
+                json.dumps({"schema": "shot-table-v2", "shots": [{"shot_id": "SH001"}]}),
+                encoding="utf-8",
+            )
+            files = inspect_files(prod)
+            ready, reason = gate_file_ready(prod, "E", files)
+            self.assertFalse(ready)
+            self.assertIn("还没有单镜视频", reason)
+            (prod / "05-shots").mkdir(parents=True)
+            (prod / "05-shots" / "SH001.mp4").write_bytes(b"x" * 32)
+            (prod / "04-frames" / "SH001.jpg").write_bytes(b"x")
+            files = inspect_files(prod)
+            ready, reason = gate_file_ready(prod, "E", files)
+            self.assertFalse(ready)
+            self.assertIn("animatic", reason)
+
+
+class SeedanceMotionOneSetupTests(unittest.TestCase):
+    def test_out_to_cut_language_is_stripped_and_internal_cuts_stay_off(self) -> None:
+        from director.prompts import compile_seedance_motion_from_spec, sanitize_camera_state
+        from director.video_profiles import get_profile
+
+        self.assertEqual(sanitize_camera_state("立刻切她的怕"), "")
+        self.assertEqual(sanitize_camera_state("肩刚出白衬衫，切琳的眼"), "肩刚出白衬衫")
+        self.assertEqual(sanitize_camera_state("画面下缘切在小腿"), "画面下缘切在小腿")
+        motion = compile_seedance_motion_from_spec(
+            {
+                "in_from": "她还盯工牌",
+                "out_to": "立刻切她的怕",
+                "action_now": "从琳肩后看见胸口透光",
+                "duration_sec": 4,
+                "internal_cuts": [{"at_sec": 3, "scale": "close", "one_action": "切她的怕"}],
+            },
+            {},
+            get_profile("seedance_2_0"),
+        )
+        self.assertNotIn("立刻切", motion)
+        self.assertNotIn("片内切", motion)
+        self.assertNotIn("切到", motion)
+        self.assertIn("整段停在本机位", motion)
+        self.assertIn("从起幅开始：她还盯工牌。", motion)
+
 
 if __name__ == "__main__":
 

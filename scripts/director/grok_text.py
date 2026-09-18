@@ -137,6 +137,20 @@ def parse_json_content(content: str) -> Any:
     except json.JSONDecodeError:
         start = raw.find("{")
         end = raw.rfind("}")
+        # Closed the shots array too early, then kept emitting shot objects.
+        premature = re.sub(r"\]\s*,\s*(\{\"shot_id\")", r",\1", raw, count=1)
+        if premature != raw:
+            try:
+                return json.loads(premature)
+            except json.JSONDecodeError:
+                pass
+        if start >= 0:
+            # One complete object followed by extra text (a repeated object, a note): keep the first object.
+            try:
+                obj, _end = json.JSONDecoder().raw_decode(raw, start)
+                return obj
+            except json.JSONDecodeError:
+                pass
         if start >= 0 and end > start:
             snippet = raw[start : end + 1]
             try:

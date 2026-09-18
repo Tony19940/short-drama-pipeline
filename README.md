@@ -14,7 +14,7 @@
 4. 锁主图。然后写 `sets.json`，跑 `render_blocking.py` 得到舞台。没有 blocking 不准写镜头。
 5. `coverage.md` 一场几种机位 → `shots.json` → `python3 scripts/check_prod.py --prod …`。continue 出片吃上一镜末帧。审剧情用 `mix_review_track.py`，不要拿无声 H3 当审片。
 
-规则见 [PIPELINE.md](PIPELINE.md)、[CULTURE.md](CULTURE.md)、[QUALITY.md](QUALITY.md)（硬规则 **R1–R12**）。出片见 [VIDEO.md](VIDEO.md)。
+规则见 [PIPELINE.md](PIPELINE.md)、[CULTURE.md](CULTURE.md)、[QUALITY.md](QUALITY.md)（硬规则 **R1–R14**）。出片见 [VIDEO.md](VIDEO.md)。
 
 ## 目录
 
@@ -46,7 +46,7 @@ productions/
 - **视频**：按镜切。默认 Hailuo 2.3 Fast 无声；每集最多 3 镜 H3，且必须带角色主图作参考。见 `VIDEO.md`。
 - **成片**：ffmpeg 拼接画面，再叠旁白和字幕。不对口型。旁白更长时拉长画面，不加速人声。
 
-都市短剧默认 **50–75 秒，6–10 镜**；神话旁白集仍可 **70–90 秒，8–15 镜**。100 集合集按季复用主图，不平行开三季。
+都市短剧默认 **16:9 横幅**。单集时长跟分镜走，不设秒数上限。100 集合集按季复用主图，不平行开三季。已锁定 9:16 的旧项目维持原画幅。
 
 
 ## 本机导演台

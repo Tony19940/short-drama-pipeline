@@ -24,15 +24,17 @@ v3 主验收是 `004-yuye-jinlian` 第 01 集。导演台默认打开 004。`003
 | 小说 | 写或上传故事 | 启动 InkOS 或上传 md/txt |
 | 编剧 | 改能拍的分场本 | 保存台词和场次；不写景别运镜 |
 | 资产 | 锁脸/空镜/道具 | 按缺口清单把图放进 02-assets |
-| 分镜 | 决定拍哪些镜头 | 先舞台，再按场拆镜头清单 |
+| 分镜 | 决定拍哪些镜头 | 先舞台，再镜头表 v2：「场戏分析」出场卡 →「导演 Agent 拆镜（N 版）」→ 每场候选对比「选这版」→「画面描述」→「静帧 animatic」；旧剧切「旧表 shots.json」 |
 | 说明书 | 7 组人读说明 | 保存；台词必须是编剧原句 |
 | 生成包 | 模型计划 | 人点确认后才能出关键帧/视频 |
 | 关键帧 | 这一镜静帧 | 从父图改，过审再往下 |
 | 视频 | 单镜出片 | 先预览再派出；未确认生成包不能派 |
-| 声音 | 原句配音 | 叠工作旁白听一遍 |
+| 声音 | 原句配音 | 先按分镜表混音效床，再叠工作旁白听一遍 |
 | 剪辑 | 时间线成片 | 按说明书秒数修剪，可删镜 |
 
 导演页先看整场节奏板，再点「按场拆镜」。拆镜只写草稿。人接受后才进正式表。详见 `DIRECTOR.md`。
+
+分镜页第 2 步在有 `.pipeline/` 的剧默认是镜头表 v2：顶部四个按钮（场戏分析 / 导演 Agent 拆镜 N 版 / 画面描述 / 静帧 animatic），每场一张可折叠场卡和一张候选对比表（机器指标 + 评审七维 + 选这版），镜头条带首帧缩略图和 v2 字段，右侧是本镜编辑器（保存整张表，机器校验不过就 409 列出原因）、画面描述段、警告清单。「旧表 shots.json」切回旧页。
 
 每关要人点锁定。未过 `check_prod.py` 不能出视频。AI 只写草稿。旧项目（如 004）没有 `source/` 时故事页只读展示已迁移剧本，不改写 `ep01.md` / 资产 / 8 镜。
 
@@ -55,7 +57,7 @@ v3 主验收是 `004-yuye-jinlian` 第 01 集。导演台默认打开 004。`003
 
 ## 禁止
 
-Ken Burns / `stills-to-shots.sh` 不是成片路径。该脚本已挪到 `scripts/_disabled/`。`assemble.sh` 会拒绝 `*kenburns*` / `*still-pass*`。
+Ken Burns / `stills-to-shots.sh` 不是成片路径。该脚本已挪到 `scripts/_disabled/`。`assemble.sh` 会拒绝 `*kenburns*` / `*still-pass*` / `*animatic*`。静帧 animatic（分镜页「静帧 animatic」，`03-storyboard/animatic/`）只给审节奏。
 
 ## v2 人审分镜合同
 
@@ -104,7 +106,7 @@ python3 scripts/reverse_video.py --prod productions/<slug> --video ~/Desktop/ref
 
 剧本页的「写分镜草稿」走鹏城六步，但落地到本机合同：
 
-1. 理解需求 → 读 `confirm.md` / `ep01.md`（金边竖屏，不对口型）
+1. 理解需求 → 读 `confirm.md` / `ep01.md`（金边横屏 16:9，不对口型）
 2. 规划结构 → `01-bible/blueprint.draft.md`（3 秒钩子 / 中段冲突 / 尾钩，不写广告号召）
 3. 生成分镜 → 先吃已有 `coverage.md` / `beats.md`，再写 `03-storyboard/shots.draft.json`
 4. 撰写提示词 → 每镜英文 `video_prompt`，读 `templates/video-prompt-formula.md` + `templates/camera-moves.md`（H3 / Imagine，不是 MJ/SD/`--ar`）

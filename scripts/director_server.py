@@ -31,7 +31,7 @@ from director.inbox import list_tasks, scan_inbox, task_for_asset, task_for_shot
 from director.gates import lock_gate, snapshot  # noqa: E402
 from director.fingerprint import prepare_render  # noqa: E402
 from director.jobs import assemble_episode, enqueue_render_confirmed, enqueue_review, gpu_configured  # noqa: E402
-from director.gpu_caps import gpu_capabilities, seedance_configured, video_backend_name, video_ready  # noqa: E402
+from director.gpu_caps import gpu_capabilities, minimax_configured, seedance_configured, wan_configured, video_backend_name, video_ready  # noqa: E402
 from director.story import ingest_upload, snapshot_story, write_brief  # noqa: E402
 from director.inkos import launch_inkos  # noqa: E402
 from director.producer import snapshot_producer, write_producer_draft  # noqa: E402
@@ -112,6 +112,8 @@ def health():
         "video_ready": video_ready(),
         "video_backend": video_backend_name(),
         "seedance": seedance_configured(),
+        "minimax": minimax_configured(),
+        "wan": wan_configured(),
         "imagine": bool(__import__("os").environ.get("XAI_API_KEY", "").strip()),
         "grok_text": text_configured(),
         "grok_backend": __import__("director.grok_text", fromlist=["text_backend"]).text_backend(),
@@ -145,6 +147,8 @@ def api_production(slug: str):
         "video_ready": video_ready(),
         "video_backend": video_backend_name(),
         "seedance": seedance_configured(),
+        "minimax": minimax_configured(),
+        "wan": wan_configured(),
         "gpu_caps": gpu_capabilities(),
         "imagine": bool(__import__("os").environ.get("XAI_API_KEY", "").strip()),
         "grok_text": text_configured(),
@@ -201,14 +205,23 @@ def api_pipeline_put(slug: str, name: str, payload: Optional[dict] = Body(None))
         write_artifact,
     )
 
+    from director.station_agents import _validate_frame_desc_artifact, _validate_scene_cards_artifact
+
     payload = payload_dict(payload)
     if not name.endswith(".json"):
         name = name + ".json"
+    if name == "shot_list.json" and str(payload.get("schema") or "") == "shot-table-v2":
+        from director.pipeline import read_artifact
+        from director.shot_table import sanitize_shot_table
+
+        payload = sanitize_shot_table(payload, writer=read_artifact(get_prod(slug), "writer.json"))
     validators = {
         "novel.json": validate_novel,
         "writer.json": validate_writer,
         "assets.json": lambda data: validate_assets(data, get_prod(slug)),
-        "shot_list.json": validate_shot_list,
+        "shot_list.json": lambda data: validate_shot_list(data, **_shot_list_context(get_prod(slug), data)),
+        "scene_cards.json": lambda data: _validate_scene_cards_artifact(data, get_prod(slug)),
+        "frame_descriptions.json": lambda data: _validate_frame_desc_artifact(data, get_prod(slug)),
         "shot_specs.json": lambda data: validate_shot_specs(data, __import__("director.pipeline", fromlist=["read_artifact"]).read_artifact(get_prod(slug), "writer.json")),
         "gen_packages.json": lambda data: validate_packages(data, __import__("director.pipeline", fromlist=["read_artifact"]).read_artifact(get_prod(slug), "assets.json"), __import__("director.pipeline", fromlist=["read_artifact"]).read_artifact(get_prod(slug), "shot_specs.json")),
         "keyframes.json": validate_keyframes,
@@ -221,7 +234,43 @@ def api_pipeline_put(slug: str, name: str, payload: Optional[dict] = Body(None))
             raise_if(validator(payload))
         except PermissionError as exc:
             return fail(exc, 409)
-    return write_artifact(get_prod(slug), name, payload)
+    written = write_artifact(get_prod(slug), name, payload)
+    if name == "shot_list.json" and str(payload.get("schema") or "") == "shot-table-v2":
+        _rerender_shot_table(get_prod(slug), written)
+    return written
+
+
+def _shot_list_context(prod: Path, data: dict) -> dict:
+    """A v2 table saved from the studio is checked against the same writer / sets / look / profile as the agent's."""
+    if str(data.get("schema") or "") != "shot-table-v2":
+        return {}
+    from director.shot_table import table_context
+
+    check = table_context(prod, str(data.get("target_model") or "") or None)
+    return {"writer": check["writer"], "sets": check["sets"], "profile": check["profile"], "look_text": check["look_text"], "prod": prod}
+
+
+def _rerender_shot_table(prod: Path, table: dict) -> None:
+    """Keep shot-list.draft.md and the compiled specs in step with a hand-edited v2 table. Best effort."""
+    try:
+        from director.frame_desc import index_by_shot
+        from director.pipeline import read_artifact, write_artifact
+        from director.production import write_text
+        from director.shot_table import compile_specs_from_shot_table, render_shot_table_md, table_context, validate_shot_table
+
+        check = table_context(prod, str(table.get("target_model") or "") or None)
+        _errors, warnings = validate_shot_table(table, writer=check["writer"], sets=check["sets"], profile=check["profile"], look_text=check["look_text"], prod=prod)
+        specs = compile_specs_from_shot_table(table, aspect=str(table.get("aspect") or "16:9"))
+        specs["origin"] = "compiled-from-shot-table"
+        write_artifact(prod, "shot_specs.json", specs)
+        title = str((read_artifact(prod, "writer.json").get("episode_outline") or [{}])[0].get("title") or "第 01 集")
+        write_text(
+            prod,
+            "03-storyboard/shot-list.draft.md",
+            render_shot_table_md(table, title=f"第 01 集 {title}", profile=check["profile"], warnings=warnings, frame_descriptions=index_by_shot(read_artifact(prod, "frame_descriptions.json"))),
+        )
+    except Exception:  # the artifact itself is already saved; the mirror files are a convenience
+        return
 
 
 @app.post("/api/productions/{slug}/pipeline/seed")
@@ -266,12 +315,29 @@ def api_station_agent(slug: str, station: str, payload: Optional[dict] = Body(No
     from director.station_agents import run_station_agent
 
     payload = payload_dict(payload)
+    candidates = payload.get("candidates")
+    try:
+        candidates = int(candidates) if candidates not in (None, "") else None
+    except (TypeError, ValueError):
+        return fail(ValueError("candidates 必须是整数"), 400)
+    scene_ids = payload.get("scene_ids") or payload.get("sceneIds")
+    if isinstance(scene_ids, str):
+        scene_ids = [s.strip() for s in scene_ids.split(",") if s.strip()]
+    scene_ids = [str(s) for s in scene_ids] if isinstance(scene_ids, list) and scene_ids else None
+    try:
+        episode = int(payload.get("episode") or payload.get("episode_no") or 1)
+    except (TypeError, ValueError):
+        return fail(ValueError("episode 必须是整数"), 400)
     try:
         return run_station_agent(
             get_prod(slug),
             station,
             brief=str(payload.get("brief") or ""),
             target_model=str(payload.get("targetModel") or payload.get("target_model") or "") or None,
+            resume=bool(payload.get("resume", True)),
+            candidates=candidates,
+            scene_ids=scene_ids,
+            episode=episode,
         )
     except TextError as exc:
         return fail(exc, 409)
@@ -279,6 +345,117 @@ def api_station_agent(slug: str, station: str, payload: Optional[dict] = Body(No
         return fail(exc, 409)
     except ValueError as exc:
         return fail(exc, 400)
+
+
+@app.get("/api/productions/{slug}/design/candidates")
+def api_design_candidates(slug: str):
+    """Raw candidates plus the deterministic metrics the compare page shows next to the critic's scores."""
+    from director.direction import candidate_metrics
+    from director.station_agents import design_candidates
+
+    data = design_candidates(get_prod(slug))
+    for row in data.get("scenes") or []:
+        card = row.get("scene_card")
+        for cand in row.get("candidates") or []:
+            if isinstance(cand, dict):
+                cand["metrics"] = candidate_metrics(list(cand.get("shots") or []), card, cand.get("warnings") or [])
+    return data
+
+
+@app.post("/api/productions/{slug}/design/pick")
+def api_design_pick(slug: str, payload: Optional[dict] = Body(None)):
+    from director.station_agents import pick_candidate
+
+    payload = payload_dict(payload)
+    scene_id = str(payload.get("scene_id") or payload.get("sceneId") or "")
+    try:
+        index = int(payload.get("candidate") if payload.get("candidate") is not None else payload.get("index"))
+    except (TypeError, ValueError):
+        return fail(ValueError("candidate 必须是候选序号"), 400)
+    if not scene_id:
+        return fail(ValueError("缺 scene_id"), 400)
+    try:
+        return pick_candidate(get_prod(slug), scene_id, index)
+    except PermissionError as exc:
+        return fail(exc, 409)
+    except ValueError as exc:
+        return fail(exc, 400)
+
+
+@app.get("/api/productions/{slug}/animatic")
+def api_animatic(slug: str, episode: int = 1):
+    from director.animatic import snapshot_animatic
+
+    return snapshot_animatic(get_prod(slug), episode)
+
+
+@app.post("/api/productions/{slug}/animatic")
+def api_animatic_build(slug: str, payload: Optional[dict] = Body(None)):
+    from director.animatic import build_animatic
+    from director.paths import media_url
+
+    payload = payload_dict(payload)
+    prod = get_prod(slug)
+    try:
+        result = build_animatic(
+            prod,
+            int(payload.get("episode") or 1),
+            audio=str(payload.get("audio") or "") or None,
+            fps=int(payload.get("fps") or 24),
+        )
+    except PermissionError as exc:
+        return fail(exc, 409)
+    except ValueError as exc:
+        return fail(exc, 400)
+    except RuntimeError as exc:
+        return fail(exc, 500)
+    result["url"] = media_url(prod, result["file"])
+    return result
+
+
+@app.get("/api/productions/{slug}/feedback")
+def api_feedback(slug: str, profile: str = ""):
+    from director.model_notes import snapshot_feedback
+
+    return snapshot_feedback(get_prod(slug), profile or None)
+
+
+@app.post("/api/productions/{slug}/feedback")
+def api_feedback_record(slug: str, payload: Optional[dict] = Body(None)):
+    from director.model_notes import record_outcome
+
+    payload = payload_dict(payload)
+    try:
+        return record_outcome(
+            get_prod(slug),
+            str(payload.get("shot_id") or payload.get("shotId") or ""),
+            str(payload.get("verdict") or ""),
+            payload.get("tags"),
+            str(payload.get("note") or ""),
+            str(payload.get("profile_id") or payload.get("profileId") or "") or None,
+        )
+    except ValueError as exc:
+        return fail(exc, 400)
+
+
+@app.get("/api/productions/{slug}/camera-plot")
+def api_camera_plot(slug: str):
+    from director.camera_plot import snapshot_camera_plot
+
+    return snapshot_camera_plot(get_prod(slug))
+
+
+@app.post("/api/productions/{slug}/camera-plot/render")
+def api_camera_plot_render(slug: str):
+    from director.camera_plot import render_all, snapshot_camera_plot
+
+    prod = get_prod(slug)
+    try:
+        result = render_all(prod)
+    except (OSError, ValueError) as exc:
+        return fail(exc, 400)
+    result["snapshot"] = snapshot_camera_plot(prod)
+    return result
 
 @app.get("/api/productions/{slug}/diff")
 def api_diff(slug: str, gateId: str = ""):
@@ -340,6 +517,25 @@ def api_sound(slug: str):
 @app.post("/api/productions/{slug}/sound/draft")
 def api_sound_draft(slug: str):
     return write_sound_draft(get_prod(slug))
+
+
+@app.post("/api/productions/{slug}/sound/sfx")
+def api_sound_sfx(slug: str, payload: Optional[dict] = Body(None)):
+    from director.sfx import run_mix
+
+    payload = payload_dict(payload)
+    try:
+        return run_mix(
+            get_prod(slug),
+            episode=int(payload.get("episode") or 1),
+            dry_run=bool(payload.get("dry_run")),
+            force=bool(payload.get("force")),
+            preview=payload.get("preview", True),
+        )
+    except ValueError as exc:
+        return fail(exc, 400)
+    except Exception as exc:
+        return fail(exc, 500)
 
 
 @app.get("/api/productions/{slug}/qc")
@@ -424,11 +620,13 @@ def api_breakdown(slug: str, payload: Optional[dict] = Body(None)):
             return fail(exc, 400)
     if text_configured():
         try:
+            candidates = payload.get("candidates")
             result = run_station_agent(
                 prod,
                 "design",
                 brief=brief,
                 target_model=str(payload.get("targetModel") or payload.get("target_model") or "") or None,
+                candidates=int(candidates) if candidates not in (None, "") else None,
             )
             result["shot_count"] = len((result.get("artifact") or {}).get("shots") or [])
             result["origin"] = "station-agent"

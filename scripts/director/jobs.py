@@ -25,8 +25,16 @@ def seedance_configured() -> bool:
     return bool(os.environ.get("ARK_API_KEY", "").strip())
 
 
+def minimax_configured() -> bool:
+    return bool(os.environ.get("MINIMAX_API_KEY", "").strip())
+
+
+def wan_configured() -> bool:
+    return bool(os.environ.get("DASHSCOPE_API_KEY", "").strip())
+
+
 def video_ready() -> bool:
-    return bool(os.environ.get("LOCAL_H3_BASE", "").strip()) or seedance_configured()
+    return bool(os.environ.get("LOCAL_H3_BASE", "").strip()) or seedance_configured() or minimax_configured() or wan_configured()
 
 
 def default_render_backend() -> str:
@@ -34,6 +42,10 @@ def default_render_backend() -> str:
         return os.environ["DIRECTOR_VIDEO_BACKEND"].strip()
     if seedance_configured():
         return "seedance"
+    if minimax_configured():
+        return "minimax"
+    if wan_configured():
+        return "wan"
     if os.environ.get("LOCAL_H3_BASE", "").strip():
         return "local"
     return ""
@@ -112,7 +124,7 @@ def enqueue_render_confirmed(
         "outputs": [],
     }
     if not video_ready():
-        job["log"].append("未配置 ARK_API_KEY 或 LOCAL_H3_BASE，任务停在 queued，不假装成功。")
+        job["log"].append("未配置 ARK_API_KEY、MINIMAX_API_KEY 或 LOCAL_H3_BASE，任务停在 queued，不假装成功。")
         return _append_job(prod, job)
     _append_job(prod, job)
     thread = threading.Thread(target=_run_render, args=(prod, job["id"]), daemon=True)
@@ -153,29 +165,66 @@ def _run_render(prod: Path, job_id: str) -> None:
     data = load_jobs(prod)
     job = next(item for item in data["jobs"] if item["id"] == job_id)
     backend = job.get("backend") or default_render_backend() or "local"
-    cmd = [
-        sys.executable,
-        str(ROOT / "scripts" / "render_shots.py"),
-        "--prod",
-        str(prod),
-        "--backend",
-        backend,
-        "--skip-assemble",
-    ]
-    if job.get("shot_ids"):
-        cmd += ["--only", *job["shot_ids"]]
-    if job.get("review_track"):
-        cmd.append("--review-track")
+    from .pipeline import uses_pipeline
+
+    if uses_pipeline(prod) and backend in {"seedance", "ark"}:
+        cmd = [
+            sys.executable,
+            str(ROOT / "scripts" / "render_seedance_packages.py"),
+            "--prod",
+            str(prod),
+        ]
+        if job.get("shot_ids"):
+            cmd += ["--only", *job["shot_ids"]]
+    else:
+        cmd = [
+            sys.executable,
+            str(ROOT / "scripts" / "render_shots.py"),
+            "--prod",
+            str(prod),
+            "--backend",
+            backend,
+            "--skip-assemble",
+        ]
+        if job.get("shot_ids"):
+            cmd += ["--only", *job["shot_ids"]]
+        if job.get("review_track"):
+            cmd.append("--review-track")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
         log = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
         if proc.returncode != 0:
             _update_job(prod, job_id, status="failed", error=log[-1200:], log=[log[-2000:]])
             return
+        if uses_pipeline(prod) and backend in {"seedance", "ark"} and job.get("review_track"):
+            selected_ids = list(job.get("shot_ids") or [])
+            out = prod / "06-export" / ("preview-vo.mp4" if not selected_ids else "preview-partial-vo.mp4")
+            mix = [
+                sys.executable,
+                str(ROOT / "scripts" / "mix_review_track.py"),
+                "--prod",
+                str(prod),
+                "--out",
+                str(out),
+            ]
+            if selected_ids:
+                mix += ["--only", *selected_ids]
+            mix_proc = subprocess.run(mix, capture_output=True, text=True)
+            log = (log + "\n" + ((mix_proc.stdout or "") + "\n" + (mix_proc.stderr or "")).strip()).strip()
+            if mix_proc.returncode != 0:
+                _update_job(prod, job_id, status="failed", error=log[-1200:], log=[log[-2000:]])
+                return
         outputs = []
+        clip_records = []
+        fallback_from = None
+        scaled_to = None
+        used_backend = backend
+        from .video_fallback import read_clip_record
+
         for shot_id in job.get("shot_ids") or []:
             video = prod / "05-shots" / f"{shot_id}.mp4"
             last = prod / "04-frames" / f"{shot_id}-last.jpg"
+            extracted = prod / "05-shots" / f"{shot_id}-last.jpg"
             if video.exists() and ken_burns_blocked(video):
                 video.unlink()
                 _update_job(
@@ -187,9 +236,30 @@ def _run_render(prod: Path, job_id: str) -> None:
                 return
             if video.exists():
                 outputs.append(f"05-shots/{shot_id}.mp4")
+                record = read_clip_record(video)
+                if record:
+                    clip_records.append(record)
+                    if record.get("fallback_from"):
+                        used_backend = record.get("backend") or "minimax_h3"
+                        fallback_from = record.get("fallback_from")
+                        scaled_to = record.get("scaled_to")
             if last.exists():
                 outputs.append(f"04-frames/{shot_id}-last.jpg")
-        _update_job(prod, job_id, status="ready", log=[log[-2000:]], outputs=outputs, error=None)
+            elif extracted.exists():
+                outputs.append(f"05-shots/{shot_id}-last.jpg")
+        fields = {
+            "status": "ready",
+            "log": [log[-2000:]],
+            "outputs": outputs,
+            "error": None,
+            "backend": used_backend,
+        }
+        if fallback_from:
+            fields["fallback_from"] = fallback_from
+            fields["scaled_to"] = scaled_to
+        if clip_records:
+            fields["clip_records"] = clip_records
+        _update_job(prod, job_id, **fields)
     except Exception as exc:
         _update_job(prod, job_id, status="failed", error=str(exc))
 
@@ -281,6 +351,8 @@ def assemble_episode(prod: Path) -> dict:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and ken_burns_blocked(dest):
         dest.unlink()
+    # Re-encodes each clip (not -c copy). Official 16:9 EP clips should already
+    # be 1280x720; mixed Seedance 720p + raw H3 768p must never reach assemble.sh.
     work = prod / ".director" / "cut-work"
     work.mkdir(parents=True, exist_ok=True)
     list_path = work / "concat.txt"

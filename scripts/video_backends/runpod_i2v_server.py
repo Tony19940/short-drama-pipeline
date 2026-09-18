@@ -397,7 +397,7 @@ def run_job(task_id: str, data: dict):
         if not prompt:
             raise RuntimeError("missing prompt")
         seconds = float(data.get("duration") or 6)
-        aspect = str(data.get("aspect") or "9:16")
+        aspect = str(data.get("aspect") or "16:9")
         width, height = choose_size(*image_size(first), aspect)
         seed = int(data.get("seed") or (int(time.time()) % 1_000_000_000))
         first_name = upload_image(first, f"{task_id}_first{first.suffix or '.jpg'}")

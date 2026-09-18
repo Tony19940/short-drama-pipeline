@@ -40,10 +40,58 @@ def _shots(prod: Path) -> list[dict]:
     return list(data.get("shots") or [])
 
 
-def inspect_files(prod: Path) -> dict:
+def _costume_state_dirs(prod: Path) -> set[str]:
+    from .pipeline import read_artifact, uses_pipeline
+
+    if not uses_pipeline(prod):
+        return set()
+    character_folders: set[str] = set()
+    costume_folders: set[str] = set()
+    for item in (read_artifact(prod, "assets.json").get("assets") or []):
+        rel = str(item.get("file") or "").replace(chr(92), "/")
+        parts = [part for part in rel.split("/") if part]
+        folder = ""
+        if "characters" in parts:
+            idx = parts.index("characters")
+            if idx + 1 < len(parts):
+                folder = parts[idx + 1]
+        kind = str(item.get("type") or "")
+        if kind == "character" and folder:
+            character_folders.add(folder)
+        if kind == "costume_state" and folder:
+            costume_folders.add(folder)
+    return costume_folders - character_folders
+
+
+def _v2_frame_rows(prod: Path, episode: int = 1) -> list[dict]:
+    """Count official frames from shot-table-v2 when there is no legacy shots.json."""
+    from .pipeline import episode_artifact_name, read_artifact, uses_pipeline
+    from place_codex_frame import episode_frame_dir
+
+    if not uses_pipeline(prod):
+        return []
+    table = read_artifact(prod, episode_artifact_name("shot_list.json", episode))
+    folder = episode_frame_dir(episode)
+    rows = []
+    for item in table.get("shots") or []:
+        sid = str(item.get("shot_id") or "").strip()
+        if not sid:
+            continue
+        rows.append(
+            {
+                "id": sid,
+                "frame": f"{folder}/{sid}.jpg",
+                "last_frame": f"{folder}/{sid}-last.jpg",
+            }
+        )
+    return rows
+
+
+def inspect_files(prod: Path, episode: int = 1) -> dict:
     shots = _shots(prod)
+    frame_shots = shots or _v2_frame_rows(prod, episode)
     frames = []
-    for shot in shots:
+    for shot in frame_shots:
         frame = prod / shot.get("frame", f"04-frames/{shot['id']}.jpg")
         last = prod / shot.get("last_frame", f"04-frames/{shot['id']}-last.jpg")
         video = prod / "05-shots" / f"{shot['id']}.mp4"
@@ -53,7 +101,7 @@ def inspect_files(prod: Path) -> dict:
                 "frame": _exists(frame),
                 "last": _exists(last),
                 "video": _exists(video),
-                "parent": parent_still(prod, shot, shots),
+                "parent": parent_still(prod, shot, shots) if shots else {"kind": "pipeline", "path": shot.get("frame", ""), "exists": _exists(frame), "reason": "shot-table-v2 首帧"},
             }
         )
     blocking = list((prod / "02-assets" / "scenes").glob("*/blocking.jpg")) if (prod / "02-assets" / "scenes").exists() else []
@@ -71,6 +119,7 @@ def inspect_files(prod: Path) -> dict:
                         "side": _exists(child / "side.jpg"),
                         "back": _exists(child / "back.jpg"),
                         "sheet": _exists(child / "sheet.jpg"),
+                        "costume_state": child.name in _costume_state_dirs(prod),
                     }
                 )
     scenes = []
@@ -102,7 +151,7 @@ def inspect_files(prod: Path) -> dict:
         "source": _exists(prod / "01-bible" / "source" / "source.json") and _exists(prod / "01-bible" / "source" / "original.md"),
         "producer": _exists(prod / "01-bible" / "producer" / "plan.md") and _exists(prod / "01-bible" / "producer" / "manifest.json"),
         "qc": _exists(prod / "08-qc" / "report.json") or _exists(prod / "01-bible" / "qc" / "report.md"),
-        "shot_count": len(shots),
+        "shot_count": len(frame_shots),
         "video_count": sum(1 for item in frames if item["video"]),
         "locked_frame_count": sum(1 for item in frames if item["frame"]),
     }
@@ -132,6 +181,32 @@ def parent_still(prod: Path, shot: dict, shots: Optional[list[dict]] = None) -> 
             "from": prev["id"],
         }
     return {"kind": "missing", "path": "", "exists": False, "reason": "找不到父镜"}
+
+
+def v2_storyboard_ready(prod: Path) -> tuple[bool, str]:
+    """Official storyboard for pipeline shows is `.pipeline/shot_list.json` (shot-table-v2).
+
+    Legacy coverage.md / beats.md / shots.json / blocking.jpg are not required when
+    that table exists and validates. Returns ("", "") when this prod is not on v2.
+    """
+    from .pipeline import SHOT_TABLE_SCHEMA, read_artifact, uses_pipeline, validate_shot_list
+
+    if not uses_pipeline(prod):
+        return False, ""
+    shot_list = read_artifact(prod, "shot_list.json")
+    if not shot_list:
+        return False, ""
+    if str(shot_list.get("schema") or "") != SHOT_TABLE_SCHEMA:
+        return False, ""
+    from .shot_table import table_context
+
+    context = table_context(prod, shot_list.get("target_model"))
+    errors = validate_shot_list(shot_list, **context)
+    if errors:
+        return False, errors[0]
+    count = len(shot_list.get("shots") or [])
+    status = str(shot_list.get("status") or "draft")
+    return True, f"分镜表 shot-table-v2 {count} 镜已过校验（{status}）"
 
 
 def continue_last_frame_rule(shot: dict, prev: Optional[dict]) -> tuple[bool, str]:
@@ -237,8 +312,22 @@ def run_check(prod: Path) -> dict:
     }
 
 
-def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None) -> tuple[bool, str]:
-    files = files or inspect_files(prod)
+def _c2_still_t0_note(prod: Path) -> str:
+    """Warn on first-still result text without failing the C2 lock (later-ep artifacts)."""
+    from .frame_desc import index_by_shot
+    from .pipeline import read_artifact
+    from .still_t0 import issues_for_table
+
+    table = read_artifact(prod, "shot_list.json")
+    descs = index_by_shot(read_artifact(prod, "frame_descriptions.json"))
+    warns = issues_for_table(list(table.get("shots") or []), descs)
+    if not warns:
+        return ""
+    return f"（首帧 t=0 警告 {len(warns)}：{warns[0]}）"
+
+
+def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, episode: int = 1) -> tuple[bool, str]:
+    files = files or inspect_files(prod, episode)
     if gate_id == "0":
         if files.get("source"):
             return True, "故事源已归一到 01-bible/source/"
@@ -253,8 +342,13 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None) -> t
     if gate_id == "B":
         if not files["characters"]:
             return False, "还没有角色主图"
-        if any(not item["master"] or not item["face"] for item in files["characters"]):
-            return False, "每个角色都要 master.jpg + face.jpg"
+        for item in files["characters"]:
+            if item.get("costume_state"):
+                if not item["master"]:
+                    return False, "服装状态 %s 缺 master.jpg" % item["id"]
+                continue
+            if not item["master"] or not item["face"]:
+                return False, "每个角色都要 master.jpg + face.jpg"
         if not files["scenes"] or any(not item["master"] for item in files["scenes"]):
             return False, "每个主场景都要空镜 master.jpg"
         return True, "角色/场景主图齐全"
@@ -276,22 +370,17 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None) -> t
             return False, "缺 blocking.jpg，先打点再出舞台"
         return True, "舞台和 blocking 已在"
     if gate_id == "C":
+        v2_ok, v2_reason = v2_storyboard_ready(prod)
+        if v2_ok:
+            return True, v2_reason
+        if v2_reason:
+            return False, v2_reason
         missing = [name for name in ("coverage", "beats", "shots") if not files[name]]
         if missing:
             return False, "缺 " + ", ".join(missing)
         check = run_check(prod)
         if not check["ok"]:
             return False, check["stderr"] or check["stdout"] or "check_prod 未过"
-        from .pipeline import SHOT_TABLE_SCHEMA, read_artifact, uses_pipeline, validate_shot_list
-        shot_list = read_artifact(prod, "shot_list.json")
-        if uses_pipeline(prod) and shot_list:
-            context = {}
-            if str(shot_list.get("schema") or "") == SHOT_TABLE_SCHEMA:
-                from .shot_table import table_context
-                context = table_context(prod, shot_list.get("target_model"))
-            errors = validate_shot_list(shot_list, **context)
-            if errors:
-                return False, errors[0]
         return True, check["stdout"] or "分镜合同已过 check_prod"
     if gate_id == "C1":
         from .pipeline import read_artifact, uses_pipeline, validate_shot_specs
@@ -320,11 +409,40 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None) -> t
                 return False, errors[0]
             if not packages_confirmed(packages):
                 return False, "生成包还没确认"
-            return True, "生成包已确认"
+            note = _c2_still_t0_note(prod)
+            return True, "生成包已确认" + note
         if files.get("shots"):
             return True, "沿用旧 video_prompt 作为生成计划"
         return False, "还没有生成包"
     if gate_id == "D":
+        from .pipeline import keyframe_context, read_artifact, uses_pipeline, validate_keyframes
+
+        if uses_pipeline(prod):
+            from .pipeline import episode_artifact_name
+            from place_codex_frame import episode_frame_dir, parent_chain_errors
+
+            table = read_artifact(prod, episode_artifact_name("shot_list.json", episode))
+            shots = table.get("shots") or []
+            if not shots:
+                return False, "还没有分镜"
+            folder = episode_frame_dir(episode)
+            missing = [
+                str(item.get("shot_id") or "")
+                for item in shots
+                if str(item.get("shot_id") or "") and not _exists(prod / f"{folder}/{item['shot_id']}.jpg")
+            ]
+            if missing:
+                return False, "缺首帧 " + ", ".join(missing)
+            frames = read_artifact(prod, episode_artifact_name("keyframes.json", episode))
+            if not frames:
+                return False, "还没有 keyframes.json"
+            errors = validate_keyframes(frames, **keyframe_context(prod, episode))
+            if errors:
+                return False, errors[0]
+            chain = parent_chain_errors(prod, shots, episode=episode)
+            if chain:
+                return False, chain[0]
+            return True, f"{len(shots)} 张首帧已按顺序锁，keyframes 已过校验"
         if not files["shot_count"]:
             return False, "还没有分镜"
         shots = _shots(prod)
@@ -346,9 +464,8 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None) -> t
                 prev_frame = prod / prev.get("frame", f"04-frames/{prev['id']}.jpg")
                 if not prev_frame.exists():
                     return False, f"{shot.get('id')} 的上一镜 {prev.get('id')} 还没锁"
-        from .pipeline import keyframe_context, read_artifact, uses_pipeline, validate_keyframes
         frames = read_artifact(prod, "keyframes.json")
-        if uses_pipeline(prod) and frames:
+        if frames:
             errors = validate_keyframes(frames, **keyframe_context(prod))
             if errors:
                 return False, errors[0]
@@ -364,12 +481,19 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None) -> t
         missing = [item["id"] for item in files["frames"] if not item["video"]]
         if missing:
             return False, "缺视频 " + ", ".join(missing)
+        if uses_pipeline(prod):
+            from .animatic import animatic_rel
+
+            frames_locked = bool(files["frames"]) and all(item.get("frame") for item in files["frames"])
+            anim = prod / animatic_rel(1)
+            if frames_locked and not anim.exists():
+                return False, f"缺静帧 animatic {animatic_rel(1)}；正式出片前先出 animatic（05-shots/smoke 不受此限）"
         return True, f"{files['video_count']} 条单镜已在"
     if gate_id == "E+":
         from .pipeline import read_artifact, uses_pipeline, validate_audio
         audio = read_artifact(prod, "audio.json")
         if uses_pipeline(prod) and audio:
-            errors = validate_audio(audio, read_artifact(prod, "writer.json"))
+            errors = validate_audio(audio, read_artifact(prod, "writer.json"), prod)
             if errors:
                 return False, errors[0]
         if not files["review"]:
@@ -395,7 +519,7 @@ def snapshot(prod: Path) -> dict:
     gates = []
     for spec in GATES:
         ready, reason = gate_file_ready(prod, spec["id"], files)
-        if spec["id"] == "C":
+        if spec["id"] == "C" and not v2_storyboard_ready(prod)[0]:
             s_ok, s_reason = gate_file_ready(prod, "S", files)
             if not s_ok:
                 ready, reason = False, s_reason
@@ -441,7 +565,7 @@ def lock_gate(prod: Path, gate_id: str, locked: bool = True) -> dict:
         _promote_on_lock(prod, gate_id)
         files = inspect_files(prod)
         ready, reason = gate_file_ready(prod, gate_id, files)
-        if gate_id == "C":
+        if gate_id == "C" and not v2_storyboard_ready(prod)[0]:
             s_ok, s_reason = gate_file_ready(prod, "S", files)
             if not s_ok:
                 ready, reason = False, s_reason
@@ -494,4 +618,4 @@ def ken_burns_blocked(path: Path) -> bool:
         text = name
     except Exception:
         text = name
-    return "kenburns" in text or "still-pass" in text or path.suffix.lower() == ".kenburns.mp4"
+    return "kenburns" in text or "still-pass" in text or "animatic" in text or path.suffix.lower() == ".kenburns.mp4"

@@ -11,6 +11,16 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+from .defaults import (
+    LONG_TAKE_REASON,
+    PACE_SPM_WARN_BELOW,
+    PAPER_DIALOGUE,
+    PAPER_HARD_FAIL_SEC,
+    PAPER_INSERT,
+    PAPER_LONG_CAP,
+    PAPER_REACTION,
+)
+
 SCHEMA = "shot-table-v2"
 
 SCALES = ("wide", "full", "medium", "close", "otc", "insert", "pov")
@@ -19,10 +29,25 @@ ANGLES = ("eye", "high", "low")
 HEIGHTS = ("standing", "chest", "low", "ground", "high", "underwater", "eye")
 COVERAGE = ("master", "otc", "ots", "reverse", "reaction", "insert", "empty", "continuous", "close", "single", "pov", "follow")
 DELIVERY = ("none", "post", "on_camera")
-FORBIDDEN_KEYS = ("prompt", "video_prompt", "image_prompt", "motion_prompt", "asset_id", "image_file", "keyframe_file")
+FORBIDDEN_KEYS = ("prompt", "video_prompt", "image_prompt", "motion_prompt", "asset_id", "image_file", "keyframe_file", "frame_description")
 # Per-shot world state. Costume is a free state id that must resolve to an asset; binding is an enum so the
 # machine can tell "hands behind" from "hands in front" without reading Chinese.
 BINDINGS = ("none", "wrists_front", "wrists_behind", "pillar", "snared", "held")
+# Body orientation of the foreground person. Eyeline is where they look — do not reuse it as facing.
+BODY_FACING = ("朝镜头", "四分之三", "侧脸", "背对镜头", "无人")
+CAMERA_SIDE = ("front", "front-left", "front-right", "behind", "left", "right")
+OTC_COVERAGE = {"otc", "ots"}
+FRONT_FACING = re.compile(r"朝镜头|面向镜头|面朝镜头|四分之三|3/4|(?<!未转)(?<!不见)正脸")
+BACK_FACING = re.compile(r"背对镜头|整背影|后脑")
+TURN_ACTION = re.compile(r"转身|回头|转过身|转向")
+UNTURNED = re.compile(r"(没有|没|尚未|仍未|还未|未)(转身|回头|转过)")
+# Ghost / second person parked behind the shoulder owner — geometrically invisible from a true OTC.
+BEHIND_SHOULDER = re.compile(
+    r"(波帕|bopha|魂魄|春安|威图|桑南|梅婶|女工|琳).{0,16}(?:在|贴|漂|蹲)?.{0,8}"
+    r"(?:她|他|其|琳|[\u4e00-\u9fff]{1,4})?(?:的)?(?:右|左)?(?:肩后|身后|背后)"
+    r"|"
+    r"(?:她|他|其|琳)(?:的)?(?:右|左)?肩后"
+)
 CHAR_STATE_KEYS = ("costume", "binding", "bound_with", "carrying")
 BINDING_ZH = {
     "none": "",
@@ -41,6 +66,14 @@ FORBIDDEN_MOVE_WORDS = {
     "whip_pan": ("甩镜", "whip pan", "闪摇"),
 }
 CLAUSE_SPLIT = re.compile(r"[，；。→;,]|然后|接着|随即|再(?=[\u4e00-\u9fff])")
+# Two-verb connectors that mean "split this shot" (proposal §4.5). Not every 和.
+COMPOUND_ACTION = re.compile(
+    r"然后|接着|随即|并且|并把|"
+    r"(?<![一没未不])再(?=[\u4e00-\u9fff]{0,6}[走扔捡塞开拉读退撞甩摊拧抬转推捡])|"
+    r"和(?=[\u4e00-\u9fff]{0,6}[走扔捡塞开拉读退撞甩摊拧抬转])"
+)
+# Process that must stay one shot even if the wording has 再/并.
+MUST_HOLD_ACTION = re.compile(r"穿过|穿进|穿出|笔尖|透身|透出|门槛|扫到墙角")
 MOVE_INTENSITY = {"static": 0, "push": 3, "pull": 3, "pan": 3, "tilt": 3, "track": 5, "follow": 5, "handheld": 4, "crane": 6}
 CHARS_PER_SEC = 4.0
 LINE_PAUSE_SEC = 0.8
@@ -59,6 +92,67 @@ def _int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _sec(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def store_duration(value: Any, default: float = 0.0) -> float | int:
+    """Keep whole seconds as int so existing tables stay 5 not 5.0."""
+    n = round(_sec(value, default), 1)
+    if n == int(n):
+        return int(n)
+    return n
+
+
+def lock_parts(value: Any) -> dict[str, str]:
+    """Split a scene lock into plate (background) vs axis (character line).
+
+    A plain string is the legacy form: the same sentence is both plate and axis.
+    A dict may use `plate` / `axis`, or aliases `background` / `line`.
+    """
+    if isinstance(value, dict):
+        plate = _t(value.get("plate") or value.get("background"))
+        axis = _t(value.get("axis") or value.get("line"))
+        return {"plate": plate, "axis": axis}
+    text = _t(value)
+    return {"plate": text, "axis": text}
+
+
+def lock_is_present(value: Any) -> bool:
+    """A scene lock is present if plate, axis, or any leftover nonempty string is set."""
+    if isinstance(value, dict):
+        parts = lock_parts(value)
+        if parts["plate"] or parts["axis"]:
+            return True
+        return any(_t(v) for v in value.values() if isinstance(v, str))
+    return bool(_t(value))
+
+
+def lock_axis_text(value: Any) -> str:
+    """Text for `axis_side` / geometry: prefer axis, then plate, then the legacy string."""
+    parts = lock_parts(value)
+    return parts["axis"] or parts["plate"]
+
+
+def lock_display(value: Any) -> str:
+    """Human cell for the 左右锁 table."""
+    if isinstance(value, dict):
+        parts = lock_parts(value)
+        bits = []
+        if parts["plate"]:
+            bits.append(f"底板 {parts['plate']}")
+        if parts["axis"]:
+            bits.append(f"轴 {parts['axis']}")
+        if bits:
+            return "；".join(bits)
+        leftover = "；".join(_t(v) for v in value.values() if isinstance(v, str) and _t(v))
+        return leftover
+    return _t(value)
+
+
 def dialogue_seconds(lines: list[str]) -> float:
     total = 0.0
     for line in lines:
@@ -69,15 +163,298 @@ def dialogue_seconds(lines: list[str]) -> float:
     return round(total, 1)
 
 
+SENTENCE_END = re.compile(r"(?<=[。！？])")
+
+
+def _shot_blob(shot: dict) -> str:
+    state = shot.get("state") if isinstance(shot.get("state"), dict) else {}
+    return " ".join(
+        _t(shot.get(key))
+        for key in ("left", "right", "eyeline", "body_facing", "one_action", "shot_job", "in_from", "out_to", "action_ref")
+    ) + " " + _t(state.get("note"))
+
+
+def facing_class(shot: dict) -> str:
+    """front / back / '' from the enum or from wording. 背影 of a second person does not count."""
+    facing = _t(shot.get("body_facing"))
+    if facing in ("朝镜头", "四分之三", "侧脸"):
+        return "front"
+    if facing == "背对镜头":
+        return "back"
+    if facing == "无人":
+        return ""
+    blob = _shot_blob(shot)
+    back = bool(BACK_FACING.search(blob))
+    front = bool(FRONT_FACING.search(blob))
+    if back and not front:
+        return "back"
+    if front and not back:
+        return "front"
+    return ""
+
+
+def turn_is_written(shot: dict) -> bool:
+    blob = _shot_blob(shot)
+    if not TURN_ACTION.search(blob):
+        return False
+    stripped = UNTURNED.sub("", blob)
+    return bool(TURN_ACTION.search(stripped))
+
+
+def orientation_errors(shots: list[dict]) -> list[str]:
+    """Hard filmability: OTC cannot see behind the foreground person; no unmotivated front↔back flip."""
+    errors: list[str] = []
+    prev: Optional[dict] = None
+    for shot in shots:
+        sid = _t(shot.get("shot_id") or shot.get("id")) or "?"
+        coverage = _t(shot.get("coverage_type"))
+        facing = _t(shot.get("body_facing"))
+        if facing and facing not in BODY_FACING:
+            errors.append(f"{sid} body_facing must be one of {list(BODY_FACING)}")
+        side = _t(shot.get("camera_side"))
+        if side and side not in CAMERA_SIDE:
+            errors.append(f"{sid} camera_side must be one of {list(CAMERA_SIDE)}")
+        blob = _shot_blob(shot)
+        if coverage in OTC_COVERAGE and BEHIND_SHOULDER.search(blob):
+            errors.append(
+                f"{sid} {coverage} cannot show a target behind the foreground person "
+                f"(肩后/身后); use a dirty single from in front, not over-shoulder"
+            )
+        if coverage in OTC_COVERAGE and facing_class(shot) == "back":
+            errors.append(
+                f"{sid} {coverage} describes the shoulder owner as 背对镜头/后脑; "
+                f"over-shoulder is not turning them around"
+            )
+        if prev is not None and _t(prev.get("scene_id")) == _t(shot.get("scene_id")):
+            prev_face = facing_class(prev)
+            this_face = facing_class(shot)
+            if prev_face and this_face and prev_face != this_face:
+                if not (turn_is_written(prev) or turn_is_written(shot)):
+                    errors.append(
+                        f"{sid} facing flips {prev_face}→{this_face} from {_t(prev.get('shot_id'))} "
+                        f"with no 转身/回头 in in_from/out_to/one_action"
+                    )
+        prev = shot
+    return errors
+
+
+def sentence_units(text: str) -> list[str]:
+    parts = [p.strip() for p in SENTENCE_END.split(_t(text)) if p.strip()]
+    return parts or ([_t(text)] if _t(text) else [])
+
+
+def pack_dialogue_for_budget(line: str, max_dialogue_sec: float) -> list[str]:
+    """Pack sentences so each chunk's spoken time stays inside the budget."""
+    units = sentence_units(line)
+    if not units:
+        return []
+    packs: list[str] = []
+    current = ""
+    for unit in units:
+        trial = f"{current}{unit}"
+        if current and dialogue_seconds([trial]) > max_dialogue_sec:
+            packs.append(current)
+            current = unit
+        else:
+            current = trial
+    if current:
+        packs.append(current)
+    return packs
+
+
+def consecutive_fragments(writer_line: str) -> set[str]:
+    units = sentence_units(writer_line)
+    out: set[str] = set()
+    for i in range(len(units)):
+        for j in range(i + 1, len(units) + 1):
+            out.add("".join(units[i:j]))
+    return out
+
+
+def is_writer_line_or_fragment(shot_line: str, all_writer_lines: set[str]) -> bool:
+    if shot_line in all_writer_lines:
+        return True
+    return any(shot_line in consecutive_fragments(writer_line) for writer_line in all_writer_lines)
+
+
+def writer_line_is_covered(writer_line: str, used_lines: dict[str, list]) -> bool:
+    if writer_line in used_lines:
+        return True
+    units = sentence_units(writer_line)
+    if not units:
+        return True
+    allowed = consecutive_fragments(writer_line)
+    blob = "".join(key for key in used_lines if key in allowed)
+    return all(unit in blob for unit in units)
+
+
+def fit_writer_dialogue(writer: dict, *, max_shot_sec: int = 15) -> dict:
+    """Split script lines that cannot fit in one Seedance shot (4–15s)."""
+    budget = max(4.0, float(max_shot_sec) - BASE_ACTION_SEC - 1.0)
+    for scene in writer.get("scenes") or []:
+        dialogue = scene.get("dialogue") or []
+        packed: list[Any] = []
+        for item in dialogue:
+            if not isinstance(item, dict):
+                packed.append(item)
+                continue
+            line = _t(item.get("line"))
+            if not line or dialogue_seconds([line]) + BASE_ACTION_SEC <= float(max_shot_sec):
+                packed.append(item)
+                continue
+            packs = pack_dialogue_for_budget(line, budget)
+            if len(packs) <= 1:
+                packed.append(item)
+                continue
+            for pack in packs:
+                piece = dict(item)
+                piece["line"] = pack
+                packed.append(piece)
+        scene["dialogue"] = packed
+    return writer
+
+
 def clauses_of(action: str) -> list[str]:
     return [c.strip() for c in CLAUSE_SPLIT.split(_t(action)) if c.strip()]
 
 
+def paper_floor_waived(data: dict, shot: dict) -> bool:
+    """1.0s opening hooks on a candidate tight_2_4 table. Locked picture stays strict."""
+    if picture_is_locked(data):
+        return False
+    if _t(data.get("pace_profile")) != "tight_2_4":
+        return False
+    return bool(shot.get("opening_hook"))
+
+
 def needed_seconds(shot: dict) -> float:
+    """Minimum paper seconds this shot must hold. Reaction/insert can sit under 2s."""
     lines = [_t(item.get("line")) for item in (shot.get("dialogue_ref") or []) if isinstance(item, dict)]
+    spoken = dialogue_seconds(lines)
+    coverage = _t(shot.get("coverage_type"))
+    if coverage == "reaction" and not spoken:
+        return PAPER_REACTION[0]
+    if coverage == "insert" and not spoken:
+        return PAPER_INSERT[0]
+    if spoken:
+        extra = 0.4 if coverage == "reaction" or len(lines) == 1 else BASE_ACTION_SEC
+        return round(max(PAPER_DIALOGUE[0], spoken + extra), 1)
     clauses = clauses_of(shot.get("one_action") or shot.get("action_ref") or "")
     action_sec = BASE_ACTION_SEC + CLAUSE_SEC * max(0, len(clauses) - 1)
-    return round(action_sec + dialogue_seconds(lines), 1)
+    return round(action_sec, 1)
+
+
+def has_long_take_reason(shot: dict) -> bool:
+    blob = _t(shot.get("shot_job")) + _t(shot.get("one_action"))
+    return LONG_TAKE_REASON in blob
+
+
+def has_compound_action(shot: dict) -> bool:
+    text = _t(shot.get("one_action") or shot.get("action_ref"))
+    if not text or MUST_HOLD_ACTION.search(text):
+        return False
+    if has_long_take_reason(shot):
+        return False
+    return bool(COMPOUND_ACTION.search(text))
+
+
+def pace_metrics(shots: list[dict]) -> dict[str, float]:
+    total = sum(_sec(s.get("duration_sec")) for s in shots)
+    n = len(shots)
+    minutes = total / 60.0 if total else 0.0
+    return {
+        "shots": n,
+        "total_sec": round(total, 1),
+        "spm": round(n / minutes, 2) if minutes else 0.0,
+        "asl": round(total / n, 2) if n else 0.0,
+    }
+
+
+def picture_is_locked(data: dict, prod: Any = None) -> bool:
+    """Official picture lock: flag, or every shot id already has an unsuffixed mp4."""
+    if data.get("locked_picture") is True:
+        return True
+    if _t(data.get("status")) == "candidate" or _t(data.get("resplit_of")):
+        return False
+    if prod is None:
+        return False
+    from pathlib import Path
+
+    root = Path(prod)
+    shots = [s for s in (data.get("shots") or []) if _t(s.get("shot_id"))]
+    if not shots:
+        return False
+    return all((root / "05-shots" / f"{_t(s.get('shot_id'))}.mp4").exists() for s in shots)
+
+
+def pace_enforcement(data: dict, prod: Any = None) -> str:
+    """error for new paper / candidate; warning for locked picture or ready episode tables."""
+    if picture_is_locked(data, prod):
+        return "warning"
+    status = _t(data.get("status"))
+    if status == "ready":
+        return "warning"
+    return "error"
+
+
+def _emit_pace(errors: list[str], warnings: list[str], message: str, *, hard: bool) -> None:
+    (errors if hard else warnings).append(message)
+
+
+def _check_shot_pace(
+    data: dict,
+    shots: list[dict],
+    errors: list[str],
+    warnings: list[str],
+    *,
+    pace_hard: bool,
+    partial: bool,
+    scene_scope: Optional[list[str]],
+) -> None:
+    """SPM / consecutive longs / dialogue-without-reaction. Locked picture stays warning."""
+    prev: Optional[dict] = None
+    for shot in shots:
+        duration = _sec(shot.get("duration_sec"))
+        if (
+            prev is not None
+            and _t(prev.get("scene_id")) == _t(shot.get("scene_id"))
+            and _sec(prev.get("duration_sec")) >= PAPER_LONG_CAP
+            and duration >= PAPER_LONG_CAP
+        ):
+            warnings.append(
+                f"{_t(shot.get('shot_id'))} follows {_t(prev.get('shot_id'))} at ≥{PAPER_LONG_CAP:g}s; consecutive long takes"
+            )
+        if prev is not None and _t(prev.get("scene_id")) == _t(shot.get("scene_id")) and prev.get("dialogue_ref"):
+            nxt_cov = _t(shot.get("coverage_type"))
+            nxt_dlg = bool(shot.get("dialogue_ref"))
+            if not nxt_dlg and nxt_cov not in ("reaction", "close", "insert") and _t(shot.get("beat")) != _t(prev.get("beat")):
+                warnings.append(
+                    f"{_t(prev.get('shot_id'))} has dialogue but {_t(shot.get('shot_id'))} changes topic with no reaction"
+                )
+        prev = shot
+
+    def _spm_flag(label: str, group: list[dict]) -> None:
+        if len(group) < 4:
+            return
+        metrics = pace_metrics(group)
+        if metrics["spm"] < PACE_SPM_WARN_BELOW:
+            _emit_pace(
+                errors,
+                warnings,
+                f"{label} SPM {metrics['spm']} < {PACE_SPM_WARN_BELOW} (target 14–18); "
+                f"{metrics['shots']} shots / {metrics['total_sec']}s",
+                hard=pace_hard,
+            )
+
+    if not partial and len(shots) >= 8:
+        _spm_flag("episode", shots)
+    by_scene: dict[str, list[dict]] = {}
+    for shot in shots:
+        by_scene.setdefault(_t(shot.get("scene_id")), []).append(shot)
+    scope = set(scene_scope or by_scene)
+    for scene_id, group in by_scene.items():
+        if scene_id in scope:
+            _spm_flag(f"scene {scene_id}", group)
 
 
 def writer_lines(writer: Optional[dict]) -> dict[str, list[str]]:
@@ -185,6 +562,74 @@ def shot_text(shot: dict) -> str:
     return " ".join(_t(p) for p in parts)
 
 
+def change_tags(raw: Any) -> list[str]:
+    """Normalize `state_changes` to tags like `sokha.binding`.
+
+    Accepts a list, a split string, or a dict whose keys are already tags
+    (models sometimes write `{"rin.carrying": ["cleaning-cart"]}`).
+    """
+    if isinstance(raw, str):
+        return [c.strip() for c in re.split(r"[、,，;； ]+", raw) if c.strip()]
+    if isinstance(raw, dict):
+        return [_t(k) for k in raw if _t(k)]
+    return [_t(c) for c in (raw or []) if _t(c)]
+
+
+def evidence_claims(raw: Any) -> list[str]:
+    """Normalize per-shot evidence to bible `what` strings.
+
+    Models sometimes write `[{"what": "…"}]` instead of `["…"]`. Unwrap only;
+    do not invent a claim the shot did not already name.
+    """
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        return [_t(raw)] if _t(raw) else []
+    if isinstance(raw, dict):
+        what = _t(raw.get("what"))
+        return [what] if what else []
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            what = _t(item.get("what"))
+            if what:
+                out.append(what)
+        elif _t(item):
+            out.append(_t(item))
+    return out
+
+
+def fill_omitted_state_change_tags(shots: list[dict]) -> None:
+    """If `state` already differs from the carried character, tag `state_changes`.
+
+    Walks the table in order. Fills `cid.costume` / `.binding` / `.bound_with` /
+    `.carrying` when the shot's own state already shows the new value. Does not
+    invent costume, props, or carried items, and does not drop extra tags.
+    """
+    carried: dict[str, dict] = {}
+    for shot in shots:
+        state = normalize_state(shot.get("state"))
+        if state is None:
+            continue
+        shot["state"] = state
+        changes = change_tags(shot.get("state_changes"))
+        seen = set(changes)
+        for cid, item in state["characters"].items():
+            prev = carried.get(cid)
+            tracked = dict(item)
+            if not tracked["costume"] and prev:
+                tracked["costume"] = prev["costume"]
+            if prev:
+                for key in CHAR_STATE_KEYS:
+                    if tracked[key] != prev[key]:
+                        tag = f"{cid}.{key}"
+                        if tag not in seen:
+                            changes.append(tag)
+                            seen.add(tag)
+            carried[cid] = tracked
+        shot["state_changes"] = changes
+
+
 def state_sentence(state: Optional[dict], bible: Optional[dict] = None) -> str:
     """Fallback one-liner when the designer wrote no note: binding + bound prop, per character."""
     if not state:
@@ -246,7 +691,7 @@ def validate_state_chain(data: dict, *, writer: Optional[dict] = None) -> tuple[
         if not state["note"]:
             errors.append(f"{sid} state needs a note: one line the frame must obey")
         here = scene_order.get(_t(shot.get("scene_id")), -1)
-        declared = {_t(x) for x in (shot.get("state_changes") or []) if _t(x)}
+        declared = set(change_tags(shot.get("state_changes")))
         seen: set[str] = set()
         for cid, item in state["characters"].items():
             if cast and cid not in cast:
@@ -284,6 +729,52 @@ def validate_state_chain(data: dict, *, writer: Optional[dict] = None) -> tuple[
     return errors, warnings
 
 
+def validate_camera_ids(shots: list[dict], sets: Optional[dict]) -> tuple[list[str], list[str]]:
+    """`camera_id` is optional; when written it must exist in sets.json and agree with the plot geometry.
+
+    Axis errors apply to cameras **used by shots in this table**, not unused cameras sitting on the set.
+    Per-shot left/right flips stay warnings (`side_disagreements`).
+    """
+    from .camera_plot import axis_check, axis_marks, find_camera, set_cameras, side_disagreements
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    entries = [s for s in (sets or {}).get("sets") or [] if isinstance(s, dict) and _t(s.get("id"))]
+    if not entries:
+        return errors, warnings
+    by_id = {_t(s.get("id")): s for s in entries}
+    with_cameras = [s for s in entries if set_cameras(s)]
+    used: dict[str, set[str]] = {}
+    for shot in shots:
+        camera_id = _t(shot.get("camera_id"))
+        if not camera_id:
+            continue
+        sid = _t(shot.get("shot_id")) or "?"
+        home = by_id.get(_t(shot.get("location_id")))
+        owner = home if home is not None and find_camera(home, camera_id) else next((s for s in with_cameras if find_camera(s, camera_id)), None)
+        if owner is None:
+            errors.append(f"{sid} camera_id {camera_id} is not a camera in sets.json" + (f" ({_t(shot.get('location_id'))})" if _t(shot.get("location_id")) else ""))
+            continue
+        owner_id = _t(owner.get("id"))
+        used.setdefault(owner_id, set()).add(camera_id)
+        if home is not None and owner is not home:
+            warnings.append(f"{sid} camera {camera_id} belongs to set {_t(owner.get('id'))}, not the shot's {_t(shot.get('location_id'))}")
+        warnings.extend(side_disagreements(owner, shot))
+    for owner_id, cam_ids in used.items():
+        owner = by_id.get(owner_id)
+        if owner is None:
+            continue
+        cameras = [c for c in set_cameras(owner) if c["id"] in cam_ids]
+        if not cameras:
+            continue
+        a, b = axis_marks(owner)
+        if a is None or b is None:
+            continue
+        for problem in axis_check(cameras, a, b):
+            errors.append(f"set {owner_id}: {problem}")
+    return errors, warnings
+
+
 def validate_shot_table(
     data: dict,
     *,
@@ -293,6 +784,7 @@ def validate_shot_table(
     look_text: str = "",
     scene_scope: Optional[list[str]] = None,
     partial: bool = False,
+    prod: Any = None,
 ) -> tuple[list[str], list[str]]:
     """Return (errors, warnings).
 
@@ -303,6 +795,7 @@ def validate_shot_table(
     warnings: list[str] = []
     shots = list(data.get("shots") or [])
     profile = profile or {}
+    pace_hard = pace_enforcement(data, prod) == "error"
     min_sec = int(profile.get("min_shot_sec") or 1)
     max_sec = int(profile.get("max_shot_sec") or 60)
     allowed_moves = set(profile.get("allowed_moves") or MOVE_INTENSITY)
@@ -323,9 +816,9 @@ def validate_shot_table(
     scene_ids = _scene_ids_in_order(shots)
     if isinstance(lock, dict):
         for sid in scene_ids:
-            if not _t(lock.get(sid)):
+            if not lock_is_present(lock.get(sid)):
                 errors.append(f"left_right_lock missing scene {sid}")
-    elif not _t(lock):
+    elif not lock_is_present(lock):
         errors.append("missing left_right_lock")
 
     bible = data.get("continuity_bible") if isinstance(data.get("continuity_bible"), dict) else {}
@@ -372,9 +865,9 @@ def validate_shot_table(
         if _t(shot.get("lens")) and not re.fullmatch(r"\d{2,3}mm", _t(shot.get("lens"))):
             errors.append(f"{sid} lens must look like 35mm")
 
-        duration = _int(shot.get("duration_sec"), 0)
+        duration = _sec(shot.get("duration_sec"), 0)
         if duration <= 0:
-            errors.append(f"{sid} duration_sec must be a positive integer")
+            errors.append(f"{sid} duration_sec must be a positive number")
         else:
             if duration > max_sec:
                 errors.append(f"{sid} duration {duration}s exceeds model max {max_sec}s")
@@ -382,11 +875,40 @@ def validate_shot_table(
                 warnings.append(f"{sid} duration {duration}s below model min {min_sec}s; render at {min_sec}s and trim in cut")
             need = needed_seconds(shot)
             if need > duration + 0.05:
-                errors.append(f"{sid} needs about {need}s for its action and lines but has {duration}s; split the shot or add seconds")
+                if paper_floor_waived(data, shot) and duration >= 1.0:
+                    warnings.append(
+                        f"{sid} opening hook {duration}s below formula {need}s; "
+                        f"allowed by pace_profile=tight_2_4"
+                    )
+                elif data.get("keep_paper_duration"):
+                    warnings.append(
+                        f"{sid} paper {duration}s below formula {need}s; "
+                        f"keep_paper_duration, render at model min and trim in cut"
+                    )
+                elif duration >= max_sec and need <= max_sec + 1.5:
+                    warnings.append(f"{sid} needs about {need}s for its action and lines but has {duration}s; split if the model clips")
+                else:
+                    errors.append(f"{sid} needs about {need}s for its action and lines but has {duration}s; split the shot or add seconds")
+            if duration > PAPER_LONG_CAP and not has_long_take_reason(shot):
+                padded = duration >= PAPER_HARD_FAIL_SEC or duration >= need + 3.0
+                if padded:
+                    _emit_pace(
+                        errors,
+                        warnings,
+                        f"{sid} duration {duration}s > {PAPER_LONG_CAP:g}s without 「{LONG_TAKE_REASON}」 in shot_job",
+                        hard=pace_hard and duration >= PAPER_HARD_FAIL_SEC,
+                    )
 
         clauses = clauses_of(shot.get("one_action") or "")
         if len(clauses) > 5:
             errors.append(f"{sid} one_action has {len(clauses)} clauses; one shot, one beat")
+        if has_compound_action(shot):
+            _emit_pace(
+                errors,
+                warnings,
+                f"{sid} one_action has two verbs (和/再/然后/并); split",
+                hard=pace_hard,
+            )
 
         move = _t(shot.get("move_type") or ("static" if _t(shot.get("move_needed")) in ("", "static") else ""))
         if not move:
@@ -432,7 +954,7 @@ def validate_shot_table(
             errors.append(f"{sid} has lines but dialogue_delivery=none")
         for item in dialogue:
             line = _t(item.get("line"))
-            if all_writer_lines and line not in all_writer_lines:
+            if all_writer_lines and line and not is_writer_line_or_fragment(line, all_writer_lines):
                 errors.append(f"{sid} line is not a writer line: {line[:20]}")
             used_lines.setdefault(line, []).append(sid)
 
@@ -443,7 +965,12 @@ def validate_shot_table(
             expected = scene_location.get(scene_id)
             if loc and expected and loc != expected:
                 errors.append(f"{sid} location_id {loc} differs from writer scene {scene_id} ({expected})")
-            others = [name for oid, name in set_names.items() if name and oid != loc and name in text]
+            spoken = " ".join(lines_by_scene.get(scene_id) or [])
+            others = [
+                name
+                for oid, name in set_names.items()
+                if name and oid != loc and name in text and name not in spoken
+            ]
             if loc and others:
                 errors.append(f"{sid} one shot cannot visit two sets ({others[0]})")
         if re.search(r"(拖进|拖入|带进|走进|进入|押进)", text) and re.search(r"(门外|寨门|外面|门口)", text):
@@ -455,7 +982,7 @@ def validate_shot_table(
             if not token or token in ("空", "—", "-", "无"):
                 continue
             if sides.get(token) and sides[token] != side:
-                errors.append(f"{sid} {token} flips to {side} inside scene {scene_id}; axis lock broken")
+                warnings.append(f"{sid} {token} flips to {side} inside scene {scene_id}; axis lock broken")
             sides.setdefault(token, side)
 
         if scale:
@@ -482,7 +1009,7 @@ def validate_shot_table(
         if count >= 3 and len(scales) < 2:
             warnings.append(f"scene {scene_id} has {count} shots but only one scale; add a tighter or wider setup")
         for line in lines_by_scene.get(scene_id) or []:
-            if line not in used_lines:
+            if not writer_line_is_covered(line, used_lines):
                 errors.append(f"scene {scene_id} line not assigned to any shot: {line[:20]}")
     for line, owners in used_lines.items():
         if len(owners) > 1:
@@ -509,7 +1036,7 @@ def validate_shot_table(
             if last_scene in scene_order and here > scene_order[last_scene]:
                 errors.append(f"{sid} still shows {name} after its last scene {last_scene}")
             if first_scene in scene_order and here < scene_order[first_scene]:
-                errors.append(f"{sid} shows {name} before its first scene {first_scene}")
+                warnings.append(f"{sid} shows {name} before its first scene {first_scene}")
 
     evidence = bible.get("evidence") if isinstance(bible.get("evidence"), list) else []
     for item in evidence:
@@ -527,23 +1054,50 @@ def validate_shot_table(
             warnings.append(f"evidence {what} claimed by {len(claimants)} shots")
         for shot in claimants:
             if _t(shot.get("scale")) == "wide":
-                errors.append(f"evidence {what} sits in wide shot {_t(shot.get('shot_id'))}; it must be readable")
+                warnings.append(f"evidence {what} sits in wide shot {_t(shot.get('shot_id'))}; it must be readable")
             if _t(item.get("scene_id")) and _t(shot.get("scene_id")) != _t(item.get("scene_id")):
                 warnings.append(f"evidence {what} planned for {_t(item.get('scene_id'))} but shown in {_t(shot.get('scene_id'))}")
 
     declared = data.get("total_sec")
-    actual = sum(_int(s.get("duration_sec"), 0) for s in shots)
-    if declared not in (None, "") and _int(declared) != actual:
-        errors.append(f"total_sec {declared} != sum of shots {actual}")
+    actual = round(sum(_sec(s.get("duration_sec")) for s in shots), 1)
+    if declared not in (None, "") and abs(_sec(declared) - actual) > 0.05:
+        errors.append(f"total_sec {declared} != sum of shots {actual:g}")
+
+    _check_shot_pace(data, shots, errors, warnings, pace_hard=pace_hard, partial=partial, scene_scope=scene_scope)
 
     state_errors, state_warnings = validate_state_chain(data, writer=writer)
     errors.extend(state_errors)
     warnings.extend(state_warnings)
+
+    # Camera plot: a shot that names a camera must name one the set knows, and its left/right must agree with the geometry.
+    camera_errors, camera_warnings = validate_camera_ids(shots, sets)
+    errors.extend(camera_errors)
+    warnings.extend(camera_warnings)
+
+    errors.extend(orientation_errors(shots))
+
+    # Director layer: only when the table carries scene cards / visual grammar (or asks for it).
+    from .direction import film_grade_checks, has_direction
+
+    if has_direction(data) or bool(data.get("film_grade")):
+        direction_errors, direction_warnings = film_grade_checks(data, writer=writer)
+        errors.extend(direction_errors)
+        warnings.extend(direction_warnings)
     return errors, warnings
 
 
 def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
-    """Fill derivable fields, strip forbidden keys. Never invents sides, lines, or seconds."""
+    """Fill derivable fields, strip forbidden keys. Never invents sides or lines.
+
+    Seconds stay as given except a <1s ceil: if the action/line formula needs more
+    than `duration_sec` but not more than `duration_sec + 1`, bump one second so
+    integer rounding-down does not invent extra coverage.
+
+    If a shot's `state` already differs from the previous shot / first appearance
+    (costume, binding, bound_with, carrying) but `state_changes` omitted the tag,
+    fill the tag. Evidence written as `{"what": "…"}` unwraps to the string.
+    Does not invent story state.
+    """
     payload = dict(data or {})
     payload["schema"] = SCHEMA
     locations = writer_locations(writer)
@@ -553,14 +1107,21 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
         for key in FORBIDDEN_KEYS:
             shot.pop(key, None)
         shot.pop("lens_mm", None)
+        if shot.get("internal_cuts"):
+            # House rule: one shot, one setup. Seedance profiles default max_internal_cuts=0.
+            shot["internal_cuts"] = []
         if not _t(shot.get("shot_id")) and _t(shot.get("id")):
             shot["shot_id"] = _t(shot.get("id"))
         if not _t(shot.get("shot_id")):
-            shot["shot_id"] = f"SH{index + 1:03d}"
+            used = {_t(s.get("shot_id")) for s in shots}
+            n = index + 1
+            while f"SH{n:03d}" in used:
+                n += 1
+            shot["shot_id"] = f"SH{n:03d}"
         if not _t(shot.get("location_id")) and _t(shot.get("scene_id")) in locations:
             shot["location_id"] = locations[_t(shot.get("scene_id"))]
         if shot.get("duration_sec") not in (None, ""):
-            shot["duration_sec"] = _int(shot.get("duration_sec"), 0)
+            shot["duration_sec"] = store_duration(shot.get("duration_sec"), 0)
         move = _t(shot.get("move_type"))
         if not move:
             move = "static" if _t(shot.get("move_needed")) in ("", "static") else _t(shot.get("move_needed"))
@@ -578,6 +1139,27 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
             shot["dialogue_delivery"] = "none"
         elif not _t(shot.get("dialogue_delivery")):
             shot["dialogue_delivery"] = "post"
+        coverage = _t(shot.get("coverage_type"))
+        coverage_alias = {"medium": "single", "ms": "single", "ws": "master", "wide_shot": "master", "cu": "close"}
+        if coverage in coverage_alias:
+            shot["coverage_type"] = coverage_alias[coverage]
+        duration = _sec(shot.get("duration_sec"), 0)
+        if duration > 15:
+            shot["duration_sec"] = 15
+            duration = 15
+        if duration > 0:
+            need = needed_seconds(shot)
+            hook_keep = (
+                bool(shot.get("opening_hook"))
+                and _t(payload.get("pace_profile")) == "tight_2_4"
+                and payload.get("locked_picture") is not True
+            )
+            if (
+                not hook_keep
+                and not payload.get("keep_paper_duration")
+                and duration + 0.05 < need <= duration + 1.0
+            ):
+                shot["duration_sec"] = store_duration(min(15, duration + 1))
         if not _t(shot.get("angle")):
             shot["angle"] = "eye"
         if shot.get("key_sfx") is None:
@@ -586,26 +1168,30 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
             shot["key_sfx"] = [s.strip() for s in re.split(r"[、,，;；]", shot["key_sfx"]) if s.strip()]
         if shot.get("internal_cuts") is None:
             shot["internal_cuts"] = []
-        evidence = shot.get("evidence")
-        if evidence is None or evidence == "":
-            evidence = []
-        if isinstance(evidence, str):
-            evidence = [evidence]
-        shot["evidence"] = [_t(e) for e in evidence if _t(e)]
+        shot["evidence"] = evidence_claims(shot.get("evidence"))
         shot.setdefault("visual_turn", False)
         shot.setdefault("hardest", False)
+        if shot.get("emotion_level") not in (None, ""):
+            shot["emotion_level"] = _int(shot.get("emotion_level"), 0)
+        else:
+            shot.pop("emotion_level", None)
         if not _t(shot.get("action_ref")):
             shot["action_ref"] = _t(shot.get("one_action"))
         state = normalize_state(shot.get("state"))
         if state is not None:
+            for item in (state.get("characters") or {}).values():
+                if not isinstance(item, dict):
+                    continue
+                if item.get("binding") not in BINDINGS:
+                    item["binding"] = "none"
+                if item.get("binding") != "none" and not item.get("bound_with"):
+                    item["binding"] = "none"
             shot["state"] = state
-            changes = shot.get("state_changes")
-            if isinstance(changes, str):
-                changes = [c.strip() for c in re.split(r"[、,，;； ]+", changes) if c.strip()]
-            shot["state_changes"] = [_t(c) for c in (changes or []) if _t(c)]
+            shot["state_changes"] = change_tags(shot.get("state_changes"))
         shots.append(shot)
+    fill_omitted_state_change_tags(shots)
     payload["shots"] = shots
-    payload["total_sec"] = sum(_int(s.get("duration_sec"), 0) for s in shots)
+    payload["total_sec"] = store_duration(sum(_sec(s.get("duration_sec")) for s in shots))
     payload.setdefault("dropped_shots", [])
     payload.setdefault("design_steps_done", [1, 2, 3, 4, 5, 6, 7])
     payload.setdefault("visible_change_without_dialogue", "pass")
@@ -670,18 +1256,19 @@ def compile_specs_from_shot_table(data: dict, *, aspect: str = "16:9") -> dict:
             "left": _t(shot.get("left")),
             "right": _t(shot.get("right")),
             "eyeline": _t(shot.get("eyeline")),
-            "body_facing": _t(shot.get("body_facing") or shot.get("eyeline")),
+            "body_facing": _t(shot.get("body_facing")),
+            "camera_side": _t(shot.get("camera_side")),
             "day_night": light["day_night"],
             "key_light_dir": light["key_light_dir"],
             "quality": light["quality"],
             "color_mood": light["color_mood"],
-            "duration_sec": float(_int(shot.get("duration_sec"), 0)),
+            "duration_sec": float(store_duration(shot.get("duration_sec"), 0)),
             "dialogue_line": lines[0] if lines else "",
             "dialogue_lines": lines,
             "dialogue_delivery": _t(shot.get("dialogue_delivery") or ("post" if lines else "none")),
             "dialogue_start_sec": (shot.get("dialogue_start_sec") if shot.get("dialogue_start_sec") not in (None, "") else (0.6 if lines else None)),
             "key_sfx": list(shot.get("key_sfx") or []),
-            "axis_side": _t(axis),
+            "axis_side": lock_axis_text(axis),
             "in_from": _t(shot.get("in_from")),
             "out_to": _t(shot.get("out_to")),
             "internal_cuts": list(shot.get("internal_cuts") or []),
@@ -693,18 +1280,27 @@ def compile_specs_from_shot_table(data: dict, *, aspect: str = "16:9") -> dict:
     return {"shot_specs": specs, "status": "draft", "origin": "compiled-from-shot-table", "schema": SCHEMA}
 
 
-def table_context(prod, target_model: Optional[str] = None) -> dict:
+def table_context(prod, target_model: Optional[str] = None, episode: int = 1) -> dict:
     """Everything the validator and the renderer need from disk: writer, sets, look text, model profile."""
-    from .pipeline import read_artifact
+    from .pipeline import episode_artifact_name, read_artifact
     from .production import load_json, read_text
     from .video_profiles import get_profile, resolve_target_model
 
     model = resolve_target_model(prod, target_model)
+    writer_name = episode_artifact_name("writer.json", episode)
+    writer = read_artifact(prod, writer_name)
+    if not writer.get("scenes") and int(episode) != 1:
+        writer = read_artifact(prod, "writer.json")
+    sets_rel = "03-storyboard/sets.json" if int(episode) == 1 else f"03-storyboard/sets.ep{int(episode):02d}.json"
+    sets = load_json(prod, sets_rel, {"sets": []})
+    if int(episode) != 1 and not (sets.get("sets") or []):
+        sets = load_json(prod, "03-storyboard/sets.json", {"sets": []})
     return {
-        "writer": read_artifact(prod, "writer.json"),
-        "sets": load_json(prod, "03-storyboard/sets.json", {"sets": []}),
+        "writer": writer,
+        "sets": sets,
         "look_text": read_text(prod, "02-assets/LOOK.md"),
         "profile": get_profile(model),
+        "prod": prod,
     }
 
 
@@ -713,10 +1309,18 @@ def _md_cell(value: Any) -> str:
     return text.replace("|", "／").replace("\n", " ") or "—"
 
 
-def render_shot_table_md(data: dict, *, title: str = "", profile: Optional[dict] = None, warnings: Optional[list[str]] = None) -> str:
+def render_shot_table_md(
+    data: dict,
+    *,
+    title: str = "",
+    profile: Optional[dict] = None,
+    warnings: Optional[list[str]] = None,
+    frame_descriptions: Optional[dict] = None,
+) -> str:
     profile = profile or {}
     shots = list(data.get("shots") or [])
-    total = sum(_int(s.get("duration_sec"), 0) for s in shots)
+    descriptions = frame_descriptions or {}
+    total = store_duration(sum(_sec(s.get("duration_sec")) for s in shots))
     lock = data.get("left_right_lock")
     bible = data.get("continuity_bible") if isinstance(data.get("continuity_bible"), dict) else {}
     lines: list[str] = []
@@ -740,6 +1344,11 @@ def render_shot_table_md(data: dict, *, title: str = "", profile: Optional[dict]
         lines.append(f"- **删掉的镜**：{'；'.join(_t(d) for d in dropped)}")
     if warnings:
         lines.append("- **警告**：" + "；".join(warnings))
+    if data.get("scene_cards"):
+        lines.append("- **场卡**：见 `03-storyboard/scene-cards.draft.md`（导演阐述层，拆镜依据）")
+    picks = data.get("candidate_picks") if isinstance(data.get("candidate_picks"), dict) else {}
+    if picks:
+        lines.append("- **候选**：" + "；".join(f"{sid} 选第 {int(idx) + 1} 版" for sid, idx in picks.items()) + "（对比页 `03-storyboard/shot-candidates.draft.md`）")
     lines.append("")
     lines.append("## 左右锁")
     lines.append("")
@@ -747,9 +1356,9 @@ def render_shot_table_md(data: dict, *, title: str = "", profile: Optional[dict]
         lines.append("| 场 | 锁 |")
         lines.append("|---|---|")
         for sid, text in lock.items():
-            lines.append(f"| {_md_cell(sid)} | {_md_cell(text)} |")
+            lines.append(f"| {_md_cell(sid)} | {_md_cell(lock_display(text))} |")
     else:
-        lines.append(_t(lock) or "—")
+        lines.append(_t(lock_display(lock)) or "—")
     lines.append("")
     lines.append("## 连戏圣经")
     lines.append("")
@@ -804,12 +1413,17 @@ def render_shot_table_md(data: dict, *, title: str = "", profile: Optional[dict]
     for shot in shots:
         sid = _t(shot.get("shot_id"))
         light = light_of(shot, bible)
-        lines.append(f"### {sid} · {_t(shot.get('scene_id'))} · {_t(shot.get('location_id')) or '—'} · {_int(shot.get('duration_sec'))}s")
+        lines.append(f"### {sid} · {_t(shot.get('scene_id'))} · {_t(shot.get('location_id')) or '—'} · {store_duration(shot.get('duration_sec'))}s")
         lines.append("")
-        lines.append(f"- **节拍**：{_t(shot.get('beat'))}")
+        lines.append(f"- **节拍**：{_t(shot.get('beat'))}" + (f"（情绪 {_int(shot.get('emotion_level'))}/10）" if shot.get("emotion_level") not in (None, "") else ""))
         lines.append(f"- **任务**：{_t(shot.get('shot_job'))}")
         lines.append(f"- **画面**：{_t(shot.get('one_action'))}")
+        desc = descriptions.get(sid) if isinstance(descriptions, dict) else None
+        if isinstance(desc, dict) and _t(desc.get("one_paragraph")):
+            lines.append(f"- **画面描述**：{_t(desc.get('one_paragraph'))}")
         geometry = f"{_t(shot.get('scale'))}，{_t(shot.get('angle') or 'eye')}，机高 {_t(shot.get('height') or '—')}，{_t(shot.get('lens'))}"
+        if _t(shot.get("camera_id")):
+            geometry += f"，机位 {_t(shot.get('camera_id'))}"
         lines.append(f"- **几何**：{geometry}")
         move = _t(shot.get("move_type") or "static")
         lines.append(f"- **运动**：{move}" + (f"。{_t(shot.get('move_reason'))}" if _t(shot.get("move_reason")) else "。固定"))

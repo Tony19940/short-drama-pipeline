@@ -26,6 +26,9 @@ import requests
 
 
 class CompShareH3:
+    MIN_DURATION = 4
+    MAX_DURATION = 15
+
     def __init__(self) -> None:
         self.api_key = os.environ.get("COMPSHARE_API_KEY", "").strip()
         if not self.api_key:
@@ -33,7 +36,7 @@ class CompShareH3:
         self.base = os.environ.get("COMPSHARE_BASE_URL", "https://cp.compshare.cn").rstrip("/")
         self.model = os.environ.get("COMPSHARE_MODEL", "MiniMax-H3")
         self.resolution = os.environ.get("COMPSHARE_RESOLUTION", "768P")
-        self.ratio = os.environ.get("COMPSHARE_RATIO", "9:16")
+        self.ratio = os.environ.get("COMPSHARE_RATIO", "16:9")
         self.poll = int(os.environ.get("COMPSHARE_POLL_SECONDS", "12"))
 
     def _headers(self, idempotency: str | None = None) -> dict[str, str]:
@@ -115,6 +118,19 @@ class CompShareH3:
         r.raise_for_status()
         return r.json()
 
+    def clamp_duration(self, seconds: int, shot_id: str = "") -> int:
+        """Validate, never clamp. H3 takes 4–15 s; anything else is a shot-table bug to fix upstream."""
+        try:
+            value = int(seconds or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value < self.MIN_DURATION or value > self.MAX_DURATION:
+            where = f"{shot_id} " if shot_id else ""
+            raise RuntimeError(
+                f"{where}秒数 {value} 不在 {self.model} 档内 [{self.MIN_DURATION},{self.MAX_DURATION}]，改分镜表，不替人改"
+            )
+        return value
+
     def _create(self, prompt: str, seconds: int, image_url: str) -> requests.Response:
         payload = {
             "model": self.model,
@@ -127,7 +143,7 @@ class CompShareH3:
                 },
             ],
             "resolution": self.resolution,
-            "duration": max(4, min(15, int(seconds))),
+            "duration": self.clamp_duration(seconds),
             "ratio": self.ratio,
             "use_context_ir": False,
             "aigc_watermark": False,
@@ -199,6 +215,7 @@ class CompShareH3:
         dest: Path,
         refs: list[Path] | None = None,
     ) -> None:
+        self.clamp_duration(seconds, shot_id=dest.stem)
         pts = self.points()
         print(
             f"compshare h3 {dest.name} ({seconds}s) 768P "

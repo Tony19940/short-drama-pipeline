@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Optional
 import re
 
+from .defaults import DEFAULT_ASPECT, frame_label, production_aspect
+
 ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE_DIR = ROOT / "templates"
 MOVE_CAMERA = {
@@ -126,11 +128,10 @@ def compose_video_prompt(shot: dict) -> str:
         "pan": f"Camera contract: one small pan along the 180 line in {seconds}s, then hold.",
         "track": f"Camera contract: short lateral track in {seconds}s, keep the background continuous.",
     }.get(move, "Camera contract: locked-off for the full shot.")
-    aspect = str(shot.get("aspect") or "")
-    if not aspect:
-        scene = str(shot.get("scene") or "")
-        aspect = "16:9"
-    frame = "Widescreen 16:9" if aspect == "16:9" else "Vertical 9:16"
+    aspect = production_aspect(explicit=str(shot.get("aspect") or "") or None)
+    if aspect not in ("16:9", "9:16"):
+        aspect = DEFAULT_ASPECT
+    frame = frame_label(aspect)
     return (
         f"{frame} photoreal Khmer {lens_bit}{SETUP_WORDS.get(setup, setup)} {SCALE_WORDS.get(scale, scale)}. "
         f"{speed} {camera}. {action}. {look}. Keep the same wardrobe, faces and room geography. "
@@ -142,7 +143,7 @@ def character_sheet_prompt(slug: str, slot: str, extra: str = "") -> str:
     base = (
         "Photoreal adult Khmer, visible pores, natural skin texture, no beauty filter. "
         "Match the locked master exactly: same face, hair, age, wardrobe. Neutral even light, clean backdrop. "
-        "Vertical 9:16 unless slot is sheet."
+        "Portrait reference card, not an episode frame."
     )
     slot = str(slot or "master")
     if slot == "sheet":
@@ -161,7 +162,7 @@ def character_sheet_prompt(slug: str, slot: str, extra: str = "") -> str:
     elif slot == "face":
         body = "Face lock close-up from the locked master. Keep pores and natural skin. No makeup filter."
     elif slot == "master":
-        body = "Full-body 9:16 master still of this character in the locked costume. One new generate only."
+        body = "Full-body master still of this character in the locked costume. One new generate only."
     else:
         body = f"{slot} still of this character, match locked master."
     extra = str(extra or "").strip()
@@ -202,9 +203,9 @@ def default_negatives_for(shot: dict) -> str:
 
 def shot_seconds(shot: dict) -> float:
     try:
-        value = float(shot.get("seconds") or 6)
+        value = float(shot.get("seconds") or shot.get("duration_sec") or 4)
     except (TypeError, ValueError):
-        value = 6.0
+        value = 4.0
     return max(4.0, min(value, 15.0))
 
 
@@ -325,14 +326,33 @@ def state_note_of(spec: dict, shot: Optional[dict] = None) -> str:
     return state_sentence(state) if state else ""
 
 
-def compile_keyframe_prompt_zh(spec: dict, shot: Optional[dict] = None) -> str:
-    """Still prompt for 6.1. One start-pose sentence, not a dump of the seven spec groups."""
+def compile_keyframe_prompt_zh(
+    spec: dict,
+    shot: Optional[dict] = None,
+    frame_desc: Optional[dict] = None,
+    *,
+    slot: str = "first",
+) -> str:
+    """Still prompt for 6.1. First slot is t=0 (in_from / still_start), never the finished one_action.
+
+    `one_action` is mentioned only as motion that happens AFTER this frame.
+    Last slot uses out_to / still_end.
+    """
     shot = shot or {}
+    from .frame_desc import description_sentence, normalize_item
+    from .still_t0 import first_still_text, forbidden_result_clause, last_still_text
+
+    item = normalize_item(frame_desc) if frame_desc else {}
+    picture = description_sentence(item) if item else ""
     size = SIZE_ZH.get(_spec_text(spec, "shot_size") or str(shot.get("scale") or ""), _spec_text(spec, "shot_size") or "中景")
     angle = ANGLE_ZH.get(_spec_text(spec, "angle") or str(shot.get("angle") or ""), "平视")
     lens = _spec_text(spec, "focal_length") or str(shot.get("lens") or "50mm")
     start = _spec_text(spec, "in_from") or str(shot.get("in_from") or shot.get("start") or "")
-    subject = _spec_text(spec, "subject", "action_now", "content") or str(shot.get("one_action") or "")
+    end = _spec_text(spec, "out_to") or str(shot.get("out_to") or "")
+    action = _spec_text(spec, "action_now", "content") or str(shot.get("one_action") or "")
+    still_subject = _spec_text(spec, "subject")
+    if still_subject and still_subject in {action, _spec_text(spec, "action_now", "content")}:
+        still_subject = ""
     left = _spec_text(spec, "left")
     right = _spec_text(spec, "right")
     eyeline = _spec_text(spec, "eyeline")
@@ -342,28 +362,222 @@ def compile_keyframe_prompt_zh(spec: dict, shot: Optional[dict] = None) -> str:
     light = _spec_text(spec, "key_light_dir") or str((shot.get("light") or {}).get("key_dir") or "")
     quality = _spec_text(spec, "quality") or str((shot.get("light") or {}).get("quality") or "")
     note = state_note_of(spec, shot)
+    light_line = "，".join(part for part in (day, mood, ("主光" + light) if light else "", quality) if part).rstrip("，") + "。"
+    if slot == "last":
+        still = last_still_text(item) or end
+        bits = [
+            "数字电影 CG 静帧，16:9，禁止真人、photoreal、real person。",
+            f"{size}，{lens}，{angle}。",
+            f"落幅定住：{end.rstrip('。')}。" if end else "",
+            f"尾帧画面：{still.rstrip('。')}。" if still else "",
+            f"左：{left.rstrip('。')}。右：{right.rstrip('。')}。" if left or right else "",
+            f"视线：{eyeline.rstrip('。')}。" if eyeline else "",
+            f"连戏必须照做：{note.rstrip('。')}。" if note else "",
+            light_line,
+            "画动作已经完成的那一格，对得上 out_to。",
+            "数字电影感绘画静帧，有体积和绘画颗粒，不是照片，不是动漫。皮肤有纹理，不要磨皮塑料脸。",
+            "不要字幕、水印、国旗、现代天际线、吴哥塔、环绕构图。",
+        ]
+        return "".join(bit for bit in bits if bit)
+    still = first_still_text(item) if item else ""
+    still_para = str((item.get("still_start") or {}).get("one_paragraph") or item.get("one_paragraph") or still or "").strip()
+    holding = str((item.get("still_start") or {}).get("holding") or (item.get("subject") or {}).get("holding") or "").strip()
     bits = [
-        "横屏16:9写实静帧，不是视频。",
+        "数字电影 CG 静帧，16:9，禁止真人、photoreal、real person。",
         f"{size}，{lens}，{angle}。",
+        "画动作尚未发生的那一格。",
         f"起幅定住：{start.rstrip('。')}。" if start else "",
-        f"画面：{subject.rstrip('。')}。" if subject else "",
+        f"首帧（第0秒）：{still_para.rstrip('。')}。" if still_para else "",
+        f"起幅拿着：{holding.rstrip('。')}。" if holding else "",
+        f"画面：{still_subject.rstrip('。')}。" if still_subject else "",
+        f"画面描述：{picture}" if picture else "",
         f"左：{left.rstrip('。')}。右：{right.rstrip('。')}。" if left or right else "",
         f"视线：{eyeline.rstrip('。')}。" if eyeline else "",
-        f"连戏必须照做：{note.rstrip('。')}。" if note else "",
-        "，".join(part for part in (day, mood, ("主光" + light) if light else "", quality) if part).rstrip("，") + "。",
-        "动作尚未完成，不要画出落幅。",
-        "写实历史轻度美化，皮肤有纹理，不要磨皮塑料脸。",
+        f"连戏必须照做：{note.rstrip('。')}。首帧只守服装、在场、绑法；note 里的动作结果不要画进这一格。" if note else "",
+        light_line,
+        f"本镜之后才会发生，不要画成已完成：{action.rstrip('。')}。" if action else "",
+        forbidden_result_clause(action),
+        "动作尚未发生，不要画出落幅。禁止把 one_action 的结果画进首帧。",
+        "数字电影感绘画静帧，有体积和绘画颗粒，不是照片，不是动漫。皮肤有纹理，不要磨皮塑料脸。",
         "不要字幕、水印、国旗、现代天际线、吴哥塔、环绕构图。",
     ]
     return "".join(bit for bit in bits if bit)
 
 
-def compile_seedance_motion_from_spec(spec: dict, shot: Optional[dict] = None) -> str:
-    """Motion-only Chinese prompt for Seedance. How it moves, not a new costume description."""
+REFERENCE_ROLE_MARK = re.compile(r"\[图\s*\d+\]|@(?:图)?\s*\d+")
+_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
+_ASSET_ID_NOISE = re.compile(r"^(?:CHAR|LOC|PROP)_|_V\d+$", re.I)
+
+
+def has_reference_roles(text: str) -> bool:
+    """True when the prompt already names its reference images ([图1] / @图1 / @1：), so nothing is injected twice."""
+    return bool(REFERENCE_ROLE_MARK.search(str(text or "")))
+
+
+def _ref_kind(ref: str, item: dict) -> str:
+    rid = str(ref or "").lower()
+    file = str(item.get("file") or "").replace("\\", "/").lower()
+    kind = str(item.get("type") or "").lower()
+    if file.endswith("sheet.jpg") or "sheet" in rid:
+        return "sheet"
+    if file.endswith("face.jpg") or "face" in rid:
+        return "face"
+    if kind == "location" or rid.startswith("loc_"):
+        return "location"
+    if kind in {"character", "costume_state"} or rid.startswith("char_"):
+        return "character"
+    if kind == "prop" or rid.startswith("prop_"):
+        return "prop"
+    return "other"
+
+
+def compile_reference_roles_zh(refs: list[str], assets: dict, *, parent_first: bool = True) -> str:
+    """One job per reference image, numbered [图1]…[图N] in asset_refs order.
+
+    Plate → camera / space / light; face or passport → face and wardrobe only; sheet → the panel
+    matching this shot's camera; prop → shape and state only. With `parent_first` a leading plate is
+    the parent image (本场空镜) the frame is edited from. Non-image assets (LOOK.md) take no number.
+    """
+    by_id = {str(item.get("asset_id")): item for item in (assets or {}).get("assets") or [] if item.get("asset_id")}
+    bits: list[str] = []
+    for ref in refs or []:
+        item = by_id.get(str(ref)) or {}
+        file = str(item.get("file") or "")
+        if item and (str(item.get("type") or "") == "style" or (file and not file.lower().endswith(_IMAGE_SUFFIXES))):
+            continue
+        kind = _ref_kind(ref, item)
+        name = str(item.get("name") or item.get("binds_to") or _ASSET_ID_NOISE.sub("", str(ref)).lower().replace("_", "-"))
+        base = Path(file).name if file else ""
+        n = len(bits) + 1
+        if kind == "location":
+            if parent_first and n == 1:
+                bits.append(f"[图1] 是父图（本场空镜 {name}）：机位、空间、光位、画幅以此为准，只改一件事。")
+            else:
+                bits.append(f"[图{n}] 是本场空镜 {name}：机位、空间、光位以此为准，不当画布。")
+        elif kind == "sheet":
+            bits.append(f"[图{n}] 是 {name} 的 {base or 'sheet.jpg'}：取与本镜机位一致的面板，不当首帧。")
+        elif kind in {"face", "character"}:
+            what = f"{name} 的 {base}" if base else (f"{name} 的 face.jpg" if kind == "face" else f"{name} 的护照")
+            bits.append(f"[图{n}] 是 {what}：只锁脸和衣服，不参考构图姿势。")
+        elif kind == "prop":
+            bits.append(f"[图{n}] 是道具 {name}：只认这件道具的形状和状态。")
+        else:
+            bits.append(f"[图{n}] 是 {name}：只作参考，不当画布。")
+    if not bits:
+        return ""
+    bits.append("各图身份边界不混，不把别的图的人物画进来。")
+    return "".join(bits)
+
+
+KHMERLESS_TAIL = "底板无高棉文、无汉字；厂牌拉丁文可留；不要让模型在招牌或工牌上新写高棉文。"
+
+
+def strip_reference_roles_zh(text: str) -> tuple[str, str]:
+    """Split a still prompt into (body without [图N] block, preserved khmerless tail)."""
+    raw = str(text or "")
+    tail = ""
+    if KHMERLESS_TAIL in raw:
+        raw = raw.replace(KHMERLESS_TAIL, "")
+        tail = KHMERLESS_TAIL
+    idx = raw.find("[图")
+    if idx >= 0:
+        raw = raw[:idx]
+    return raw.rstrip(), tail
+
+
+def compile_reference_roles_from_files(files: list[str], assets: dict) -> str:
+    """Number [图N] by the actual Codex still list, not the untruncated Seedance 9-cap ids."""
+    slash = chr(92)
+    by_file = {}
+    for item in (assets or {}).get("assets") or []:
+        rel = str(item.get("file") or "").replace(slash, "/")
+        if rel:
+            by_file[rel] = item
+    bits: list[str] = []
+    for i, raw in enumerate(files or [], 1):
+        rel = str(raw or "").replace(slash, "/").lstrip("./")
+        if not rel:
+            continue
+        item = by_file.get(rel) or {}
+        if not item and rel.endswith("face.jpg"):
+            item = by_file.get(rel[: -len("face.jpg")] + "master.jpg") or {}
+        name = str(item.get("name") or item.get("binds_to") or Path(rel).parent.name)
+        base = Path(rel).name
+        if i == 1:
+            if rel.startswith("04-frames/"):
+                bits.append("[图1] 是父图（上一镜过闸首帧）：机位、空间、光位、画幅以此为准，只改一件事。")
+            else:
+                loc_name = name if item.get("type") == "location" else Path(rel).parent.name
+                bits.append(f"[图1] 是父图（本场空镜 {loc_name}）：机位、空间、光位、画幅以此为准，只改一件事。")
+            continue
+        kind = _ref_kind(item.get("asset_id") or "", item)
+        if rel.endswith("face.jpg"):
+            kind = "face"
+        if kind == "location":
+            bits.append(f"[图{i}] 是本场空镜 {name}：机位、空间、光位以此为准，不当画布。")
+        elif kind == "sheet":
+            bits.append(f"[图{i}] 是 {name} 的 {base}：取与本镜机位一致的面板，不当首帧。")
+        elif kind in {"face", "character"} or item.get("type") in {"character", "costume_state"}:
+            what = f"{name} 的 {base}" if base else f"{name} 的护照"
+            bits.append(f"[图{i}] 是 {what}：只锁脸和衣服，不参考构图姿势。")
+        elif kind == "prop" or item.get("type") == "prop":
+            bits.append(f"[图{i}] 是道具 {name}：只认这件道具的形状和状态。")
+        else:
+            bits.append(f"[图{i}] 是 {name}：只作参考，不当画布。")
+    if not bits:
+        return ""
+    bits.append("各图身份边界不混，不把别的图的人物画进来。")
+    return "".join(bits)
+
+
+def rewrite_still_prompt(prompt: str, files: list[str], assets: dict) -> str:
+    """Drop leftover 9-cap [图N] numbering and rewrite from the files actually sent."""
+    body, tail = strip_reference_roles_zh(prompt)
+    roles = compile_reference_roles_from_files(files, assets)
+    return "".join(part for part in (body, roles, tail) if part)
+
+
+_EDIT_CUT = re.compile(r"立刻切|片内切|硬切|转切|cut\s+to|切到", re.I)
+_COMPOSITION_CUT = re.compile(r"切(?:在|小腿|脚|腰|画)")
+_CLAUSE_SPLIT = re.compile(r"[，,；;]")
+_NEXT_SETUP = re.compile(r"下一镜")
+
+
+def sanitize_camera_state(text: str) -> str:
+    """Keep this camera's start/end state. Drop edit-cut / next-setup language.
+
+    Composition cuts stay: 画面下缘切在小腿. Edit cuts go: 立刻切她的怕 / 切到门口.
+    """
+    raw = str(text or "").strip().rstrip("。.")
+    if not raw:
+        return ""
+    kept: list[str] = []
+    for clause in _CLAUSE_SPLIT.split(raw):
+        bit = clause.strip().rstrip("。.")
+        if not bit:
+            continue
+        if _NEXT_SETUP.search(bit) or _EDIT_CUT.search(bit):
+            continue
+        if "切" in bit and not _COMPOSITION_CUT.search(bit):
+            continue
+        kept.append(bit)
+    return "，".join(kept)
+
+
+def compile_seedance_motion_from_spec(
+    spec: dict,
+    shot: Optional[dict] = None,
+    profile: Optional[dict] = None,
+) -> str:
+    """Motion-only Chinese prompt for Seedance. How it moves, not a new costume description.
+
+    Default is one shot, one camera setup. `internal_cuts` only compile when the
+    profile opts in (`max_internal_cuts > 0` and multi-setup allowed).
+    """
     shot = shot or {}
     action = _spec_text(spec, "action_now", "content") or str(shot.get("one_action") or "")
-    start = _spec_text(spec, "in_from") or str(shot.get("in_from") or "")
-    end = _spec_text(spec, "out_to") or str(shot.get("out_to") or "")
+    start = sanitize_camera_state(_spec_text(spec, "in_from") or str(shot.get("in_from") or ""))
+    end = sanitize_camera_state(_spec_text(spec, "out_to") or str(shot.get("out_to") or ""))
     move = _spec_text(spec, "move_type") or str(shot.get("move_type") or "static")
     move_line = MOVE_ZH.get(move, MOVE_ZH["static"])
     try:
@@ -376,15 +590,18 @@ def compile_seedance_motion_from_spec(spec: dict, shot: Optional[dict] = None) -
     if action:
         parts.append(f"本镜只做一件事：{action.rstrip('。')}。")
     parts.append("运镜：" + move_line + "。")
-    for cut in spec.get("internal_cuts") or shot.get("internal_cuts") or []:
-        at = cut.get("at_sec")
-        scale = SIZE_ZH.get(str(cut.get("scale") or ""), str(cut.get("scale") or ""))
-        beat = str(cut.get("one_action") or "").rstrip("。")
-        if beat:
-            parts.append(f"{at}秒时片内切到{scale}：{beat}。")
+    from .video_profiles import allows_internal_cuts
+
+    if allows_internal_cuts(profile):
+        for cut in spec.get("internal_cuts") or shot.get("internal_cuts") or []:
+            at = cut.get("at_sec")
+            scale = SIZE_ZH.get(str(cut.get("scale") or ""), str(cut.get("scale") or ""))
+            beat = str(cut.get("one_action") or "").rstrip("。")
+            if beat:
+                parts.append(f"{at}秒时片内切到{scale}：{beat}。")
     if end:
         parts.append(f"落幅停在：{end.rstrip('。')}。")
-    parts.append("不要切到别的地点。不要字幕、水印，不要把对白烧进画面。保持同一张脸、同一套衣服。")
+    parts.append("整段停在本机位，不要换地点、不要换机位。不要字幕、水印，不要把对白烧进画面。保持同一张脸、同一套衣服。")
     note = state_note_of(spec, shot)
     if note:
         parts.append(f"连戏不变：{note.rstrip('。')}。")

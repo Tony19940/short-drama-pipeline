@@ -100,6 +100,16 @@ def main() -> None:
     if args.assemble_only:
         assemble(prod)
         return
+    if "smoke" not in str(args.video_dir).lower():
+        try:
+            from director.animatic import animatic_rel
+            from director.pipeline import uses_pipeline
+
+            rel = animatic_rel(1)
+            if uses_pipeline(prod) and not (prod / rel).exists():
+                print(f"warn: missing {rel}; official Gate E wants the stills animatic before locking video")
+        except ImportError:
+            pass
 
     shots = load_shots(prod, args.storyboard)
     subprocess.check_call(
@@ -144,12 +154,10 @@ def main() -> None:
 
         if args.backend == "auto":
             name = "h3" if shot.get("tier") == "h3" else "hailuo"
+            if name == "h3" and os.environ.get("COMPSHARE_API_KEY", "").strip():
+                name = "compshare"
         else:
             name = "h3" if args.backend == "minimax" else args.backend
-        if name == "h3" and os.environ.get("COMPSHARE_API_KEY", "").strip():
-            name = "compshare"
-        if name == "auto" and os.environ.get("ARK_API_KEY", "").strip() and not os.environ.get("MINIMAX_API_KEY", "").strip():
-            name = "seedance"
         backend = get_backend(name)
 
         extra_refs = []
@@ -158,7 +166,7 @@ def main() -> None:
             if path.exists() and path not in refs and path not in extra_refs:
                 extra_refs.append(path)
         refs = (refs + extra_refs)[:4]
-        if name in {"seedance", "ark"}:
+        if name in {"seedance", "ark", "wan", "wan3", "wan_3"}:
             from director.pipeline import read_artifact
             from director.prompts import compile_seedance_prompt
 
@@ -182,10 +190,24 @@ def main() -> None:
         from director.pipeline import duration_for_shot
 
         seconds = int(round(duration_for_shot(prod, shot["id"], float(shot.get("seconds") or 4))))
-        try:
-            backend.render(image, prompt, seconds, dest, refs=refs, mode=mode, last_frame=end)
-        except TypeError:
-            backend.render(image, prompt, seconds, dest, refs=refs)
+        if name in {"seedance", "ark"}:
+            from director.video_fallback import render_seedance_or_h3_fallback
+
+            render_seedance_or_h3_fallback(
+                backend,
+                image,
+                prompt,
+                seconds,
+                dest,
+                refs=refs,
+                mode=mode,
+                last_frame=end,
+            )
+        else:
+            try:
+                backend.render(image, prompt, seconds, dest, refs=refs, mode=mode, last_frame=end)
+            except TypeError:
+                backend.render(image, prompt, seconds, dest, refs=refs)
         last = last_frame_path(prod, shot)
         last.parent.mkdir(parents=True, exist_ok=True)
         subprocess.check_call(

@@ -4,7 +4,7 @@
 
 ## 公式
 
-`9:16 photoreal Khmer` + `lens` + `setup/scale` + **一次** `move` + `start pose -> one body beat -> hold` + `look` + `no subtitle / no lip-sync`
+`16:9 photoreal Khmer` + `lens` + `setup/scale` + **一次** `move` + `start pose -> one body beat -> hold` + `look` + `no subtitle / no lip-sync`
 
 声音只写在 `line` / `caption` / `speaker`：口述、心里、旁白、出场简介、短信。动作必须是过程，不是「她站着好看」。一镜只做一件新信息。
 
@@ -18,4 +18,4 @@
 
 ## 不要写进 `video_prompt`
 
-台词原文、环绕、闪摇、无人机、crash zoom、16:9、IMAX、配乐人名、口型、烧录字幕。
+台词原文、环绕、闪摇、无人机、crash zoom、IMAX、配乐人名、口型、烧录字幕。画幅跟本剧 `confirm.md` 走，默认 16:9，不要写错成 9:16。

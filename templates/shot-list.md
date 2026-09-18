@@ -1,16 +1,18 @@
 # 分镜表 · 第 __ 集
 
 - **状态**：draft | review | locked
-- **画幅**：9:16
+- **画幅**：16:9
 - **总镜数**：
-- **总时长**：
+- **总时长**：跟分镜走，等于各镜秒数之和
 - **声音**：每镜一种：口述 / 心里 / 旁白 / 出场简介 / 短信
 
-先写 `01-bible/blueprint.md` 和 `beats.md`。都市短剧 8 秒内必须有冲突。`shots.json` 必填 `new_info` / `from` / `cut` / `scale` / `scene` / `facing` / `expression` / `blocking`。跑 `scripts/check_storyboard.py`。
+先写 `01-bible/blueprint.md` 和 `beats.md`。开场先让人站住，第一场里冲突必须发生。`shots.json` 必填 `new_info` / `from` / `cut` / `scale` / `scene` / `facing` / `expression` / `blocking`。跑 `scripts/check_storyboard.py`。
+
+纸面秒按桶：反应 1.2–2.0 · 插入 1.5–2.5 · 对白 2.5–4.5 · 建立 3–5 · 长镜 5–8。目标 14–18 镜/分。不要为模型 4s 底把反应垫长。
 
 | 镜号 | 秒 | 档 | 景别 | 切 | 朝向 | 新信息 | @角色 | @场景 |
 |---|---|---|---|---|---|---|---|---|
-| SH001 | 6 | fast | med | 开场 | 低头 | | | |
+| SH001 | 4 | fast | med | 开场 | 低头 | | | |
 
 ## 声音对照
 

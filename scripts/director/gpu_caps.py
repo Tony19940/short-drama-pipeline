@@ -21,8 +21,16 @@ def seedance_configured() -> bool:
     return bool(os.environ.get("ARK_API_KEY", "").strip())
 
 
+def minimax_configured() -> bool:
+    return bool(os.environ.get("MINIMAX_API_KEY", "").strip())
+
+
+def wan_configured() -> bool:
+    return bool(os.environ.get("DASHSCOPE_API_KEY", "").strip())
+
+
 def video_ready() -> bool:
-    return gpu_configured() or seedance_configured()
+    return gpu_configured() or seedance_configured() or minimax_configured() or wan_configured()
 
 
 def video_backend_name() -> str:
@@ -31,6 +39,10 @@ def video_backend_name() -> str:
         return chosen
     if seedance_configured():
         return "seedance"
+    if minimax_configured():
+        return "minimax"
+    if wan_configured():
+        return "wan"
     if gpu_configured():
         return "local"
     return ""
@@ -72,6 +84,44 @@ def gpu_capabilities(force: bool = False) -> dict[str, Any]:
                 "continue_last_frame": True,
                 "reason": "Seedance 2.0 Mini 已接火山方舟，不走本机 GPU",
                 "note": "云端图生视频：首帧必带，首尾帧可选，参考图挂在首帧外面。文生视频不成片。",
+            }
+        )
+        _CACHE = (now, cloud)
+        return cloud
+    if wan_configured() and video_backend_name() in {"wan", "wan3", "wan_3"}:
+        cloud = dict(empty)
+        cloud.update(
+            {
+                "ok": True,
+                "configured": True,
+                "gpu": False,
+                "cloud": True,
+                "backend": "wan",
+                "model": os.environ.get("WAN_MODEL", "wan3.0-video"),
+                "fl2va": True,
+                "designed_end_frame": True,
+                "continue_last_frame": True,
+                "reason": "Wan 3.0 已接阿里云百炼，不走本机 GPU",
+                "note": "硬首帧或首尾帧。不能和 reference_image 同发。文生视频不成片。",
+            }
+        )
+        _CACHE = (now, cloud)
+        return cloud
+    if minimax_configured() and video_backend_name() in {"minimax", "h3"}:
+        cloud = dict(empty)
+        cloud.update(
+            {
+                "ok": True,
+                "configured": True,
+                "gpu": False,
+                "cloud": True,
+                "backend": "minimax",
+                "model": os.environ.get("MINIMAX_MODEL", "MiniMax-H3"),
+                "fl2va": True,
+                "designed_end_frame": True,
+                "continue_last_frame": True,
+                "reason": "MiniMax-H3 已接官方 API，不走本机 GPU",
+                "note": "官方图生：硬首帧或首尾帧。不能和 reference_image 同发。文生视频不成片。",
             }
         )
         _CACHE = (now, cloud)

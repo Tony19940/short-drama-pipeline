@@ -40,7 +40,8 @@ python3 scripts/place_codex_asset.py \
 | 首帧 | `productions/<slug>/04-frames/SH001.jpg` |
 | 尾帧 | `productions/<slug>/04-frames/SH001-last.jpg` |
 
-关键帧不是护照。从该场空镜或上一镜首帧 **edit**，禁止文生新脸。画幅跟生成包走（本集 16:9）。
+关键帧不是护照。从该场空镜或上一镜已锁帧 **edit**，禁止文生新脸。父图只参考人物和场景，**不跟父图文件比例走**。画幅跟生成包 / 本剧 confirm 走（本集 16:9）。`place_codex_frame.py` 会把非 1672×941 硬拉成正式首帧，源图必须已经是 16:9（可裁切，禁止拉伸）。
+**首帧 = 动作未发生的第 0 秒。** 从上一镜 `-last` edit，但内容跟本镜 `in_from` / `still_start`，不跟父图已经做完的结果（SH006 父图 SH005 钥匙仍在地上 — 父图对，子图若画成入手就错了）。禁止把 `one_action` 的结果画进首帧。
 生成包每镜有 `state_note`（连戏句）和 `continuity.binding`（绑法），逐字照做：反剪就画反剪，说不在画里的就不画。
 
 ```bash
@@ -51,7 +52,7 @@ python3 scripts/place_codex_frame.py \
   --src "$CODEX_HOME/generated_images/那张图.png"
 ```
 
-`--parent` 首帧必填（本场空镜 `master.jpg` 或上一镜已锁的 `04-frames/SHxxx.jpg`），尾帧默认本镜首帧。脚本在 jpg 旁写 `SHxxx.json` 记父图与来源。
+`--parent` 首帧默认同场上一镜 `-last.jpg`（没有则该镜首帧）。空镜 `master.jpg` 只许场第一镜，或加 `--allow-master`。尾帧默认本镜首帧。脚本在 jpg 旁写 `SHxxx.json` 记父图与来源。
 
 不要把首帧写进 `02-assets/`。不要写 `shots.json`。不要出视频。不要自己写 `keyframes.json` 的 pass。
 

@@ -29,6 +29,7 @@ SCALE_FOR_SETUP = {
     "single": "med",
     "insert": "insert",
 }
+from .defaults import DEFAULT_ASPECT, production_aspect
 from .prompts import camera_for_move, compose_video_prompt, load_template  # noqa: E402
 
 MOVE_WORDS = {
@@ -73,11 +74,11 @@ MOVE_HINTS = [
     (re.compile(r"跟|track", re.I), "track"),
 ]
 
-SYSTEM = """You are the in-house AI video scriptwriter for a Khmer vertical short-drama director desk.
+SYSTEM = """You are the in-house AI video scriptwriter for a Khmer landscape short-drama director desk.
 Follow the six-step expert flow, but emit files for THIS pipeline only:
 
-1. Understand: audience is Phnom Penh phone viewers, 9:16, photoreal, no lip-sync.
-2. Plan structure: hook in 3s, mid conflict, end hook. 50-75 seconds, 6-10 shots, 1-2 real places.
+1. Understand: audience is Phnom Penh viewers, default 16:9 landscape, photoreal, no lip-sync.
+2. Plan structure: let people land, then conflict, then end hook. Shot count and episode length follow coverage — do not cap at 50-75 seconds or pad to fill a quota. 1-2 real places.
 3. Generate shots: one new_info per shot, one camera move, 180-degree axis, coverage master+tighter.
 4. Write prompts: English video_prompt using templates/video-prompt-formula.md and templates/camera-moves.md. MiniMax H3 / Grok Imagine only. Not Midjourney, not CogVideoX, not SD --ar.
 5. Write copy: Chinese working-track sound. line_kind is intro|dialogue|inner|narration|sms|reaction. speaker is a character slug only for dialogue/inner. Dialogue never enters video_prompt. reaction is a silent 2s listen beat.
@@ -86,7 +87,7 @@ If the production already has character folders, reuse those slugs. 罗丝 is ro
 
 Return JSON only:
 {
-  "overview": {"title": "", "seconds": 60, "style": "", "audience": "Phnom Penh 9:16", "platform": "Reels/TikTok vertical"},
+  "overview": {"title": "", "seconds": 0, "style": "", "audience": "Phnom Penh 16:9", "platform": "landscape 16:9; duration is the sum of shots"},
   "blueprint_md": "markdown",
   "beats_md": "markdown table 起|止|节拍|新信息|地点|人",
   "coverage_md": "markdown",
@@ -94,7 +95,7 @@ Return JSON only:
   "shots": {
     "episode": "ep01",
     "kind": "shortdrama",
-    "aspect": "9:16",
+    "aspect": "16:9",
     "shots": [ {director-contract shot objects} ]
   }
 }
@@ -530,6 +531,7 @@ def heuristic_shot(index: int, beat: dict, dialogue: Optional[dict], prev: Optio
             "action": action,
             "look": look,
             "new_info": beat.get("new_info") or beat.get("beat"),
+            "aspect": beat.get("aspect") or DEFAULT_ASPECT,
         }
     )
     emotion = "held"
@@ -662,12 +664,14 @@ def heuristic_package(prod: Path) -> dict:
     unused_lines = list(dialogue)
     shots = []
     prev = None
-    for index, beat in enumerate(beats[:10], start=1):
+    aspect = production_aspect(prod)
+    for index, beat in enumerate(beats, start=1):
         people = [align_slug(name, prod) for name in re.split(r"[,/、\s]+", beat.get("people") or "") if name]
         line = pick_dialogue(beat, unused_lines)
         if line is None and beat.get("setup") != "insert":
             fallback = beat.get("new_info") or beat.get("beat")
             line = {"text": str(fallback).strip("。") + "。", "kind": "narration", "character": (people[0] if people else "sophea")}
+        beat = {**beat, "aspect": aspect}
         shot = heuristic_shot(index, beat, line, prev, prod)
         shots.append(shot)
         prev = shot
@@ -745,8 +749,8 @@ def heuristic_package(prod: Path) -> dict:
         "title": title,
         "seconds": seconds,
         "style": "photoreal Phnom Penh short drama",
-        "audience": "金边竖屏本地观众",
-        "platform": "Reels / TikTok 9:16，不是国内中视频默认时长",
+        "audience": "金边横屏本地观众",
+        "platform": "16:9 横幅；单集时长等于分镜秒数之和",
         "confirm": confirm[:400],
         "beat_source": source,
         "characters": sorted({c for s in shots for c in (s.get("characters") or [])}),
@@ -760,7 +764,7 @@ def heuristic_package(prod: Path) -> dict:
         "shots": {
             "episode": "ep01",
             "kind": "shortdrama",
-            "aspect": "9:16",
+            "aspect": production_aspect(prod),
             "origin": "scriptwriter-heuristic",
             "shots": shots,
         },
@@ -796,13 +800,13 @@ def grok_package(prod: Path, brief: str = "") -> dict:
         raise ScriptError("GROK_JSON", "脚本专家没有返回对象")
     shots = data.get("shots") or {}
     if isinstance(shots, list):
-        shots = {"episode": "ep01", "kind": "shortdrama", "aspect": "9:16", "shots": shots}
+        shots = {"episode": "ep01", "kind": "shortdrama", "aspect": production_aspect(prod), "shots": shots}
     if not shots.get("shots"):
         raise ScriptError("GROK_JSON", "脚本专家没有返回分镜")
     shots["origin"] = "scriptwriter-grok"
     shots.setdefault("episode", "ep01")
     shots.setdefault("kind", "shortdrama")
-    shots.setdefault("aspect", "9:16")
+    shots.setdefault("aspect", production_aspect(prod))
     for shot in shots.get("shots") or []:
         shot["characters"] = [align_slug(name, prod) for name in (shot.get("characters") or [])]
         shot["characters"] = [c for c in shot["characters"] if c]

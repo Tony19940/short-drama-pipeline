@@ -21,7 +21,7 @@ const TABS = [
   { id: "package", label: "生成包", now: "翻译成模型计划。人确认后才能出图出片。" },
   { id: "frames", label: "关键帧", now: "按这一镜构图出静帧，过审后再出视频。" },
   { id: "render", label: "视频", now: "用过审首帧出单镜。未确认的生成包不能派。" },
-  { id: "sound", label: "声音", now: "只念编剧原句，叠旁白听一遍。" },
+  { id: "sound", label: "声音", now: "先按分镜表混音效床，再只念编剧原句。" },
   { id: "edit", label: "剪辑", now: "按时间线剪，不要整段拼接。" },
 ] as const;
 

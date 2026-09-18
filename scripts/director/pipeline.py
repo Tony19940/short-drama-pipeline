@@ -224,14 +224,14 @@ def validate_shot_specs(data: dict, writer: Optional[dict] = None) -> list[str]:
     required = (
         "subject", "action_now", "shot_size", "angle", "height", "focal_length",
         "aspect_ratio", "move_type", "move_detail", "move_reason", "intensity",
-        "left", "right", "eyeline", "body_facing", "day_night", "key_light_dir",
+        "left", "right", "eyeline", "day_night", "key_light_dir",
         "quality", "color_mood", "duration_sec", "axis_side", "in_from", "out_to",
     )
     for spec in specs:
         sid = spec.get("shot_id") or spec.get("id") or "?"
         no_people = _text(spec.get("shot_size")) in {"insert", "pov"}
         for key in required:
-            if no_people and key in ("left", "right", "eyeline", "body_facing"):
+            if no_people and key in ("left", "right", "eyeline"):
                 continue
             if spec.get(key) in (None, ""):
                 errors.append(f"{sid} spec missing {key}")
@@ -254,7 +254,7 @@ def validate_shot_specs(data: dict, writer: Optional[dict] = None) -> list[str]:
             errors.append(f"{sid} duration_sec invalid")
     return errors
 
-def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional[dict] = None) -> list[str]:
+def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional[dict] = None, prod: Optional[Path] = None) -> list[str]:
     errors = []
     packages = data.get("packages") or data.get("gen_packages") or []
     if not packages:
@@ -294,6 +294,14 @@ def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional
         spec_line = spec_lines.get(sid)
         if spec_line and line and line != spec_line:
             errors.append(f"{sid} package line is not the spec line")
+        if prod is not None:
+            from .codex_stills import missing_costume_state_files
+
+            for msg in missing_costume_state_files(prod, pkg.get("asset_refs") or [], assets or {}):
+                errors.append(f"{sid} {msg}")
+            still_files = pkg.get("still_ref_files") or []
+            if still_files and len(still_files) > 5:
+                errors.append(f"{sid} still_ref_files exceed Codex 5-cap: {len(still_files)}")
     return errors
 
 def packages_confirmed(data: dict) -> bool:
@@ -308,12 +316,12 @@ KEYFRAME_QC_VALUES = {"pass", "fail", "n/a"}
 KEYFRAME_QC_TEXT_KEYS = {"status", "notes", "waived_by"}
 
 
-def keyframe_context(prod: Path) -> dict:
+def keyframe_context(prod: Path, episode: int = 1) -> dict:
     """Everything validate_keyframes needs beyond the file itself."""
     return {
-        "packages": read_artifact(prod, "gen_packages.json"),
-        "specs": read_artifact(prod, "shot_specs.json"),
-        "table": read_artifact(prod, "shot_list.json"),
+        "packages": read_artifact(prod, episode_artifact_name("gen_packages.json", episode)),
+        "specs": read_artifact(prod, episode_artifact_name("shot_specs.json", episode)),
+        "table": read_artifact(prod, episode_artifact_name("shot_list.json", episode)),
         "prod": prod,
     }
 
@@ -404,13 +412,18 @@ def validate_clips(data: dict) -> list[str]:
             errors.append(f"{sid} hit max_attempts; send back to design")
     return errors
 
-def validate_audio(data: dict, writer: Optional[dict] = None) -> list[str]:
+def validate_audio(data: dict, writer: Optional[dict] = None, prod: Optional[Path] = None) -> list[str]:
     errors = []
     allowed = set(_lines_from_writer(writer or {}))
     for take in data.get("dialogue_takes") or []:
         line = _text(take.get("line"))
         if allowed and line not in allowed:
             errors.append("audio has a line not in the script")
+    if prod is not None:
+        for key in ("ambience_file", "sfx_file", "music_file", "mix_file"):
+            rel = _text(data.get(key))
+            if rel and not (prod / rel).exists():
+                errors.append(f"{key} missing on disk")
     return errors
 
 def validate_cut(data: dict) -> list[str]:
@@ -428,8 +441,10 @@ def snapshot_pipeline(prod: Path) -> dict:
         "novel": "novel.json",
         "writer": "writer.json",
         "assets": "assets.json",
+        "scene_cards": "scene_cards.json",
         "shot_list": "shot_list.json",
         "shot_specs": "shot_specs.json",
+        "frame_descriptions": "frame_descriptions.json",
         "packages": "gen_packages.json",
         "keyframes": "keyframes.json",
         "clips": "clips.json",
@@ -440,7 +455,7 @@ def snapshot_pipeline(prod: Path) -> dict:
     out = {"uses_pipeline": uses_pipeline(prod), "artifacts": {}}
     for key, name in names.items():
         data = read_artifact(prod, name)
-        count_src = data.get("shots") or data.get("shot_specs") or data.get("packages") or data.get("gen_packages") or data.get("keyframes") or data.get("clips") or data.get("assets") or data.get("scenes") or data.get("timeline") or []
+        count_src = data.get("shots") or data.get("shot_specs") or data.get("packages") or data.get("gen_packages") or data.get("keyframes") or data.get("clips") or data.get("assets") or data.get("scenes") or data.get("scene_cards") or data.get("items") or data.get("timeline") or []
         out["artifacts"][key] = {
             "exists": bool(data),
             "status": data.get("status"),
@@ -602,21 +617,23 @@ def _asset_ids(pool: list[dict], *, faces: bool) -> list[str]:
 
 def _pick_character_by_state(items: list[dict], bind: str, costume: str, *, faces: bool) -> list[str]:
     """Costume state assets win when one matches the state id; otherwise the base identity assets."""
+    from .continuity_hard import costume_aliases
+
     pool = [item for item in items if _text(item.get("binds_to")) == bind and item.get("type") in {"character", "costume_state"}]
     token = _norm_bind(costume)
 
     def matches(item: dict) -> bool:
-        declared = _norm_bind(item.get("costume_state") or item.get("state"))
-        if declared:
-            return declared == token
+        aliases = costume_aliases(item)
+        if aliases:
+            return bool(token) and token in aliases
         blob = _norm_bind(_asset_file(item) + " " + _text(item.get("asset_id")))
         return bool(token) and token not in {"base", "default"} and token in blob
 
-    states = [item for item in pool if item.get("type") == "costume_state" or _text(item.get("costume_state"))]
+    states = [item for item in pool if item.get("type") == "costume_state" or _text(item.get("costume_state") or item.get("costume_state_id"))]
     matched = [item for item in states if matches(item)]
     if matched:
         return _asset_ids(matched, faces=faces)
-    base = [item for item in pool if item.get("type") == "character" and not _text(item.get("costume_state"))]
+    base = [item for item in pool if item.get("type") == "character" and not _text(item.get("costume_state") or item.get("costume_state_id"))]
     return _asset_ids(base, faces=faces)
 
 
@@ -647,7 +664,18 @@ def pov_cast_id(table: dict, writer: Optional[dict]) -> str:
     return pov
 
 
-def _refs_from_state(spec: dict, shot: dict, items: list[dict], table: dict, writer: dict, *, max_refs: int) -> tuple[list[str], str, str]:
+def _refs_from_state(
+    spec: dict,
+    shot: dict,
+    items: list[dict],
+    table: dict,
+    writer: dict,
+    *,
+    max_refs: int,
+    hard: Optional[dict] = None,
+    episode: int = 1,
+) -> tuple[list[str], str, str]:
+    from .continuity_hard import resolve_costume_token
     from .shot_table import TIGHT_SCALES, bible_prop_index, normalize_state, prop_words
 
     state = normalize_state(spec.get("state") or shot.get("state")) or {"characters": {}, "props": [], "location": "", "note": ""}
@@ -681,11 +709,12 @@ def _refs_from_state(spec: dict, shot: dict, items: list[dict], table: dict, wri
         bind = resolve_cast_bind(cid, bible, items)
         if not bind:
             continue
+        costume_token = resolve_costume_token(hard, cid, episode, item["costume"])
         if cid == pov_id or (not pov_id and not pov_bind):
-            pov_bind, pov_costume = bind, item["costume"]
+            pov_bind, pov_costume = bind, costume_token
         if not item["in_frame"]:
             continue
-        add(_pick_character_by_state(items, bind, item["costume"], faces=want_face))
+        add(_pick_character_by_state(items, bind, costume_token, faces=want_face))
         attached = list(item["carrying"]) + ([item["bound_with"]] if item["bound_with"] else [])
         for pid in attached:
             if tight and not named(pid):
@@ -697,7 +726,8 @@ def _refs_from_state(spec: dict, shot: dict, items: list[dict], table: dict, wri
         add(_pick_assets(items, pid, kind="prop"))
     if not pov_bind and state["characters"]:
         first = next(iter(state["characters"].items()))
-        pov_bind, pov_costume = resolve_cast_bind(first[0], bible, items), first[1]["costume"]
+        pov_bind = resolve_cast_bind(first[0], bible, items)
+        pov_costume = resolve_costume_token(hard, first[0], episode, first[1]["costume"])
     costume = f"{pov_bind}-{pov_costume}" if pov_bind and pov_costume else ""
     location_id = variant or loc_bind
     return refs, costume, location_id
@@ -738,6 +768,62 @@ def _refs_by_name(spec: dict, shot: dict, items: list[dict], table: dict, writer
     return refs, "", loc_bind
 
 
+def package_ref_files(prod: Path, refs: list[str], assets: dict) -> list[str]:
+    """Resolve package asset_ids to on-disk files. Character identity prefers face.jpg when present."""
+    by_id = {item.get("asset_id"): item for item in (assets.get("assets") or []) if item.get("asset_id")}
+    files: list[str] = []
+    seen: set[str] = set()
+
+    def add(rel: str) -> None:
+        path = str(rel or "").replace("\\", "/")
+        if not path or path in seen:
+            return
+        if not (prod / path).exists():
+            return
+        seen.add(path)
+        files.append(path)
+
+    for rid in refs:
+        item = by_id.get(rid) or {}
+        rel = _text(item.get("file"))
+        kind = _text(item.get("type"))
+        if kind in {"character", "costume_state"} and rel.endswith("master.jpg"):
+            face = rel[: -len("master.jpg")] + "face.jpg"
+            add(face)
+            add(rel)
+        else:
+            add(rel)
+    return files
+
+
+def compile_packages_for_profiles(
+    prod: Path,
+    profiles: Optional[list[str]] = None,
+    *,
+    table: Optional[dict] = None,
+    specs: Optional[dict] = None,
+) -> dict[str, dict]:
+    """Same shot table / specs, one package tree per video profile. Prompts are not rewritten by hand."""
+    from .video_profiles import get_profile
+
+    shot_list = table if table is not None else read_artifact(prod, "shot_list.json")
+    if specs is None:
+        if str(shot_list.get("schema") or "") == SHOT_TABLE_SCHEMA:
+            from .shot_table import compile_specs_from_shot_table
+
+            specs = compile_specs_from_shot_table(shot_list, aspect=shot_list.get("aspect") or "16:9")
+        else:
+            specs = read_artifact(prod, "shot_specs.json") or compile_specs_from_legacy(prod)
+    wanted = [get_profile(name)["id"] for name in (profiles or ["seedance_2_0", "seedance_2_5"])]
+    out: dict[str, dict] = {}
+    for pid in wanted:
+        payload = compile_packages_from_specs(prod, target_model=pid, table=shot_list, specs=specs)
+        payload["profile"] = pid
+        payload["episode_target_model"] = pid
+        out[pid] = payload
+    return out
+
+
 def asset_refs_for_package(
     spec: dict,
     shot: dict,
@@ -746,6 +832,8 @@ def asset_refs_for_package(
     max_refs: int = 9,
     table: Optional[dict] = None,
     writer: Optional[dict] = None,
+    hard: Optional[dict] = None,
+    episode: int = 1,
 ) -> tuple[list[str], str, str]:
     """(asset_refs, costume_state_id, location_id) for one package.
 
@@ -756,18 +844,25 @@ def asset_refs_for_package(
     items = [item for item in (assets.get("assets") or []) if item.get("asset_id")]
     table = table or {}
     if isinstance(spec.get("state") or shot.get("state"), dict):
-        return _refs_from_state(spec, shot, items, table, writer or {}, max_refs=max_refs)
+        return _refs_from_state(
+            spec, shot, items, table, writer or {}, max_refs=max_refs, hard=hard, episode=episode
+        )
     return _refs_by_name(spec, shot, items, table, writer or {}, max_refs=max_refs)
 
 
-def package_gen_mode(spec: dict, shot: dict) -> tuple[str, str]:
+def package_gen_mode(spec: dict, shot: dict, profile: Optional[dict] = None) -> tuple[str, str]:
+    planned = _text(shot.get("keyframe_plan") or spec.get("keyframe_plan"))
+    if planned in {"first", "first_last"}:
+        return ("flf2v" if planned == "first_last" else "i2v_first"), planned
     coverage = _text(shot.get("coverage_type") or spec.get("coverage_type"))
     size = _text(spec.get("shot_size") or shot.get("scale"))
     move = _text(spec.get("move_type") or shot.get("move_type"))
     cuts = spec.get("internal_cuts") or shot.get("internal_cuts") or []
     if size == "insert" and move == "static":
         return "i2v_first", "first"
-    if cuts:
+    from .video_profiles import allows_internal_cuts
+
+    if cuts and allows_internal_cuts(profile):
         return "flf2v", "first_last"
     if coverage == "continuous":
         return "video_extend", "first"
@@ -778,60 +873,248 @@ def package_gen_mode(spec: dict, shot: dict) -> tuple[str, str]:
     return "i2v_first", "first"
 
 
-def compile_packages_from_specs(prod: Path, target_model: Optional[str] = None) -> dict:
+_EPISODE_TOKEN = re.compile(r"^(?:ep)?(\d{1,2})(?:[-_](.+))?$", re.I)
+
+
+def parse_episode(episode: Any = 1) -> tuple[int, str]:
+    """Return (episode_no, artifact/folder label).
+
+    1 / '1' / 'ep01' → (1, '') so EP01 keeps historical unsuffixed names.
+    2 / '2' / 'ep02' → (2, 'ep02')
+    'ep01-v2' → (1, 'ep01-v2') — labeled variant, never clobbers the live lock.
+    """
+    if episode is None or episode == "":
+        return 1, ""
+    if isinstance(episode, bool):
+        raise ValueError("episode 不能是 bool")
+    if isinstance(episode, int):
+        n = int(episode)
+        if n < 1:
+            raise ValueError("episode 必须 >= 1")
+        return n, "" if n == 1 else f"ep{n:02d}"
+    text = _text(episode)
+    if text.isdigit():
+        n = int(text)
+        if n < 1:
+            raise ValueError("episode 必须 >= 1")
+        return n, "" if n == 1 else f"ep{n:02d}"
+    match = _EPISODE_TOKEN.fullmatch(text)
+    if not match:
+        raise ValueError(f"看不懂的 episode 标签：{text}")
+    n = int(match.group(1))
+    extra = (match.group(2) or "").strip()
+    if extra:
+        return n, f"ep{n:02d}-{extra}"
+    return n, "" if n == 1 else f"ep{n:02d}"
+
+
+def episode_number(episode: Any = 1) -> int:
+    return parse_episode(episode)[0]
+
+
+def episode_label(episode: Any = 1) -> str:
+    return parse_episode(episode)[1]
+
+
+def episode_artifact_name(base: str, episode: Any = 1) -> str:
+    """EP01 keeps historical filenames; later episodes / labels use `stem.<label>.ext`."""
+    label = episode_label(episode)
+    if not label:
+        return base
+    if "." not in base:
+        return f"{base}.{label}"
+    stem, ext = base.rsplit(".", 1)
+    return f"{stem}.{label}.{ext}"
+
+
+def episode_frame_dir(episode: Any = 1) -> str:
+    """EP01 live lock → 04-frames/; EP02 → 04-frames/ep02/; ep01-v2 → 04-frames/ep01-v2/."""
+    label = episode_label(episode)
+    return "04-frames" if not label else f"04-frames/{label}"
+
+
+def episode_shot_dir(episode: Any = 1) -> str:
+    label = episode_label(episode)
+    return "05-shots" if not label else f"05-shots/{label}"
+
+
+def compile_packages_from_specs(
+    prod: Path,
+    target_model: Optional[str] = None,
+    *,
+    table: Optional[dict] = None,
+    specs: Optional[dict] = None,
+    writer: Optional[dict] = None,
+    frame_descriptions: Optional[dict] = None,
+) -> dict:
     from .prompts import (
         compile_keyframe_prompt_zh,
+        compile_reference_roles_zh,
         compile_seedance_motion_from_spec,
         compile_seedance_prompt,
         compile_still_prompt,
         compile_video_prompt,
+        has_reference_roles,
         still_refs,
         video_mode,
     )
-    shot_list = read_artifact(prod, "shot_list.json")
+    from .video_profiles import get_profile
+
+    shot_list = table if table is not None else read_artifact(prod, "shot_list.json")
     target_model = _text(target_model) or _text(shot_list.get("target_model")) or "minimax_h3"
-    specs = read_artifact(prod, "shot_specs.json")
+    profile = get_profile(target_model)
+    target_model = _text(profile.get("id")) or target_model
+    min_sec = int(profile.get("min_shot_sec") or 4)
+    max_sec = int(profile.get("max_shot_sec") or 15)
+    max_refs = int(profile.get("max_ref_images") or 9)
+    look_blob = ""
+    try:
+        from .production import read_text as _read_text
+
+        look_blob = _read_text(prod, "02-assets/LOOK.md") + _read_text(prod, "01-bible/confirm.md")
+    except Exception:
+        look_blob = ""
+    khmerless_plates = "板上无高棉文" in look_blob or "khmerless" in look_blob.lower()
+    if specs is None:
+        specs = read_artifact(prod, "shot_specs.json")
     if not specs.get("shot_specs"):
-        specs = compile_specs_from_legacy(prod)
+        if table is not None:
+            from .shot_table import compile_specs_from_shot_table
+
+            specs = compile_specs_from_shot_table(shot_list, aspect=shot_list.get("aspect") or "16:9")
+        else:
+            specs = compile_specs_from_legacy(prod)
     assets = read_artifact(prod, "assets.json")
     table_shots = {item.get("shot_id"): item for item in shot_list.get("shots") or [] if item.get("shot_id")}
     legacy_shots = {shot.get("id"): shot for shot in (load_json(prod, "03-storyboard/shots.json", {"shots": []}).get("shots") or [])}
     lang = "zh" if target_model in MODELS_ZH else "en"
     use_table = str(shot_list.get("schema") or "") == SHOT_TABLE_SCHEMA
-    writer = read_artifact(prod, "writer.json")
+    episode_no = int(shot_list.get("episode_no") or 1)
+    from .continuity_hard import hard_items_for_state, load_continuity_hard, package_binding
+
+    hard = load_continuity_hard(prod)
+    if writer is None:
+        writer = read_artifact(prod, episode_artifact_name("writer.json", episode_no)) or read_artifact(prod, "writer.json")
     from .shot_table import normalize_state, state_sentence
 
     bible = shot_list.get("continuity_bible") if isinstance(shot_list.get("continuity_bible"), dict) else {}
+    from .frame_desc import description_sentence, index_by_shot
+
+    if frame_descriptions is None:
+        frame_descriptions = read_artifact(prod, episode_artifact_name("frame_descriptions.json", episode_no)) or read_artifact(prod, "frame_descriptions.json")
+    descriptions = index_by_shot(frame_descriptions)
     warnings: list[str] = []
+    compile_errors: list[str] = []
     packages = []
     for spec in specs.get("shot_specs") or []:
         sid = spec.get("shot_id")
         table_shot = table_shots.get(sid) or {}
         legacy = legacy_shots.get(sid) or {}
+        frame_desc = descriptions.get(sid)
         if use_table or not (legacy.get("start") or legacy.get("video_prompt")):
             state = normalize_state(spec.get("state") or table_shot.get("state"))
             if use_table and state is None:
                 warnings.append(f"{sid} has no state; asset refs guessed from names")
-            refs, costume, location_id = asset_refs_for_package(spec, table_shot, assets, table=shot_list, writer=writer)
-            gen_mode, plan = package_gen_mode(spec, table_shot)
-            image_prompt = compile_keyframe_prompt_zh(spec, table_shot) if lang == "zh" else _text(spec.get("action_now"))
-            motion = compile_seedance_motion_from_spec(spec, table_shot) if lang == "zh" else _text(spec.get("move_detail") or spec.get("action_now"))
+            refs, costume, location_id = asset_refs_for_package(
+                spec,
+                table_shot,
+                assets,
+                max_refs=max_refs,
+                table=shot_list,
+                writer=writer,
+                hard=hard,
+                episode=episode_no,
+            )
+            gen_mode, plan = package_gen_mode(spec, table_shot, profile)
+            if lang == "zh":
+                image_prompt = compile_keyframe_prompt_zh(spec, table_shot, frame_desc=frame_desc, slot="first")
+                if len(refs) > 1 and not has_reference_roles(image_prompt):
+                    image_prompt += compile_reference_roles_zh(refs, assets)
+            else:
+                from .still_t0 import first_still_text
+
+                start = _text(spec.get("in_from") or table_shot.get("in_from"))
+                still = first_still_text(frame_desc) if frame_desc else ""
+                image_prompt = still or start or _text(spec.get("subject"))
+                if frame_desc:
+                    image_prompt = (image_prompt + " " + description_sentence(frame_desc)).strip()
+            if khmerless_plates:
+                image_prompt = (
+                    image_prompt.rstrip()
+                    + "底板无高棉文、无汉字；厂牌拉丁文可留；不要让模型在招牌或工牌上新写高棉文。"
+                )
+            motion = (
+                compile_seedance_motion_from_spec(spec, table_shot, profile)
+                if lang == "zh"
+                else _text(spec.get("move_detail") or spec.get("action_now"))
+            )
             pov_state = None
             if state:
                 pov_id = pov_cast_id(shot_list, writer)
                 pov_state = state["characters"].get(pov_id) or next(iter(state["characters"].values()), None)
+            hard_list = hard_items_for_state(hard, episode_no, state) if state else []
+            raw_dur = spec.get("duration_sec") or table_shot.get("duration_sec") or min_sec
+            try:
+                paper_sec = float(raw_dur)
+            except (TypeError, ValueError):
+                paper_sec = float(min_sec)
+            render_sec = int(round(max(float(min_sec), min(float(max_sec), paper_sec))))
+            duration_sec = paper_sec if shot_list.get("keep_paper_duration") else render_sec
+            from .codex_stills import StillPackError, missing_costume_state_files, pack_codex_still_refs
+            from .prompts import rewrite_still_prompt
+
+            for msg in missing_costume_state_files(prod, refs, assets):
+                compile_errors.append(f"{sid} {msg}")
+            loc_file = ""
+            by_id = {item.get("asset_id"): item for item in (assets.get("assets") or []) if item.get("asset_id")}
+            for rid in refs:
+                item = by_id.get(rid) or {}
+                if item.get("type") == "location":
+                    loc_file = _text(item.get("file")).replace(chr(92), "/")
+                    break
+            if not loc_file and location_id:
+                loc_file = f"02-assets/scenes/{_text(location_id)}/master.jpg"
+            still_files: list[str] = []
+            if loc_file and not any(item.startswith(f"{sid} ") and "file missing:" in item for item in compile_errors):
+                try:
+                    still_files = pack_codex_still_refs(
+                        prod,
+                        parent=loc_file,
+                        state=state,
+                        assets=assets,
+                        table=shot_list,
+                        hard=hard,
+                        episode=episode_no,
+                        strict_existing=False,
+                    )
+                except StillPackError as exc:
+                    compile_errors.append(f"{sid} {exc}")
+            still_image_prompt = rewrite_still_prompt(image_prompt, still_files, assets) if still_files else ""
             packages.append({
                 "shot_id": sid,
                 "target_model": target_model,
                 "episode_target_model": target_model,
+                "profile": target_model,
                 "asset_refs": refs,
+                "ref_files": package_ref_files(prod, refs, assets),
+                "still_ref_files": still_files,
+                "still_image_prompt": still_image_prompt,
                 "keyframe_plan": plan,
                 "keyframe_files": [],
                 "image_prompt": image_prompt,
+                **(
+                    {
+                        "last_image_prompt": compile_keyframe_prompt_zh(
+                            spec, table_shot, frame_desc=frame_desc, slot="last"
+                        )
+                    }
+                    if lang == "zh" and plan == "first_last"
+                    else {}
+                ),
                 "motion_prompt": motion,
                 "prompt_language": lang,
                 "gen_mode": gen_mode,
-                "duration_sec": spec.get("duration_sec") or table_shot.get("duration_sec") or 4,
+                "duration_sec": duration_sec,
                 "aspect_ratio": spec.get("aspect_ratio") or shot_list.get("aspect") or "16:9",
                 "continuity": {
                     "left": spec.get("left"),
@@ -839,14 +1122,26 @@ def compile_packages_from_specs(prod: Path, target_model: Optional[str] = None) 
                     "eyeline": spec.get("eyeline"),
                     "costume_state_id": spec.get("costume_state_id") or costume,
                     "location_id": location_id or spec.get("location_state_id"),
-                    "binding": (pov_state or {}).get("binding", ""),
+                    "binding": package_binding((pov_state or {}).get("binding", ""), hard_list),
                     "bound_with": (pov_state or {}).get("bound_with", ""),
+                    "hard_items": hard_list,
                 },
                 "state": state,
                 "state_note": state_sentence(state, bible) if state else "",
+                "frame_description": _text((frame_desc or {}).get("one_paragraph")),
                 "dialogue_line": spec.get("dialogue_line") or "",
                 "dialogue_language": "zh" if spec.get("dialogue_line") else "",
+                "parent_hint": _text(table_shot.get("still_parent")),
+                "paper_duration_sec": paper_sec,
+                "render_duration_sec": render_sec,
+                "seedance_min_sec": min_sec,
                 "confirmed": False,
+                "generate_audio": True,
+                "ref_exclusivity": (
+                    "first_frame_xor_reference_image"
+                    if target_model in {"seedance_2_5", "minimax_h3", "wan_3"}
+                    else "first_frame_may_include_refs"
+                ),
             })
             continue
         refs = still_refs(prod, legacy) if legacy else []
@@ -882,9 +1177,18 @@ def compile_packages_from_specs(prod: Path, target_model: Optional[str] = None) 
             "confirmed": False,
         })
     origin = "compiled-from-shot-table" if use_table else "compiled"
-    payload = {"packages": packages, "episode_target_model": target_model, "status": "draft", "confirmed": False, "origin": origin}
+    payload = {
+        "packages": packages,
+        "episode_target_model": target_model,
+        "profile": target_model,
+        "status": "draft",
+        "confirmed": False,
+        "origin": origin,
+    }
     if warnings:
         payload["warnings"] = warnings
+    if compile_errors:
+        payload["errors"] = compile_errors
     return payload
 
 def compile_assets_from_folder(prod: Path) -> dict:

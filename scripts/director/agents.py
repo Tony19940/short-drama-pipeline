@@ -168,6 +168,7 @@ def agent_files(prod: Path, agent_id: str) -> list[Path]:
         return files
     if agent_id == "C2":
         _add_if_file(prod, ".pipeline/gen_packages.json", files)
+        _add_if_file(prod, ".pipeline/frame_descriptions.json", files)
         return files
     if agent_id == "D":
         _add_if_file(prod, ".pipeline/keyframes.json", files)

@@ -35,6 +35,48 @@ def _truthy(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+FACE_BLOCK_CODE = "InputImageSensitiveContentDetected.PrivacyInformation"
+
+
+class SeedanceFaceBlock(RuntimeError):
+    """First-frame real-person privacy block. Official path may fall back to MiniMax-H3."""
+
+    def __init__(self, code: str = FACE_BLOCK_CODE, body: dict | str | None = None) -> None:
+        self.code = code or FACE_BLOCK_CODE
+        self.body = body if body is not None else {}
+        super().__init__(f"Seedance face-block: {self.code}")
+
+
+def ark_error_code(body: dict | str) -> str:
+    text = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False)
+    parsed: dict | str = body
+    if isinstance(body, str):
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    err = parsed.get("error")
+    if isinstance(err, dict):
+        code = str(err.get("code") or "").strip()
+        if code:
+            return code
+    if FACE_BLOCK_CODE in text:
+        return FACE_BLOCK_CODE
+    return ""
+
+
+def classify_create(http_status: int, body: dict | str) -> tuple[str, str, int]:
+    """Return (PASS|FAIL|ERROR, raw_code, exit_code). FAIL = face-block only."""
+    code = ark_error_code(body)
+    if http_status < 400:
+        return "PASS", code or "ok", 0
+    if code == FACE_BLOCK_CODE or code.endswith(".PrivacyInformation"):
+        return "FAIL", code or FACE_BLOCK_CODE, 1
+    return "ERROR", code or f"HTTP_{http_status}", 2
+
+
 class SeedanceArk:
     def __init__(self) -> None:
         self.api_key = os.environ.get("ARK_API_KEY", "").strip()
@@ -42,11 +84,12 @@ class SeedanceArk:
             raise SystemExit("set ARK_API_KEY to the Volcengine Ark key")
         self.base = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
         self.model = os.environ.get("ARK_SEEDANCE_MODEL", "doubao-seedance-2-0-mini-260615").strip()
-        self.resolution = os.environ.get("ARK_RESOLUTION", "480p").strip() or "480p"
+        # Official 出片 is Mini 720p (1280×720). Face-block probe still forces 480p.
+        self.resolution = os.environ.get("ARK_RESOLUTION", "720p").strip() or "720p"
         self.poll = int(os.environ.get("ARK_POLL_SECONDS", "8"))
         self.min_duration = int(os.environ.get("ARK_MIN_DURATION", "4"))
         self.max_duration = int(os.environ.get("ARK_MAX_DURATION", "15"))
-        self.generate_audio = _truthy("ARK_GENERATE_AUDIO", "0")
+        self.generate_audio = _truthy("ARK_GENERATE_AUDIO", "1")
         self.watermark = _truthy("ARK_WATERMARK", "0")
 
     def _headers(self) -> dict[str, str]:
@@ -60,12 +103,17 @@ class SeedanceArk:
         b64 = base64.b64encode(image.read_bytes()).decode("ascii")
         return f"data:{mime};base64,{b64}"
 
-    def clamp_duration(self, seconds: int) -> int:
-        value = int(seconds or self.min_duration)
-        if value < self.min_duration:
-            return self.min_duration
-        if value > self.max_duration:
-            return self.max_duration
+    def clamp_duration(self, seconds: int, shot_id: str = "") -> int:
+        """Validate, never clamp. Seconds outside the model's range are a shot-table bug to fix upstream."""
+        try:
+            value = int(seconds or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value < self.min_duration or value > self.max_duration:
+            where = f"{shot_id} " if shot_id else ""
+            raise RuntimeError(
+                f"{where}秒数 {value} 不在 {self.model} 档内 [{self.min_duration},{self.max_duration}]，改分镜表，不替人改"
+            )
         return value
 
     def _image_item(self, image: Path, role: str | None = None) -> dict:
@@ -105,6 +153,7 @@ class SeedanceArk:
         mode: str = "i2v",
         last_frame: Path | None = None,
         ratio: str | None = None,
+        generate_audio: bool | None = None,
     ) -> dict:
         duration = self.clamp_duration(seconds)
         content = [
@@ -127,7 +176,7 @@ class SeedanceArk:
             "ratio": ratio or _aspect_of(image),
             "resolution": self.resolution,
             "watermark": self.watermark,
-            "generate_audio": self.generate_audio,
+            "generate_audio": self.generate_audio if generate_audio is None else bool(generate_audio),
             "return_last_frame": True,
         }
 
@@ -140,10 +189,13 @@ class SeedanceArk:
         mode: str = "i2v",
         last_frame: Path | None = None,
         idempotency_key: str | None = None,
+        generate_audio: bool | None = None,
     ) -> str:
         if mode == "t2v":
             raise RuntimeError("Seedance 成片路径不能走文生视频")
-        payload = self.build_payload(image, prompt, seconds, refs=refs, mode=mode, last_frame=last_frame)
+        payload = self.build_payload(
+            image, prompt, seconds, refs=refs, mode=mode, last_frame=last_frame, generate_audio=generate_audio
+        )
         headers = self._headers()
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
@@ -154,13 +206,52 @@ class SeedanceArk:
             json=payload,
             timeout=300,
         )
+        body = self._json_body(response)
+        verdict, code, _exit = classify_create(response.status_code, body or response.text)
+        if verdict == "FAIL":
+            raise SeedanceFaceBlock(code, body or response.text)
         if response.status_code >= 400:
             raise RuntimeError(f"Ark {response.status_code}: {response.text[:500]}")
-        body = response.json()
         task_id = body.get("id") or (body.get("data") or {}).get("id") or body.get("task_id")
         if not task_id:
             raise RuntimeError("Ark 没有返回任务 id: " + str(body)[:400])
         return str(task_id)
+
+    def _json_body(self, response: requests.Response) -> dict:
+        if not (response.text or "").strip():
+            return {}
+        try:
+            body = response.json()
+        except ValueError:
+            return {"error": {"code": "InvalidJSON", "message": (response.text or "")[:400]}}
+        return body if isinstance(body, dict) else {"error": {"code": "InvalidJSON", "message": str(body)[:400]}}
+
+    def create_task(self, payload: dict, timeout: int = 300) -> tuple[int, dict]:
+        """POST create. Returns (http_status, json) and does not raise on 400."""
+        response = requests.post(
+            f"{self.base}/contents/generations/tasks",
+            headers=self._headers(),
+            json=payload,
+            timeout=timeout,
+        )
+        return response.status_code, self._json_body(response)
+
+    def query_task(self, task_id: str) -> tuple[int, dict]:
+        response = requests.get(
+            f"{self.base}/contents/generations/tasks/{task_id}",
+            headers=self._headers(),
+            timeout=60,
+        )
+        return response.status_code, self._json_body(response)
+
+    def cancel_task(self, task_id: str) -> tuple[int, dict]:
+        """DELETE: queued → cancelled; running is not cancellable; finished records are deleted."""
+        response = requests.delete(
+            f"{self.base}/contents/generations/tasks/{task_id}",
+            headers=self._headers(),
+            timeout=60,
+        )
+        return response.status_code, self._json_body(response)
 
     def wait_url(self, task_id: str) -> str:
         url = f"{self.base}/contents/generations/tasks/{task_id}"
@@ -198,6 +289,7 @@ class SeedanceArk:
         mode: str = "i2v",
         last_frame: Path | None = None,
         force: bool = False,
+        generate_audio: bool | None = None,
     ) -> None:
         dropped = mode == "flf" and last_frame is not None and last_frame.exists() and bool(refs)
         print(
@@ -211,6 +303,7 @@ class SeedanceArk:
         ticket = {} if force else self._read_ticket(dest)
         task_id = "" if force else str(ticket.get("task_id") or "").strip()
         if not task_id:
+            self.clamp_duration(seconds, shot_id=dest.stem)
             key = dest.resolve().as_posix()
             # A leftover "submitting" ticket never stored a task id. Reusing the
             # dest path as Idempotency-Key can replay an old Ark success.
@@ -219,7 +312,14 @@ class SeedanceArk:
                 key = f"{key}:{int(time.time())}"
             self._write_ticket(dest, {"status": "submitting", "idempotency_key": key, "dest": str(dest)})
             task_id = self.submit(
-                image, prompt, seconds, refs=refs, mode=mode, last_frame=last_frame, idempotency_key=key
+                image,
+                prompt,
+                seconds,
+                refs=refs,
+                mode=mode,
+                last_frame=last_frame,
+                idempotency_key=key,
+                generate_audio=generate_audio,
             )
             self._write_ticket(dest, {"task_id": task_id, "status": "submitted", "idempotency_key": key, "dest": str(dest)})
             print(f"  task {task_id}", flush=True)

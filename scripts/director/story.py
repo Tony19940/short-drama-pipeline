@@ -114,7 +114,7 @@ def _timeline_from(text: str) -> str:
 def write_brief(prod: Path, payload: dict) -> dict:
     title = str(payload.get("title") or "").strip() or "未命名"
     logline = str(payload.get("logline") or "").strip()
-    audience = str(payload.get("audience") or "金边竖屏短剧").strip()
+    audience = str(payload.get("audience") or "金边横屏短剧").strip()
     notes = str(payload.get("notes") or "").strip()
     body = (
         f"# 创意简报\n\n"

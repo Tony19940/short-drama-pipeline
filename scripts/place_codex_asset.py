@@ -22,7 +22,10 @@ if str(SCRIPTS) not in sys.path:
 from director.paths import productions_root, safe_under
 
 KINDS = {
-    "character": ("02-assets/characters", ("master", "face", "front", "side", "back", "sheet")),
+    "character": (
+        "02-assets/characters",
+        ("master", "face", "front", "side", "back", "sheet", "scale", "hair-down"),
+    ),
     "scene": ("02-assets/scenes", ("master", "door", "table", "sheet")),
     "prop": ("02-assets/props", ("master",)),
 }

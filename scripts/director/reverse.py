@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from .defaults import DEFAULT_ASPECT
 from .paths import ROOT, media_url
 from .production import load_json, save_json, write_text
 from .store import load_jobs, save_jobs
@@ -428,11 +429,11 @@ def heuristic_draft(info: dict, cuts: list[dict], frames: list[dict], transcript
     shots = []
     for index, cut in enumerate(cuts, start=1):
         frame = frames[index - 1] if index - 1 < len(frames) else {"path": ""}
-        shots.append(heuristic_shot(index, cut, transcript, frame, info.get("aspect") or "9:16"))
+        shots.append(heuristic_shot(index, cut, transcript, frame, info.get("aspect") or DEFAULT_ASPECT))
     return {
         "episode": "ep01",
         "kind": "shortdrama",
-        "aspect": info.get("aspect") or "9:16",
+        "aspect": info.get("aspect") or DEFAULT_ASPECT,
         "origin": "reverse-heuristic",
         "shots": shots,
     }
@@ -448,7 +449,7 @@ def grok_refine_shots(draft: dict, transcript: dict, brief: str = "") -> dict:
         "facing, expression, blocking, start, scene, characters, new_info, line_kind, line, caption, "
         "on_screen, frame, last_frame, prompt, lens, axis, camera, action, look, video_prompt, negatives. "
         "start is the second-0 stance only and must not copy action. Continue shots must change start. "
-        "Keep 6-12 shots, 50-75s total if possible. First shot of a scene derived_from is <scene>.blocking. "
+        "Shot count and duration follow the source cuts; do not pad or crush to 50-75s. First shot of a scene derived_from is <scene>.blocking. "
         "continue shots keep the same scene. hard cut only when scene changes. "
         "video_prompt is English, cinematic, one move, no dialogue text, no subtitles. "
         "Dialogue stays in line/caption. No orbit/crash zoom. No lip-sync instruction."
@@ -467,7 +468,7 @@ def grok_refine_shots(draft: dict, transcript: dict, brief: str = "") -> dict:
         raise ReverseError("GROK_JSON", "Grok 没有返回 shots")
     data.setdefault("episode", "ep01")
     data.setdefault("kind", "shortdrama")
-    data.setdefault("aspect", draft.get("aspect") or "9:16")
+    data.setdefault("aspect", draft.get("aspect") or DEFAULT_ASPECT)
     data["origin"] = "reverse-grok"
     for src, dest in zip(draft.get("shots") or [], data.get("shots") or []):
         for key in ("source_start", "source_end", "source_frame"):
@@ -666,7 +667,9 @@ def heuristic_localize(draft: dict, brief: str = "") -> dict:
         prompt = str(shot.get("video_prompt") or "")
         if "Khmer" not in prompt:
             prompt = "Photoreal Khmer adult faces, olive skin. " + prompt
-        shot["video_prompt"] = prompt.replace("16:9", "9:16")
+        if DEFAULT_ASPECT == "16:9" and "9:16" in prompt and "16:9" not in prompt:
+            prompt = prompt.replace("9:16", "16:9")
+        shot["video_prompt"] = prompt
         shot["negatives"] = (
             str(shot.get("negatives") or "")
             + ", no qipao, no tangzhuang, no Forbidden City, no WeChat wallet, no RMB bills as plot device"
@@ -690,7 +693,7 @@ def heuristic_localize(draft: dict, brief: str = "") -> dict:
             shot["derived_from"] = prev_id
         prev_id = shot["id"]
         prev_scene = scene
-    out["aspect"] = "9:16"
+    out["aspect"] = DEFAULT_ASPECT
     out["character_map"] = char_map
     out["scene_map"] = scene_map
     out["brief"] = brief
@@ -712,7 +715,7 @@ def grok_localize(draft: dict, brief: str, culture: str) -> dict:
     if not isinstance(data, dict) or not data.get("shots"):
         raise ReverseError("GROK_JSON", "本地化没有返回 shots")
     data["origin"] = "reverse-localized-grok"
-    data.setdefault("aspect", "9:16")
+    data.setdefault("aspect", DEFAULT_ASPECT)
     data.setdefault("kind", "shortdrama")
     data.setdefault("episode", "ep01")
     for src, dest in zip(draft.get("shots") or [], data.get("shots") or []):
@@ -730,7 +733,7 @@ def draft_to_episode_markdown(draft: dict, title: str = "反推本地化第 01 �
         "",
         "- **状态**：draft · 来自参考片反推，未锁定",
         f"- **时长**：{total} 秒",
-        "- **画幅**：9:16",
+        f"- **画幅**：{draft.get('aspect') or DEFAULT_ASPECT}",
         "- **一句**：把参考片的冲突改成金边能认的空间和身体。",
         "",
         "## 节拍",

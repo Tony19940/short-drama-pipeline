@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from .defaults import DEFAULT_ASPECT, production_aspect
 from .knowledge import load_for
 from .prompts import camera_for_move, compose_video_prompt
 from .scriptwriter import (
@@ -474,7 +475,7 @@ def breakdown_package(prod: Path) -> dict:
         "shots": {
             "episode": "ep01",
             "kind": "shortdrama",
-            "aspect": "16:9" if any("angkor" in str(s.get("scene") or "") for s in shots) else "9:16",
+            "aspect": production_aspect(prod) if prod else DEFAULT_ASPECT,
             "origin": "director-breakdown",
             "directing": DIRECTING,
             "scenes": scenes,

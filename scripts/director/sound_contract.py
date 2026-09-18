@@ -88,6 +88,8 @@ def promote_sound_draft(prod: Path) -> None:
 
 
 def snapshot_sound(prod: Path) -> dict:
+    from .sfx import snapshot_sfx
+
     live = build_sound_contract(prod)
     official = prod / "07-dubbing" / "sound-contract.json"
     draft = prod / "07-dubbing" / "sound-contract.draft.json"
@@ -97,4 +99,5 @@ def snapshot_sound(prod: Path) -> dict:
         "draft": json.loads(draft.read_text(encoding="utf-8")) if draft.exists() else None,
         "preview": "06-export/preview-vo.mp4",
         "dubbing_dir": "07-dubbing",
+        "sfx": snapshot_sfx(prod),
     }
