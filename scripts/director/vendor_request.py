@@ -77,6 +77,23 @@ def resolve_vendor_identity(raw: str) -> tuple[str, str]:
     return profile_id, models[0]
 
 
+def resolve_package_models(raw: str) -> tuple[str, str, str]:
+    """(capability_profile_id, paid_target_model, vendor_model_id).
+
+    An explicit catalog ID stays the paid target. A profile name stays the
+    profile id so existing design artifacts keep working.
+    """
+    raw_s = str(raw or "").strip()
+    profile_id, vendor_model = resolve_vendor_identity(raw_s)
+    from .video_profiles import get_profile
+
+    profile = get_profile(raw_s or None)
+    models = [str(item) for item in (profile.get("vendor_models") or [])]
+    explicit = any(raw_s == item or raw_s.lower() == item.lower() for item in models)
+    paid = vendor_model if explicit else profile_id
+    return profile_id, paid, vendor_model
+
+
 def canonical_vendor_model(profile_id: str) -> str:
     """Profile default vendor model. Prefer resolve_vendor_identity for an explicit ID."""
     _profile_id, model = resolve_vendor_identity(profile_id)
@@ -312,7 +329,13 @@ def vendor_request_from_package(
 
     ctx = ProductionContext.resolve(prod, episode)
     frame = frame or {}
-    raw_model = str(pkg.get("target_model") or pkg.get("profile") or pkg.get("episode_target_model") or "").strip()
+    raw_model = str(
+        pkg.get("vendor_model")
+        or pkg.get("target_model")
+        or pkg.get("profile")
+        or pkg.get("episode_target_model")
+        or ""
+    ).strip()
     profile = get_profile(raw_model or None)
     profile_id, vendor_model = resolve_vendor_identity(raw_model or str(profile["id"]))
     gen_mode = str(pkg.get("gen_mode") or "i2v_first").strip()

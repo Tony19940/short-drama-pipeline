@@ -14,7 +14,7 @@ from typing import Optional
 from .gates import ken_burns_blocked, require_fresh_gate, run_check
 from .paths import ROOT
 from .shot_repo import list_shots, select_shots
-from .store import exclusive_state_lock, load_approvals, load_jobs, save_jobs
+from .store import exclusive_state_lock, load_jobs, save_jobs
 
 
 def gpu_configured() -> bool:
@@ -108,23 +108,25 @@ def enqueue_render_confirmed(
     if not check["ok"]:
         raise PermissionError(check["stderr"] or check["stdout"] or "check_prod 未过，不能出视频")
     selected = select_shots(prod, shot_ids, episode)
-    from .fingerprint import consume_render_fingerprint, require_task_inputs
+    from .fingerprint import confirmed_snapshot_rel, consume_render_fingerprint, require_task_inputs
 
     require_task_inputs(prod, selected, episode)
     used = consume_render_fingerprint(prod, fingerprint, [shot["id"] for shot in selected], review_track, episode)
-    approvals = load_approvals(prod)
-    snapshot = str((approvals.get("render") or {}).get("snapshot") or "")
+    if not isinstance(used, dict) or not used.get("snapshot") or not used.get("fingerprint"):
+        raise PermissionError("consume must return a paired fingerprint and snapshot")
+    if used["snapshot"] != confirmed_snapshot_rel(used["fingerprint"]):
+        raise PermissionError("consumed fingerprint and snapshot are not a pair")
     job = {
         "id": f"job-{uuid.uuid4().hex[:10]}",
         "kind": "render",
         "status": "queued",
-        "shot_ids": [shot["id"] for shot in selected],
+        "shot_ids": list(used.get("shot_ids") or [shot["id"] for shot in selected]),
         "review_track": review_track,
         "gpu": gpu_configured(),
         "backend": default_render_backend() or None,
-        "fingerprint": used,
-        "snapshot": snapshot,
-        "episode": episode,
+        "fingerprint": used["fingerprint"],
+        "snapshot": used["snapshot"],
+        "episode": used.get("episode", episode),
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
         "log": [],
@@ -189,6 +191,8 @@ def _run_render(prod: Path, job_id: str) -> None:
             str(prod),
             "--from-snapshot",
             snapshot,
+            "--expected-fingerprint",
+            str(job.get("fingerprint") or ""),
             "--episode",
             str(job.get("episode") or 1),
         ]

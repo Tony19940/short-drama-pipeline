@@ -109,6 +109,105 @@ def confirmed_snapshot_rel(fingerprint: str) -> str:
     return f"{SNAPSHOT_DIR}/{str(fingerprint).strip()}.json"
 
 
+def snapshot_canonical_payload(data: dict) -> dict:
+    payload = {
+        "compiler_version": str(data.get("compiler_version") or ""),
+        "episode": str(data.get("episode") if data.get("episode") not in (None, "") else ""),
+        "shot_ids": list(data.get("shot_ids") or []),
+        "requests": list(data.get("requests") or []),
+    }
+    if data.get("shots"):
+        payload["shots"] = list(data.get("shots") or [])
+    return payload
+
+
+def snapshot_batch(
+    *,
+    episode: Any,
+    shot_ids: list[str],
+    requests: Optional[list[dict]] = None,
+    shots: Optional[list[dict]] = None,
+    compiler_version: str = COMPILER_VERSION,
+) -> dict:
+    batch = {
+        "compiler_version": compiler_version,
+        "episode": str(episode if episode not in (None, "") else ""),
+        "shot_ids": list(shot_ids),
+        "requests": list(requests or []),
+    }
+    if shots:
+        batch["shots"] = list(shots)
+    return batch
+
+
+def _legacy_shot_rows(specs: list[dict]) -> list[dict]:
+    keys = ("id", "parent", "source", "refs", "mode", "dest", "compiled", "end_frame", "media_hashes")
+    return [{key: item[key] for key in keys if key in item} for item in specs]
+
+
+def _batch_from_specs(episode: Any, specs: list[dict]) -> dict:
+    requests = [item.get("vendor_request") for item in specs if item.get("vendor_request")]
+    return snapshot_batch(
+        episode=episode,
+        shot_ids=[item["id"] for item in specs],
+        requests=requests,
+        shots=None if requests else _legacy_shot_rows(specs),
+    )
+
+
+def snapshot_content_fingerprint(data: dict) -> str:
+    raw = json.dumps(snapshot_canonical_payload(data), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def confirmed_media_path(prod: Path, digest: str) -> Path:
+    digest = str(digest or "").strip()
+    return Path(prod) / SNAPSHOT_DIR / "media" / digest[:2] / digest
+
+
+def persist_confirmed_media(prod: Path, requests: list[dict]) -> None:
+    for req in requests:
+        if not isinstance(req, dict):
+            continue
+        hashes = req.get("media_hashes") or {}
+        if not isinstance(hashes, dict):
+            continue
+        for rel, digest in hashes.items():
+            digest = str(digest or "").strip()
+            rel = str(rel or "").strip()
+            if not digest or not rel:
+                continue
+            dest = confirmed_media_path(prod, digest)
+            if dest.is_file():
+                continue
+            src = Path(prod) / rel
+            if not src.is_file():
+                raise PermissionError(f"cannot freeze {rel}")
+            data = src.read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise PermissionError(f"{rel} changed while writing snapshot")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(".part")
+            tmp.write_bytes(data)
+            tmp.replace(dest)
+
+
+def read_confirmed_media_bytes(prod: Path, rel: str, digest: str) -> bytes:
+    digest = str(digest or "").strip()
+    stored = confirmed_media_path(prod, digest) if digest else Path()
+    if digest and stored.is_file():
+        data = stored.read_bytes()
+        if hashlib.sha256(data).hexdigest() == digest:
+            return data
+    src = Path(prod) / str(rel or "")
+    if not src.is_file():
+        raise RuntimeError(f"missing confirmed media {rel}")
+    data = src.read_bytes()
+    if digest and hashlib.sha256(data).hexdigest() != digest:
+        raise RuntimeError(f"{rel} changed since confirm")
+    return data
+
+
 def write_confirmed_snapshot(
     prod: Path,
     fingerprint: str,
@@ -118,26 +217,39 @@ def write_confirmed_snapshot(
     requests: list[dict],
     extra: Optional[dict] = None,
 ) -> str:
-    rel = confirmed_snapshot_rel(fingerprint)
-    dest = Path(prod) / rel
-    dest.parent.mkdir(parents=True, exist_ok=True)
     body = {
-        "fingerprint": fingerprint,
         "compiler_version": COMPILER_VERSION,
-        "episode": episode,
+        "episode": str(episode if episode not in (None, "") else ""),
         "shot_ids": list(shot_ids),
         "requests": list(requests),
         "at": int(time.time()),
     }
     if extra:
-        body.update(extra)
+        for key, value in extra.items():
+            if key != "fingerprint":
+                body[key] = value
+    live = snapshot_content_fingerprint(body)
+    if fingerprint and fingerprint != live:
+        raise PermissionError("snapshot fingerprint does not match canonical payload")
+    body["fingerprint"] = live
+    persist_confirmed_media(prod, list(requests))
+    rel = confirmed_snapshot_rel(live)
+    dest = Path(prod) / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(dest)
     return rel
 
 
-def load_confirmed_snapshot(prod: Path, fingerprint_or_rel: str) -> dict:
+def load_confirmed_snapshot(
+    prod: Path,
+    fingerprint_or_rel: str,
+    *,
+    expected_fingerprint: Optional[str] = None,
+    expected_episode: Any = None,
+    expected_shot_ids: Optional[list[str]] = None,
+) -> dict:
     raw = str(fingerprint_or_rel or "").strip()
     if not raw:
         raise PermissionError("missing confirmed snapshot")
@@ -153,6 +265,19 @@ def load_confirmed_snapshot(prod: Path, fingerprint_or_rel: str) -> dict:
         raise PermissionError(f"confirmed snapshot unreadable: {path}") from exc
     if not isinstance(data, dict) or not data.get("requests"):
         raise PermissionError("confirmed snapshot has no requests")
+    if str(data.get("compiler_version") or "") != COMPILER_VERSION:
+        raise PermissionError("snapshot compiler_version is missing or incompatible")
+    live = snapshot_content_fingerprint(data)
+    stored = str(data.get("fingerprint") or "")
+    if stored != live:
+        raise PermissionError("snapshot content does not match fingerprint")
+    expected = str(expected_fingerprint or "").strip()
+    if expected and expected != live:
+        raise PermissionError("snapshot fingerprint does not match the job")
+    if expected_episode not in (None, "") and str(data.get("episode")) != str(expected_episode):
+        raise PermissionError("snapshot episode does not match the job")
+    if expected_shot_ids is not None and list(data.get("shot_ids") or []) != list(expected_shot_ids):
+        raise PermissionError("snapshot shot list does not match the job")
     return data
 
 
@@ -213,26 +338,11 @@ def require_task_inputs(prod: Path, selected: list[dict], episode: Any = 1) -> N
 def fingerprint_for(prod: Path, shot_ids: Optional[list[str]] = None, episode: Any = 1) -> tuple[str, list[dict]]:
     if uses_pipeline(prod):
         specs = _pipeline_specs(prod, shot_ids, episode)
-        payload = {
-            "compiler_version": COMPILER_VERSION,
-            "episode": str(episode),
-            "shot_ids": [item["id"] for item in specs],
-            "requests": [item["vendor_request"] for item in specs],
-        }
     else:
         shots = _shots(prod, episode)
         selected = _selected(prod, shot_ids, episode)
         specs = [shot_spec(prod, shot, shots) for shot in selected]
-        payload = {
-            "compiler_version": COMPILER_VERSION,
-            "shot_ids": [item["id"] for item in specs],
-            "shots": [
-                {k: item[k] for k in ("id", "parent", "source", "refs", "mode", "dest", "compiled", "end_frame", "media_hashes")}
-                for item in specs
-            ],
-        }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest(), specs
+    return snapshot_content_fingerprint(_batch_from_specs(episode, specs)), specs
 
 
 def prepare_render(
@@ -253,12 +363,14 @@ def prepare_render(
     selected = _selected(prod, shot_ids, episode)
     require_task_inputs(prod, selected, episode)
     fingerprint, specs = fingerprint_for(prod, [shot["id"] for shot in selected], episode)
+    batch = _batch_from_specs(episode, specs)
     snapshot = write_confirmed_snapshot(
         prod,
         fingerprint,
         episode=episode,
-        shot_ids=[shot["id"] for shot in selected],
-        requests=[item.get("vendor_request") for item in specs if item.get("vendor_request")],
+        shot_ids=batch["shot_ids"],
+        requests=batch["requests"],
+        extra={"shots": batch["shots"]} if batch.get("shots") else None,
     )
     with exclusive_state_lock(prod, "approvals"):
         approvals = load_approvals(prod)
@@ -289,7 +401,7 @@ def consume_render_fingerprint(
     shot_ids: Optional[list[str]] = None,
     review_track: bool = False,
     episode: Any = 1,
-) -> str:
+) -> dict:
     if not fingerprint:
         raise PermissionError("出片需要先 prepare 并确认指纹")
     with exclusive_state_lock(prod, "approvals"):
@@ -308,13 +420,20 @@ def consume_render_fingerprint(
         rec["consumed"] = True
         rec["used_at"] = int(time.time())
         rec["review_track"] = bool(review_track)
+        batch = _batch_from_specs(episode, _specs)
         rec["snapshot"] = write_confirmed_snapshot(
             prod,
             fingerprint,
             episode=episode,
-            shot_ids=want,
-            requests=[item.get("vendor_request") for item in _specs if item.get("vendor_request")],
+            shot_ids=batch["shot_ids"],
+            requests=batch["requests"],
+            extra={"shots": batch["shots"]} if batch.get("shots") else None,
         )
         approvals["render"] = rec
         save_approvals(prod, approvals)
-        return fingerprint
+        return {
+            "fingerprint": fingerprint,
+            "snapshot": rec["snapshot"],
+            "episode": rec.get("episode", episode),
+            "shot_ids": list(rec.get("shot_ids") or want),
+        }

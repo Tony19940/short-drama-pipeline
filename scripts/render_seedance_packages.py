@@ -13,7 +13,7 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
@@ -387,12 +387,26 @@ def _extract_last(video: Path, dest: Path) -> None:
     print(f"  warn: could not extract last frame from {video.name}; official clip kept", flush=True)
 
 
-def plan_from_snapshot(prod: Path, snapshot_rel: str, only: Optional[list[str]] = None) -> dict:
+def plan_from_snapshot(
+    prod: Path,
+    snapshot_rel: str,
+    only: Optional[list[str]] = None,
+    *,
+    expected_fingerprint: str = "",
+    expected_episode: Any = None,
+    expected_shot_ids: Optional[list[str]] = None,
+) -> dict:
     """Paid path: execute the confirmed requests. Do not recompile packages."""
     from director.fingerprint import load_confirmed_snapshot, snapshot_requests
     from director.vendor_request import media_hash
 
-    snap = load_confirmed_snapshot(prod, snapshot_rel)
+    snap = load_confirmed_snapshot(
+        prod,
+        snapshot_rel,
+        expected_fingerprint=expected_fingerprint or None,
+        expected_episode=expected_episode,
+        expected_shot_ids=expected_shot_ids,
+    )
     episode = snap.get("episode") or 1
     dest_dir = episode_shot_dir(episode)
     want = set(only or [])
@@ -683,12 +697,23 @@ def main() -> None:
         default="",
         help="confirmed request snapshot (.pipeline/confirmed-requests/<hash>.json). Worker must pass this.",
     )
+    parser.add_argument(
+        "--expected-fingerprint",
+        default="",
+        help="job fingerprint that must match the snapshot payload",
+    )
     args = parser.parse_args()
     prod = _prod(args.prod)
     if not prod.is_dir():
         raise SystemExit(f"没有这个项目：{prod}")
     if args.from_snapshot:
-        plan = plan_from_snapshot(prod, args.from_snapshot, args.only)
+        plan = plan_from_snapshot(
+            prod,
+            args.from_snapshot,
+            args.only,
+            expected_fingerprint=args.expected_fingerprint,
+            expected_episode=args.episode,
+        )
     else:
         plan = build_plan(prod, args.only, episode=args.episode)
     summary_keys = (

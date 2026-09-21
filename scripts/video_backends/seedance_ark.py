@@ -13,6 +13,7 @@ import base64
 import hashlib
 import mimetypes
 import os
+import subprocess
 import time
 from pathlib import Path
 import json
@@ -37,6 +38,61 @@ def _truthy(name: str, default: str = "0") -> bool:
 
 
 FACE_BLOCK_CODE = "InputImageSensitiveContentDetected.PrivacyInformation"
+MP4_PROBE_VERSION = "mp4-probe-v1"
+
+
+def probe_mp4(path: Path) -> dict:
+    dest = Path(path)
+    if not dest.is_file() or dest.stat().st_size <= 1024:
+        return {}
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type,width,height",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(dest),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        body = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    streams = body.get("streams") or []
+    if not streams:
+        return {}
+    stream = streams[0] if isinstance(streams[0], dict) else {}
+    if str(stream.get("codec_type") or "") != "video":
+        return {}
+    try:
+        width = int(stream.get("width") or 0)
+        height = int(stream.get("height") or 0)
+        duration = float((body.get("format") or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if width <= 0 or height <= 0 or duration <= 0:
+        return {}
+    return {
+        "width": width,
+        "height": height,
+        "duration": duration,
+        "validator": MP4_PROBE_VERSION,
+    }
 
 
 def looks_like_mp4_file(path: Path) -> bool:
@@ -44,7 +100,9 @@ def looks_like_mp4_file(path: Path) -> bool:
     if not dest.is_file() or dest.stat().st_size <= 1024:
         return False
     head = dest.read_bytes()[:32]
-    return b"ftyp" in head
+    if b"ftyp" not in head:
+        return False
+    return bool(probe_mp4(dest))
 
 
 class SeedanceFaceBlock(RuntimeError):
@@ -135,8 +193,16 @@ class SeedanceArk:
         }
 
     def _data_url(self, image: Path) -> str:
-        mime = mimetypes.guess_type(image.name)[0] or "image/jpeg"
-        b64 = base64.b64encode(image.read_bytes()).decode("ascii")
+        cache = getattr(self, "_verified_media", None) or {}
+        key = str(Path(image).resolve())
+        if cache:
+            data = cache.get(key)
+            if data is None:
+                raise RuntimeError(f"no verified bytes for {image}")
+        else:
+            data = Path(image).read_bytes()
+        mime = mimetypes.guess_type(Path(image).name)[0] or "image/jpeg"
+        b64 = base64.b64encode(data).decode("ascii")
         return f"data:{mime};base64,{b64}"
 
     def _is_25(self) -> bool:
@@ -248,7 +314,14 @@ class SeedanceArk:
         stored = str(ticket.get("request_hash") or "").strip()
         if not stored or stored != str(request_hash or "").strip():
             return False
-        return str(ticket.get("status") or "") in {"succeeded", "downloaded", "verified"}
+        if str(ticket.get("status") or "") not in {"succeeded", "downloaded", "verified"}:
+            return False
+        output_hash = str(ticket.get("output_sha256") or "").strip()
+        if not output_hash:
+            return False
+        from director.vendor_request import sha256_file
+
+        return output_hash == sha256_file(dest)
 
     def build_payload(
         self,
@@ -552,6 +625,9 @@ class SeedanceArk:
             },
         )
         self.download(url, dest)
+        from director.vendor_request import sha256_file
+
+        probe = probe_mp4(dest)
         self._write_ticket(
             dest,
             {
@@ -560,33 +636,53 @@ class SeedanceArk:
                 "url": url,
                 "dest": str(dest),
                 "request_hash": req_hash,
+                "output_sha256": sha256_file(dest) if dest.is_file() else "",
+                "output_probe": probe,
+                "validator": MP4_PROBE_VERSION,
             },
         )
         print(f"  wrote {dest}", flush=True)
 
     def render_request(self, request: object, dest: Path, *, prod: Path, force: bool = False) -> None:
-        from director.vendor_request import VendorRequest
+        from director.fingerprint import read_confirmed_media_bytes
         from director.paths import safe_under
+        from director.vendor_request import VendorRequest
 
         if not isinstance(request, VendorRequest):
             raise TypeError("render_request expects VendorRequest")
-        image = safe_under(prod, request.first_frame) if request.first_frame else dest
-        last = safe_under(prod, request.last_frame) if request.last_frame else None
-        source = safe_under(prod, request.source_video) if request.source_video else None
-        refs = [safe_under(prod, rel) for rel in request.refs if rel]
-        self.render(
-            image,
-            request.prompt,
-            int(request.duration_sec),
-            dest,
-            refs=refs,
-            mode=request.seedance_mode(),
-            last_frame=last,
-            force=force,
-            generate_audio=request.generate_audio,
-            source_video=source,
-            request_hash=request.fingerprint(),
-            ratio=request.submit_ratio or request.ratio,
-            watermark=request.watermark,
-            submit_duration=int(request.submit_duration_sec),
-        )
+        hashes = request.media_hash_map()
+        verified: dict[str, bytes] = {}
+
+        def load_rel(rel: str) -> Path:
+            path = safe_under(prod, rel)
+            digest = hashes.get(rel)
+            if not digest:
+                raise RuntimeError(f"{rel} missing from confirmed media_hashes")
+            data = read_confirmed_media_bytes(prod, rel, digest)
+            verified[str(path.resolve())] = data
+            return path
+
+        image = load_rel(request.first_frame) if request.first_frame else dest
+        last = load_rel(request.last_frame) if request.last_frame else None
+        source = load_rel(request.source_video) if request.source_video else None
+        refs = [load_rel(rel) for rel in request.refs if rel]
+        self._verified_media = verified
+        try:
+            self.render(
+                image,
+                request.prompt,
+                int(request.duration_sec),
+                dest,
+                refs=refs,
+                mode=request.seedance_mode(),
+                last_frame=last,
+                force=force,
+                generate_audio=request.generate_audio,
+                source_video=source,
+                request_hash=request.fingerprint(),
+                ratio=request.submit_ratio or request.ratio,
+                watermark=request.watermark,
+                submit_duration=int(request.submit_duration_sec),
+            )
+        finally:
+            self._verified_media = None

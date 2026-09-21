@@ -20,10 +20,10 @@ sys.path.insert(0, str(SCRIPTS))
 
 import render_seedance_packages as renderer  # noqa: E402
 from director import video_fallback  # noqa: E402
-from director.fingerprint import write_confirmed_snapshot  # noqa: E402
+from director.fingerprint import snapshot_content_fingerprint, write_confirmed_snapshot  # noqa: E402
 from director.setup_anchors import same_setup  # noqa: E402
 from director.station_agents import _repair_writer_lines, frame_desc_shots_ctx  # noqa: E402
-from director.vendor_request import vendor_request_from_package  # noqa: E402
+from director.vendor_request import COMPILER_VERSION, vendor_request_from_package  # noqa: E402
 from video_backends.seedance_ark import SeedanceArk, SeedanceFaceBlock  # noqa: E402
 
 
@@ -217,9 +217,15 @@ class ContractRegressions(unittest.TestCase):
 
     def test_snapshot_keeps_confirmed_prompt_after_package_rewrite(self) -> None:
         req = vendor_request_from_package(self.prod, package(), keyframes()["SH001"])
+        batch = {
+            "compiler_version": COMPILER_VERSION,
+            "episode": "1",
+            "shot_ids": ["SH001"],
+            "requests": [req.to_dict()],
+        }
         rel = write_confirmed_snapshot(
             self.prod,
-            req.fingerprint(),
+            snapshot_content_fingerprint(batch),
             episode=1,
             shot_ids=["SH001"],
             requests=[req.to_dict()],

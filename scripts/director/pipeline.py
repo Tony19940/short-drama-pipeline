@@ -287,9 +287,15 @@ def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional
             errors.append(f"{sid} missing confirmed")
         model = _text(pkg.get("target_model"))
         lang = _text(pkg.get("prompt_language"))
-        if model in MODELS_ZH and lang != "zh":
+        try:
+            from .video_profiles import get_profile as _get_profile
+
+            capability = _text((_get_profile(pkg.get("capability_profile_id") or model) or {}).get("id"))
+        except Exception:
+            capability = _text(pkg.get("capability_profile_id") or model)
+        if (model in MODELS_ZH or capability in MODELS_ZH) and lang != "zh":
             errors.append(f"{sid} Wan/Seedance prompts must be zh")
-        if model in MODELS_EN and lang != "en":
+        if (model in MODELS_EN or capability in MODELS_EN) and lang != "en":
             errors.append(f"{sid} H3/Veo control language must be en")
         if episode_model and model and model != episode_model:
             errors.append(f"{sid} model differs from episode_target_model")
@@ -990,9 +996,12 @@ def compile_packages_from_specs(
     from .video_profiles import get_profile
 
     shot_list = table if table is not None else read_artifact(prod, "shot_list.json")
-    target_model = _text(target_model) or _text(shot_list.get("target_model")) or "minimax_h3"
-    profile = get_profile(target_model)
-    target_model = _text(profile.get("id")) or target_model
+    from .vendor_request import resolve_package_models
+
+    raw_choice = _text(target_model) or _text(shot_list.get("target_model")) or "minimax_h3"
+    profile = get_profile(raw_choice)
+    capability_id, paid_model, vendor_model_id = resolve_package_models(raw_choice)
+    target_model = paid_model
     min_sec = int(profile.get("min_shot_sec") or 4)
     max_sec = int(profile.get("max_shot_sec") or 15)
     max_refs = int(profile.get("max_ref_images") or 9)
@@ -1016,7 +1025,7 @@ def compile_packages_from_specs(
     assets = read_artifact(prod, "assets.json")
     table_shots = {item.get("shot_id"): item for item in shot_list.get("shots") or [] if item.get("shot_id")}
     legacy_shots = {shot.get("id"): shot for shot in (load_json(prod, "03-storyboard/shots.json", {"shots": []}).get("shots") or [])}
-    lang = "zh" if target_model in MODELS_ZH else "en"
+    lang = "zh" if capability_id in MODELS_ZH or target_model in MODELS_ZH else "en"
     use_table = str(shot_list.get("schema") or "") == SHOT_TABLE_SCHEMA
     episode_no = int(shot_list.get("episode_no") or 1)
     from .continuity_hard import hard_items_for_state, load_continuity_hard, package_binding
@@ -1247,8 +1256,10 @@ def compile_packages_from_specs(
             packages.append({
                 "shot_id": sid,
                 "target_model": target_model,
+                "vendor_model": vendor_model_id,
+                "capability_profile_id": capability_id,
                 "episode_target_model": target_model,
-                "profile": target_model,
+                "profile": capability_id,
                 "asset_refs": refs,
                 "ref_files": package_ref_files(prod, refs, assets),
                 "still_ref_files": still_files,
@@ -1321,6 +1332,8 @@ def compile_packages_from_specs(
         packages.append({
             "shot_id": sid,
             "target_model": target_model,
+            "vendor_model": vendor_model_id,
+            "capability_profile_id": capability_id,
             "episode_target_model": target_model,
             "asset_refs": [_text(item.get("asset_id")) for item in (assets.get("assets") or []) if item.get("asset_id")][:9],
             "keyframe_plan": "first_last" if gen_mode == "flf2v" else "first",
@@ -1346,7 +1359,9 @@ def compile_packages_from_specs(
     payload = {
         "packages": packages,
         "episode_target_model": target_model,
-        "profile": target_model,
+        "profile": capability_id,
+        "vendor_model": vendor_model_id,
+        "capability_profile_id": capability_id,
         "status": "draft",
         "confirmed": False,
         "origin": origin,

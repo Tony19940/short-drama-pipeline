@@ -609,18 +609,47 @@ def state_note_of(spec: dict, shot: Optional[dict] = None) -> str:
     return state_sentence(state) if state else ""
 
 
-def first_still_phase_line(shot: Optional[dict] = None, spec: Optional[dict] = None) -> str:
-    """Still sentence follows t0_phase. Default onset keeps the old lock."""
+def t0_phase_of(shot: Optional[dict] = None, spec: Optional[dict] = None) -> str:
     shot = shot or {}
     spec = spec or {}
     phase = str(shot.get("t0_phase") or spec.get("t0_phase") or "").strip() or "onset"
+    return phase if phase in {"onset", "mid", "hold", "land"} else "onset"
+
+
+def first_still_phase_line(shot: Optional[dict] = None, spec: Optional[dict] = None) -> str:
+    """Still sentence follows t0_phase. Default onset keeps the old lock."""
     lines = {
         "onset": "画动作起点的那一格：可以已经起手，结果还没发生。",
         "mid": "画动作中段的那一格：动作已经进行到一半，结果还没发生。",
         "hold": "画停住听的那一格：先停住，结果还没发生。",
         "land": "画已近落幅的那一格：接近结束，结果仍未完全落地。",
     }
-    return lines.get(phase, lines["onset"])
+    return lines[t0_phase_of(shot, spec)]
+
+
+def first_still_action_line(action: str, shot: Optional[dict] = None, spec: Optional[dict] = None) -> str:
+    act = str(action or "").strip().rstrip("。")
+    if not act:
+        return ""
+    phase = t0_phase_of(shot, spec)
+    tails = {
+        "onset": "首帧只画起手，结果留给视频",
+        "mid": "首帧画中段，不要画成起点或结果",
+        "hold": "首帧先停住，不要起手",
+        "land": "首帧已近落幅，结果仍未完全落地",
+    }
+    return f"本镜要做的动作（{tails[phase]}）：{act}。"
+
+
+def first_still_forbid_line(action: str, shot: Optional[dict] = None, spec: Optional[dict] = None) -> str:
+    from .still_t0 import forbidden_result_clause
+
+    phase = t0_phase_of(shot, spec)
+    if phase == "onset":
+        return forbidden_result_clause(action)
+    if phase == "land":
+        return "接近落幅但结果尚未完全落地，不要画成已经做完。"
+    return "不要画动作已经完成的结果，也不要把这一格画成动作起点。"
 
 
 def compile_keyframe_prompt_zh(
@@ -642,7 +671,7 @@ def compile_keyframe_prompt_zh(
     shot = shot or {}
     from .frame_desc import description_sentence, normalize_item
     from .show_policy import still_style_close, still_style_opener
-    from .still_t0 import first_still_text, forbidden_result_clause, last_still_text
+    from .still_t0 import first_still_text, last_still_text
 
     aspect = _spec_text(spec, "aspect_ratio") or str(shot.get("aspect") or shot.get("aspect_ratio") or "16:9")
     art = _spec_text(spec, "art_direction") or str(shot.get("art_direction") or "digital_cg")
@@ -714,8 +743,8 @@ def compile_keyframe_prompt_zh(
         f"连戏必须照做：{note.rstrip('。')}。首帧只守服装、在场、绑法；note 里的动作结果留给视频。" if note else "",
         lock_line,
         light_line,
-        f"本镜要做的动作（首帧只画起手，结果留给视频）：{action.rstrip('。')}。" if action else "",
-        forbidden_result_clause(action),
+        first_still_action_line(action, shot, spec),
+        first_still_forbid_line(action, shot, spec),
         closer,
         "画面干净：无字幕、无水印、无国旗、无现代天际线、无吴哥塔、无环绕构图。",
     ]
