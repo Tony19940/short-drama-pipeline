@@ -95,6 +95,11 @@ def load_shots(prod: Path, episode: int = 1) -> list[dict]:
                 "scale": _t(shot.get("scale") or ("" if v2 else shot.get("setup"))),
                 "coverage": _t(shot.get("coverage_type") or ("" if v2 else shot.get("setup"))),
                 "one_action": _t(shot.get("one_action") or shot.get("action") or shot.get("start")),
+                "t0_phase": _t(shot.get("t0_phase")),
+                "in_from": _t(shot.get("in_from") or shot.get("start")),
+                "out_to": _t(shot.get("out_to")),
+                "action_timing": list(shot.get("action_timing") or shot.get("performance_beats") or []),
+                "stimulus": _t(shot.get("stimulus") or shot.get("stimulus_line")),
             })
         return rows
 
@@ -123,10 +128,39 @@ def _label(row: dict, seconds: float, part: str = "") -> str:
     return " · ".join(bits)
 
 
+def _beat_splits(row: dict, seconds: float) -> Optional[list[tuple[float, str]]]:
+    """Performance-node windows. None means keep the old first/last half split."""
+    raw = row.get("action_timing") or []
+    if not isinstance(raw, list) or not raw:
+        return None
+    windows: list[tuple[float, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = float(item.get("from_sec", item.get("from", 0)) or 0)
+            end = float(item.get("to_sec", item.get("to", start)) or start)
+        except (TypeError, ValueError):
+            continue
+        dur = max(0.0, end - start)
+        if dur <= 0:
+            continue
+        label = _t(item.get("text") or item.get("action") or item.get("stimulus"))
+        windows.append((dur, label))
+    if not windows:
+        return None
+    total = sum(item[0] for item in windows)
+    if total <= 0:
+        return None
+    scale = seconds / total
+    return [(round(dur * scale, 3), label) for dur, label in windows]
+
+
 def plan_animatic(prod: Path, episode: int = 1) -> list[dict]:
     """Pure: which image shows for how long, in table order. No PIL, no ffmpeg.
 
-    A shot with a locked last frame splits into two cards (first half / second half).
+    Performance beats, when present, decide when the picture changes.
+    Without beats, a locked last frame still splits first half / second half.
     A shot without a first frame becomes a grey card flagged `missing`.
     """
     frames = episode_frames_dir(episode)
@@ -138,7 +172,36 @@ def plan_animatic(prod: Path, episode: int = 1) -> list[dict]:
         last_rel = f"{frames}/{sid}-last.jpg"
         first_ok = (prod / first_rel).exists()
         last_ok = first_ok and (prod / last_rel).exists()
-        if last_ok:
+        splits = _beat_splits(row, seconds)
+        if splits and last_ok:
+            last_index = len(splits) - 1
+            for index, (dur, beat_label) in enumerate(splits):
+                part = "last" if index == last_index else "first"
+                image = last_rel if part == "last" else first_rel
+                tag = "尾" if part == "last" else "首"
+                extra = f" {beat_label[:24]}" if beat_label else ""
+                plan.append({
+                    "shot_id": sid,
+                    "image": image,
+                    "seconds": dur,
+                    "label": _label(row, seconds, tag) + extra,
+                    "missing": False,
+                    "part": part,
+                    "beat": beat_label,
+                })
+        elif splits:
+            for index, (dur, beat_label) in enumerate(splits):
+                extra = f" {beat_label[:24]}" if beat_label else ""
+                plan.append({
+                    "shot_id": sid,
+                    "image": first_rel if first_ok else None,
+                    "seconds": dur,
+                    "label": _label(row, seconds) + extra + ("" if first_ok else " · 缺首帧"),
+                    "missing": not first_ok,
+                    "part": "first" if index == 0 else f"beat{index + 1}",
+                    "beat": beat_label,
+                })
+        elif last_ok:
             half = round(seconds / 2, 3)
             plan.append({"shot_id": sid, "image": first_rel, "seconds": half, "label": _label(row, seconds, "首"), "missing": False, "part": "first"})
             plan.append({"shot_id": sid, "image": last_rel, "seconds": round(seconds - half, 3), "label": _label(row, seconds, "尾"), "missing": False, "part": "last"})

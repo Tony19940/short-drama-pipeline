@@ -130,6 +130,17 @@ def record_outcome(
     tags: Any = None,
     note: str = "",
     profile_id: Optional[str] = None,
+    *,
+    model: str = "",
+    task_kind: str = "",
+    language: str = "",
+    take_id: str = "",
+    attempt_id: str = "",
+    request_hash: str = "",
+    in_sec: Any = None,
+    out_sec: Any = None,
+    cost: Any = None,
+    evidence: str = "",
 ) -> dict:
     """Append one QC outcome and regenerate the model's notes page. Returns the stored item + page path."""
     from .pipeline import artifact_path, pipeline_dir
@@ -154,6 +165,16 @@ def record_outcome(
         "tags": tag_list,
         "note": _t(note),
         "profile_id": profile,
+        "model": _t(model),
+        "task_kind": _t(task_kind),
+        "language": _t(language),
+        "take_id": _t(take_id),
+        "attempt_id": _t(attempt_id),
+        "request_hash": _t(request_hash),
+        "in_sec": in_sec,
+        "out_sec": out_sec,
+        "cost": cost,
+        "evidence": _t(evidence),
     }
     pipeline_dir(prod, create=True)
     feedback = read_feedback(prod)
@@ -296,6 +317,38 @@ def experience_for(profile_id: str, limit: int = MAX_EXPERIENCE) -> list[str]:
         raw = line.strip()
         if raw.startswith("- ") and "→" in raw:
             out.append(raw[2:].strip())
+    return out
+
+
+def search_outcomes(
+    prod: Path,
+    *,
+    verdict: str = "",
+    shot_id: str = "",
+    tag: str = "",
+    model: str = "",
+    task_kind: str = "",
+) -> list[dict]:
+    """Filter recorded accept/reject evidence. Does not invent blanket rules."""
+    items = [item for item in (read_feedback(prod).get("items") or []) if isinstance(item, dict)]
+    want_verdict = _t(verdict).lower()
+    want_shot = _t(shot_id)
+    want_tag = _t(tag).lower()
+    want_model = _t(model)
+    want_kind = _t(task_kind)
+    out = []
+    for item in items:
+        if want_verdict and _t(item.get("verdict")).lower() != want_verdict:
+            continue
+        if want_shot and _t(item.get("shot_id")) != want_shot:
+            continue
+        if want_tag and want_tag not in normalize_tags(item.get("tags")):
+            continue
+        if want_model and want_model not in {_t(item.get("model")), _t(item.get("profile_id"))}:
+            continue
+        if want_kind and _t(item.get("task_kind")) != want_kind:
+            continue
+        out.append(item)
     return out
 
 

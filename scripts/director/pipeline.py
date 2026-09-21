@@ -992,6 +992,7 @@ def compile_packages_from_specs(
         still_refs,
         video_mode,
     )
+    from .control_path import control_note
     from .show_policy import load_show_policy
     from .video_profiles import get_profile
 
@@ -1319,6 +1320,7 @@ def compile_packages_from_specs(
                     if target_model in {"seedance_2_5", "minimax_h3", "wan_3"}
                     else "first_frame_may_include_refs"
                 ),
+                "control": control_note(table_shot or spec),
             })
             continue
         refs = still_refs(prod, legacy) if legacy else []
@@ -1465,31 +1467,63 @@ def reject_to(prod: Path, *, from_agent: str, send_back_to: str, reason: str, ev
     save_approvals(prod, approvals)
     return {"ok": True, "ticket": ticket, "reject_to": send_back_to}
 
-def duration_for_shot(prod: Path, shot_id: str, fallback: float) -> float:
-    specs = read_artifact(prod, "shot_specs.json")
+def duration_for_shot(prod: Path, shot_id: str, fallback: float, episode: Any = 1) -> float:
+    specs = read_artifact(prod, episode_artifact_name("shot_specs.json", episode)) or read_artifact(prod, "shot_specs.json")
     for spec in specs.get("shot_specs") or []:
         if spec.get("shot_id") == shot_id:
             try:
                 return float(spec.get("duration_sec") or fallback)
             except (TypeError, ValueError):
                 return fallback
-    cut = read_artifact(prod, "cut.json")
+    cut = read_artifact(prod, episode_artifact_name("cut.json", episode)) or read_artifact(prod, "cut.json")
     for item in cut.get("timeline") or []:
         if item.get("shot_id") == shot_id:
             try:
-                return max(0.1, float(item.get("out_point") or fallback) - float(item.get("in_point") or 0))
+                out = item.get("out_sec", item.get("out_point") or fallback)
+                inn = item.get("in_sec", item.get("in_point") or 0)
+                return max(0.1, float(out) - float(inn or 0))
             except (TypeError, ValueError):
                 return fallback
     return fallback
 
-def default_cut_from_specs(prod: Path, shot_ids: list[str]) -> dict:
-    specs = {item.get("shot_id"): item for item in (read_artifact(prod, "shot_specs.json").get("shot_specs") or [])}
+def default_cut_from_specs(prod: Path, shot_ids: list[str], episode: Any = 1) -> dict:
+    from .takes import episode_export_rel, episode_key, selected_take_id
+
+    specs = {
+        item.get("shot_id"): item
+        for item in (
+            (read_artifact(prod, episode_artifact_name("shot_specs.json", episode)) or read_artifact(prod, "shot_specs.json")).get("shot_specs") or []
+        )
+    }
     timeline = []
+    ep = episode_key(episode)
     for sid in shot_ids:
         spec = specs.get(sid) or {}
         duration = float(spec.get("duration_sec") or 4)
-        timeline.append({"shot_id": sid, "in_point": 0, "out_point": duration, "used": True})
-    return {"episode_no": 1, "timeline": timeline, "dropped_shot_ids": [], "final_file": "06-export/ep01.mp4", "hook_landed": True, "cliffhanger_landed": True, "status": "draft"}
+        take_id = selected_take_id(prod, sid, episode)
+        timeline.append({
+            "shot_id": sid,
+            "take_id": take_id,
+            "in_point": 0,
+            "out_point": duration,
+            "in_sec": 0,
+            "out_sec": duration,
+            "audio_in_sec": 0,
+            "audio_out_sec": duration,
+            "audio_take_id": take_id,
+            "used": True,
+        })
+    return {
+        "episode_no": episode_number(episode),
+        "episode": ep,
+        "revision_id": episode_label(episode),
+        "timeline": timeline,
+        "dropped_shot_ids": [],
+        "final_file": episode_export_rel(episode),
+        "hook_landed": True,
+        "cliffhanger_landed": True,
+        "status": "draft",
+    }
 
 def seed_pipeline_drafts(prod: Path, force: bool = False) -> dict:
     written = []

@@ -74,6 +74,7 @@ class ShowPolicy:
     art_direction: str = "digital_cg"
     allow_internal_cuts: bool = False
     animatic_required: bool = False
+    scene_rehearsal_required: bool = False
     paper_long_is_warning: bool = True
     review_shots: dict[int, dict[str, list[str]]] = field(default_factory=dict)
     block_stills_from_episode: int = 0
@@ -132,6 +133,7 @@ def load_show_policy(prod: Optional[Path] = None) -> ShowPolicy:
     review: dict[int, dict[str, list[str]]] = {}
     block = 0
     animatic_required = False
+    scene_rehearsal_required = False
     allow_cuts = False
     if production_id == "010-gongpai":
         review = {int(k): dict(v) for k, v in GONGPAI_REVIEW_SHOTS.items()}
@@ -157,6 +159,9 @@ def load_show_policy(prod: Optional[Path] = None) -> ShowPolicy:
                     art = str(data["art_direction"])
                 if "animatic_required" in data:
                     animatic_required = bool(data["animatic_required"])
+                if "scene_rehearsal_required" in data:
+                    scene_rehearsal_required = bool(data["scene_rehearsal_required"])
+                    animatic_required = animatic_required or scene_rehearsal_required
                 if "allow_internal_cuts" in data:
                     allow_cuts = bool(data["allow_internal_cuts"])
                 if data.get("block_stills_from_episode"):
@@ -180,6 +185,7 @@ def load_show_policy(prod: Optional[Path] = None) -> ShowPolicy:
         art_direction=art,
         allow_internal_cuts=allow_cuts,
         animatic_required=animatic_required,
+        scene_rehearsal_required=scene_rehearsal_required,
         review_shots=review,
         block_stills_from_episode=block,
     )

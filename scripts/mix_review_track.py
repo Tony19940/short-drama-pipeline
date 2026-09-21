@@ -131,10 +131,15 @@ def main() -> None:
     clips = []
     for s in selected:
         sid = s.get("id") or s.get("shot_id")
-        mp4 = prod / shot_dir / f"{sid}.mp4"
-        if not mp4.exists() and shot_dir != "05-shots":
-            mp4 = prod / "05-shots" / f"{sid}.mp4"
-        if not mp4.exists():
+        try:
+            from director.takes import resolve_shot_media
+
+            mp4 = resolve_shot_media(prod, sid, args.episode)
+        except Exception:
+            mp4 = prod / shot_dir / f"{sid}.mp4"
+            if not mp4.exists() and shot_dir != "05-shots":
+                mp4 = prod / "05-shots" / f"{sid}.mp4"
+        if not Path(mp4).exists():
             raise SystemExit(f"missing {mp4}")
         clips.append((s, mp4, probe_duration(mp4)))
 

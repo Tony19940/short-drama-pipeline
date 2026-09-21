@@ -487,6 +487,36 @@ def _backend_for_item(item: dict) -> SeedanceArk:
     return SeedanceArk()
 
 
+def _ticket_task_id(dest: Path) -> str:
+    path = Path(dest).with_suffix(Path(dest).suffix + ".ark-task.json")
+    if not path.is_file():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(data.get("task_id") or "") if isinstance(data, dict) else ""
+
+
+def _record_plan_take(prod: Path, plan: dict, item: dict, dest: Path, request, record: Optional[dict], *, new_attempt: bool) -> None:
+    try:
+        from director.takes import record_render_take
+
+        record_render_take(
+            prod,
+            shot_id=item["shot_id"],
+            dest=dest,
+            request_hash=request.fingerprint() if request is not None else str(item.get("request_hash") or ""),
+            task_id=_ticket_task_id(dest),
+            episode=plan.get("episode") or 1,
+            revision_id=str(plan.get("episode_label") or episode_label(plan.get("episode") or 1) or ""),
+            qc={"backend": (record or {}).get("backend")},
+            new_attempt=new_attempt,
+        )
+    except (OSError, PermissionError):
+        pass
+
+
 def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
     load_dotenv()
     out_dir = prod / (plan.get("dest_dir") or episode_shot_dir(plan.get("episode") or 1))
@@ -500,6 +530,7 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
         request = VendorRequest.from_dict(item["vendor_request"]) if item.get("vendor_request") else None
         if skip_existing and request is not None and SeedanceArk.clip_matches_request(dest, request.fingerprint()):
             print(f"  {sid} reusable {item['dest']}, skip")
+            _record_plan_take(prod, plan, item, dest, request, record={"backend": "reuse"}, new_attempt=False)
             continue
         if skip_existing and item.get("exists") and request is None:
             raise SystemExit(f"{sid} existing clip has no confirmed request; refuse to skip")
@@ -554,21 +585,7 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
                 prod=prod,
             )
         item["clip"] = record
-        try:
-            from director.takes import persist_take, take_from_render
-
-            persist_take(
-                prod,
-                take_from_render(
-                    shot_id=sid,
-                    dest=dest,
-                    request_hash=str(item.get("request_hash") or ""),
-                    episode_id=str(plan.get("episode_label") or ""),
-                    qc={"backend": (record or {}).get("backend")},
-                ),
-            )
-        except OSError:
-            pass
+        _record_plan_take(prod, plan, item, dest, request, record, new_attempt=not skip_existing)
         extracted = prod / item["extracted_last"]
         _extract_last(dest, extracted)
         print(f"  extracted last {extracted.relative_to(prod)} (designed still untouched)")

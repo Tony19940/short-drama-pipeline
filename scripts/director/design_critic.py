@@ -105,23 +105,56 @@ def candidate_summary(candidate: dict, card: Optional[dict]) -> dict:
     }
 
 
+def _coverage_mix(shots: list[dict]) -> tuple[str, ...]:
+    return tuple(sorted({str(item.get("coverage_type") or "") for item in shots if item.get("coverage_type")}))
+
+
+def _duration_curve(shots: list[dict]) -> tuple[int, ...]:
+    curve = []
+    for item in shots:
+        try:
+            curve.append(int(round(float(item.get("duration_sec") or 0))))
+        except (TypeError, ValueError):
+            curve.append(0)
+    return tuple(curve)
+
+
+def schemes_are_distinct(first: dict, second: dict) -> bool:
+    """True when two versions differ by viewpoint or rhythm, not just temperature."""
+    a = list(first.get("shots") or [])
+    b = list(second.get("shots") or [])
+    if _coverage_mix(a) != _coverage_mix(b):
+        return True
+    if _duration_curve(a) != _duration_curve(b):
+        return True
+    pov_a = tuple(str(item.get("shot_job") or item.get("beat") or "") for item in a)
+    pov_b = tuple(str(item.get("shot_job") or item.get("beat") or "") for item in b)
+    return pov_a != pov_b
+
+
 def deterministic_pick(candidates: list[dict], card: Optional[dict]) -> int:
-    """No critic available: fewest warnings, then the shot landed & tightest, then the widest scale span."""
+    """No critic: pick by scene goals (the shot, viewpoint), not generic taste."""
     if not candidates:
         return 0
+    want_pov = ""
+    if isinstance(card, dict):
+        want_pov = str(card.get("pov") or "").strip().lower()
 
     def key(item: dict) -> tuple:
-        metrics = candidate_metrics(list(item.get("shots") or []), card, item.get("warnings") or [])
+        shots = list(item.get("shots") or [])
+        metrics = candidate_metrics(shots, card, item.get("warnings") or [])
+        style = str(item.get("style") or "").lower()
+        pov_hit = 0
+        if want_pov and ("pov" in style or any(str(s.get("coverage_type") or "") == "pov" for s in shots)):
+            pov_hit = 1
         return (
-            len(item.get("warnings") or []),
             0 if metrics.get("the_shot_landed") else 1,
-            0 if metrics.get("the_shot_tightest") else 1,
-            -int(metrics.get("scale_span") or 0),
-            -int(metrics.get("reactions_after_dialogue") or 0),
+            0 if pov_hit or not want_pov else 1,
+            -len({str(s.get("coverage_type") or "") for s in shots}),
+            len(item.get("warnings") or []),
         )
 
-    best = min(range(len(candidates)), key=lambda i: key(candidates[i]))
-    return best
+    return min(range(len(candidates)), key=lambda i: key(candidates[i]))
 
 
 def critic_errors(verdict: Any, count: int) -> list[str]:
@@ -193,7 +226,7 @@ def fallback_verdict(candidates: list[dict], card: Optional[dict], reason: str) 
     pick = deterministic_pick(candidates, card)
     return {
         "pick": pick,
-        "why": f"机器兜底：{reason}。按警告数、那一颗是否落地、景别跨度挑了第 {pick + 1} 版。",
+        "why": f"机器兜底：{reason}。按场戏目标（那一颗、视点），不是按警告最少或景别最花，挑了第 {pick + 1} 版。",
         "merge": "",
         "scores": [],
         "source": "deterministic",

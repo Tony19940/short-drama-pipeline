@@ -670,8 +670,10 @@ def compile_keyframe_prompt_zh(
     """
     shot = shot or {}
     from .frame_desc import description_sentence, normalize_item
+    from .scene_plan import performance_intent_of
     from .show_policy import still_style_close, still_style_opener
     from .still_t0 import first_still_text, last_still_text
+    intent = performance_intent_of(shot, spec)
 
     aspect = _spec_text(spec, "aspect_ratio") or str(shot.get("aspect") or shot.get("aspect_ratio") or "16:9")
     art = _spec_text(spec, "art_direction") or str(shot.get("art_direction") or "digital_cg")
@@ -743,6 +745,7 @@ def compile_keyframe_prompt_zh(
         f"连戏必须照做：{note.rstrip('。')}。首帧只守服装、在场、绑法；note 里的动作结果留给视频。" if note else "",
         lock_line,
         light_line,
+        (f"刺激：{str(intent.get('stimulus') or '').rstrip('。')}。" if intent.get("stimulus") else ""),
         first_still_action_line(action, shot, spec),
         first_still_forbid_line(action, shot, spec),
         closer,

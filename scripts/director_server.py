@@ -915,9 +915,10 @@ def api_review(slug: str, payload: Optional[dict] = Body(None)):
 
 
 @app.post("/api/productions/{slug}/assemble")
-def api_assemble(slug: str):
+def api_assemble(slug: str, payload: Optional[dict] = Body(None)):
     try:
-        return assemble_episode(get_prod(slug))
+        episode = (payload or {}).get("episode") or 1
+        return assemble_episode(get_prod(slug), episode)
     except (PermissionError, RuntimeError) as exc:
         return fail(exc, 409 if isinstance(exc, PermissionError) else 500)
 

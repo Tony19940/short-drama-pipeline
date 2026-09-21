@@ -14,8 +14,10 @@ from .design_critic import (
     fallback_verdict,
     normalize_verdict,
     render_candidates_md,
+    schemes_are_distinct,
     styles_for,
 )
+from .scene_plan import scene_plan_of, set_spatial_brief
 from .direction import (
     SCENE_CARD_SCHEMA,
     normalize_scene_card,
@@ -331,6 +333,7 @@ def _design_base_context(prod: Path, target_model: Optional[str] = None) -> dict
             "action": scene.get("action"),
             "dialogue": scene.get("dialogue") or [],
             "key_sounds": scene.get("key_sounds") or [],
+            "scene_plan": scene_plan_of(scene),
         })
     sets = load_json(prod, sets_rel(ep), {"sets": []})
     if ep != 1 and not (sets.get("sets") or []):
@@ -350,7 +353,7 @@ def _design_base_context(prod: Path, target_model: Optional[str] = None) -> dict
             "episode_outline": (writer.get("episode_outline") or [])[:1],
             "scenes": scenes,
         },
-        "sets": [{"id": s.get("id"), "name": s.get("name"), "axis": s.get("axis"), "notes": s.get("notes")} for s in sets.get("sets") or []],
+        "sets": [set_spatial_brief(s) for s in sets.get("sets") or []],
         "characters": characters,
         "target_profile": profile_brief(get_profile(model)),
         "schema": SHOT_TABLE_SCHEMA,
@@ -599,6 +602,7 @@ def _candidate_context(base: dict, header: dict, scene: dict, card: Optional[dic
         "scene_plan": plan,
     }
     ctx["scene"] = scene
+    ctx["scene_plan"] = scene_plan_of(scene)
     ctx["scene_card"] = card
     ctx["visual_grammar"] = grammar
     ctx["case_cards"] = cases_for(_scene_blob(scene) + " " + " ".join((card or {}).get("case_cards") or []))
@@ -961,6 +965,8 @@ def _run_design_table_body(
                 accepted.append(result)
         if not accepted:
             raise PermissionError(f"design {sid}: {n_candidates} 版都没过机器校验，看 .pipeline/design.{sid}.*.invalid.json")
+        if n_candidates >= 2 and len(accepted) >= 2 and not schemes_are_distinct(accepted[0], accepted[1]):
+            accepted[0].setdefault("warnings", []).append(f"{sid} 前两版视点/节奏几乎相同，不算两个方案")
         verdict = _run_critic(prod, sid=sid, scene=scene, card=card, grammar=grammar, candidates=accepted, profile=profile)
         pick = int(verdict.get("pick", 0) or 0)
         chosen = accepted[pick]["shots"]
