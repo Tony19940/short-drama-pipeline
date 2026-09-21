@@ -131,15 +131,32 @@ class MediaAndReuse(unittest.TestCase):
 
 
 class SnapshotIntegrity(unittest.TestCase):
-    def test_media_change_before_plan_is_detected(self) -> None:
+    def test_media_change_before_plan_still_uses_frozen_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             prod = Path(raw)
             req = _request(prod)
+            confirmed = req.media_hash_map()[req.first_frame]
             _, rel = _write_snap(prod, req)
             (prod / req.first_frame).write_bytes(b"changed before planning")
             plan = renderer.plan_from_snapshot(prod, rel)
-            self.assertFalse(plan["shots"][0]["ok"])
-            self.assertIn("changed since confirm", " ".join(plan["shots"][0]["errors"]))
+            self.assertTrue(plan["shots"][0]["ok"], plan["shots"][0]["errors"])
+            os.environ["ARK_API_KEY"] = os.environ.get("ARK_API_KEY") or "offline"
+            backend = SeedanceArk()
+            seen: list[str] = []
+
+            def render_spy(image, prompt, seconds, dest, **kw):
+                import base64
+
+                body = backend._data_url(image)
+                seen.append(hashlib.sha256(base64.b64decode(body.split(",", 1)[1])).hexdigest())
+
+            backend.render = render_spy  # type: ignore[method-assign]
+            frozen = type(req).from_dict(plan["shots"][0]["vendor_request"])
+            try:
+                backend.render_request(frozen, prod / "SH001.mp4", prod=prod)
+            except (ValueError, PermissionError, RuntimeError):
+                pass
+            self.assertEqual(seen, [confirmed])
 
     def test_media_change_after_plan_must_not_reach_submission(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

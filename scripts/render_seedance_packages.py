@@ -397,8 +397,7 @@ def plan_from_snapshot(
     expected_shot_ids: Optional[list[str]] = None,
 ) -> dict:
     """Paid path: execute the confirmed requests. Do not recompile packages."""
-    from director.fingerprint import load_confirmed_snapshot, snapshot_requests
-    from director.vendor_request import media_hash
+    from director.fingerprint import load_confirmed_snapshot, read_confirmed_media_bytes, snapshot_requests
 
     snap = load_confirmed_snapshot(
         prod,
@@ -416,11 +415,10 @@ def plan_from_snapshot(
             continue
         errors: list[str] = []
         for rel, digest in request.media_hash_map().items():
-            live = media_hash(prod, rel)
-            if digest and live != digest:
-                errors.append(f"{rel} changed since confirm")
-            if rel and not (prod / rel).exists():
-                errors.append(f"missing {rel}")
+            try:
+                read_confirmed_media_bytes(prod, rel, digest)
+            except RuntimeError as exc:
+                errors.append(str(exc))
         dest_rel = f"{dest_dir}/{request.shot_id}.mp4"
         item = {
             "shot_id": request.shot_id,

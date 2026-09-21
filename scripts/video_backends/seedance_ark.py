@@ -22,12 +22,19 @@ from typing import Optional
 import requests
 
 
-def _aspect_of(image: Path) -> str:
+def _aspect_of(image: Path, *, verified: dict[str, bytes] | None = None) -> str:
     try:
         from PIL import Image
+        import io
 
-        with Image.open(image) as im:
-            w, h = im.size
+        cache = verified or {}
+        key = str(Path(image).resolve())
+        if key in cache:
+            with Image.open(io.BytesIO(cache[key])) as im:
+                w, h = im.size
+        else:
+            with Image.open(image) as im:
+                w, h = im.size
         return "16:9" if w >= h else "9:16"
     except Exception:
         return "16:9"
@@ -38,7 +45,9 @@ def _truthy(name: str, default: str = "0") -> bool:
 
 
 FACE_BLOCK_CODE = "InputImageSensitiveContentDetected.PrivacyInformation"
-MP4_PROBE_VERSION = "mp4-probe-v1"
+# v1 was metadata-only. v2 requires an actual video-stream decode.
+MP4_PROBE_VERSION = "mp4-decode-v1"
+MP4_DECODE_TIMEOUT_SEC = 45
 
 
 def probe_mp4(path: Path) -> dict:
@@ -95,6 +104,38 @@ def probe_mp4(path: Path) -> dict:
     }
 
 
+def decode_mp4_stream(path: Path) -> bool:
+    """True only when the first video stream actually decodes. Metadata is not enough."""
+    dest = Path(path)
+    if not dest.is_file() or dest.stat().st_size <= 1024:
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-v",
+                "error",
+                "-xerror",
+                "-err_detect",
+                "explode",
+                "-i",
+                str(dest),
+                "-map",
+                "0:v:0",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=MP4_DECODE_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def looks_like_mp4_file(path: Path) -> bool:
     dest = Path(path)
     if not dest.is_file() or dest.stat().st_size <= 1024:
@@ -102,7 +143,9 @@ def looks_like_mp4_file(path: Path) -> bool:
     head = dest.read_bytes()[:32]
     if b"ftyp" not in head:
         return False
-    return bool(probe_mp4(dest))
+    if not probe_mp4(dest):
+        return False
+    return decode_mp4_stream(dest)
 
 
 class SeedanceFaceBlock(RuntimeError):
@@ -300,13 +343,17 @@ class SeedanceArk:
 
     @staticmethod
     def clip_matches_request(dest: Path, request_hash: str) -> bool:
-        if not looks_like_mp4_file(dest):
+        path = Path(dest)
+        if not path.is_file() or path.stat().st_size <= 1024:
             return False
-        path = dest.with_suffix(dest.suffix + ".ark-task.json")
-        if not path.is_file():
+        head = path.read_bytes()[:32]
+        if b"ftyp" not in head:
+            return False
+        ticket_path = path.with_suffix(path.suffix + ".ark-task.json")
+        if not ticket_path.is_file():
             return False
         try:
-            ticket = json.loads(path.read_text(encoding="utf-8"))
+            ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
         if not isinstance(ticket, dict):
@@ -321,7 +368,30 @@ class SeedanceArk:
             return False
         from director.vendor_request import sha256_file
 
-        return output_hash == sha256_file(dest)
+        if output_hash != sha256_file(path):
+            return False
+        # Current validator + matching hash: trust the prior full check.
+        if str(ticket.get("validator") or "") == MP4_PROBE_VERSION:
+            return True
+        # Old tickets (e.g. mp4-probe-v1) must pass decode before reuse.
+        if not looks_like_mp4_file(path):
+            return False
+        ticket["validator"] = MP4_PROBE_VERSION
+        ticket["output_probe"] = probe_mp4(path)
+        ticket["status"] = "verified"
+        tmp = ticket_path.with_name(ticket_path.name + ".tmp")
+        tmp.write_text(json.dumps(ticket, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(ticket_path)
+        return True
+
+    def _media_ready(self, path: Path | None) -> bool:
+        """True when verified bytes are bound, or the working path exists for legacy calls."""
+        if path is None:
+            return False
+        cache = getattr(self, "_verified_media", None) or {}
+        if cache:
+            return str(Path(path).resolve()) in cache
+        return Path(path).is_file()
 
     def build_payload(
         self,
@@ -343,7 +413,7 @@ class SeedanceArk:
         audio = self.generate_audio if generate_audio is None else bool(generate_audio)
         mark = self.watermark if watermark is None else bool(watermark)
         if mode in {"extend", "edit"}:
-            if source_video is None or not Path(source_video).is_file():
+            if not self._media_ready(source_video):
                 raise RuntimeError(f"{mode} requires reference_video")
             duration = -1 if mode == "edit" else self.clamp_duration(seconds)
             payload = {
@@ -363,12 +433,15 @@ class SeedanceArk:
                 payload["omni_reference_task_type"] = mode
             return payload
         if mode == "reference":
-            content: list[dict] = [{"type": "text", "text": prompt}]
-            for ref in refs or []:
-                if Path(ref).is_file():
-                    content.append(self._image_item(Path(ref), "reference_image"))
-            if len(content) < 2:
+            listed = [Path(ref) for ref in (refs or [])]
+            if not listed:
                 raise RuntimeError("reference task needs at least one reference_image")
+            missing = [str(ref) for ref in listed if not self._media_ready(ref)]
+            if missing:
+                raise RuntimeError("reference media missing from confirmed set: " + ", ".join(missing))
+            content: list[dict] = [{"type": "text", "text": prompt}]
+            for ref in listed:
+                content.append(self._image_item(ref, "reference_image"))
             payload = {
                 "model": self.model,
                 "content": content,
@@ -382,25 +455,31 @@ class SeedanceArk:
             if self._is_25():
                 payload["omni_reference_task_type"] = "reference"
             return payload
+        if not self._media_ready(image):
+            raise RuntimeError(f"first_frame missing from confirmed set: {image}")
         duration = self.clamp_duration(seconds)
         content = [
             {"type": "text", "text": prompt},
             self._image_item(image, "first_frame"),
         ]
-        use_last = mode == "flf" and last_frame is not None and last_frame.exists()
-        if use_last:
+        if mode == "flf":
+            if last_frame is None or not self._media_ready(last_frame):
+                raise RuntimeError(f"flf requires last_frame: {last_frame}")
             content.append(self._image_item(last_frame, "last_frame"))
         elif mode == "i2v" and not self._is_25():
             for ref in (refs or [])[:7]:
-                if ref.resolve() == image.resolve():
+                path = Path(ref)
+                if path.resolve() == Path(image).resolve():
                     continue
-                content.append(self._image_item(ref, "reference_image"))
+                if not self._media_ready(path):
+                    raise RuntimeError(f"reference_image missing from confirmed set: {path}")
+                content.append(self._image_item(path, "reference_image"))
         if ratio:
             submit_ratio = ratio
         elif self._is_25() and mode in {"i2v", "flf"}:
             submit_ratio = "adaptive"
         else:
-            submit_ratio = _aspect_of(image)
+            submit_ratio = _aspect_of(image, verified=getattr(self, "_verified_media", None) or None)
         return {
             "model": self.model,
             "content": content,
