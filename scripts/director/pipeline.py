@@ -877,6 +877,7 @@ def package_gen_mode(spec: dict, shot: dict, profile: Optional[dict] = None) -> 
 
 
 _EPISODE_TOKEN = re.compile(r"^(?:ep)?(\d{1,2})(?:[-_](.+))?$", re.I)
+_ARTIFACT_LABEL = re.compile(r"^(?P<stem>.+)\.(?P<label>ep\d{2}(?:-[A-Za-z0-9]+)?)\.json$", re.I)
 
 
 def parse_episode(episode: Any = 1) -> tuple[int, str]:
@@ -930,6 +931,17 @@ def episode_artifact_name(base: str, episode: Any = 1) -> str:
     return f"{stem}.{label}.{ext}"
 
 
+def parse_artifact_filename(name: str) -> tuple[str, Any]:
+    """Map `shot_list.ep02.json` / `shot_list.ep01-v2.json` back to (kind, episode token)."""
+    raw = _text(name)
+    if not raw.endswith(".json"):
+        raw = raw + ".json"
+    match = _ARTIFACT_LABEL.fullmatch(raw)
+    if not match:
+        return raw, 1
+    return f"{match.group('stem')}.json", match.group("label")
+
+
 def episode_frame_dir(episode: Any = 1) -> str:
     """EP01 live lock → 04-frames/; EP02 → 04-frames/ep02/; ep01-v2 → 04-frames/ep01-v2/."""
     label = episode_label(episode)
@@ -974,6 +986,7 @@ def compile_packages_from_specs(
         still_refs,
         video_mode,
     )
+    from .show_policy import load_show_policy
     from .video_profiles import get_profile
 
     shot_list = table if table is not None else read_artifact(prod, "shot_list.json")
@@ -1085,13 +1098,25 @@ def compile_packages_from_specs(
                 paper_sec = float(raw_dur)
             except (TypeError, ValueError):
                 paper_sec = float(min_sec)
-            render_sec = int(round(max(float(min_sec), min(float(max_sec), paper_sec))))
+            if paper_sec > max_sec:
+                compile_errors.append(
+                    f"{sid} duration {paper_sec:g}s exceeds {target_model} max {max_sec}s; replan, do not clamp"
+                )
+                render_sec = int(round(paper_sec))
+            elif paper_sec < min_sec:
+                render_sec = int(min_sec)
+            else:
+                render_sec = int(round(paper_sec))
             duration_sec = paper_sec if shot_list.get("keep_paper_duration") else render_sec
             # Who is in frame (display names), who speaks, what each looks like.
             in_frame = [_text(name) for name in (table_shot.get("characters") or []) if _text(name)]
             if not in_frame and state:
                 in_frame = [cast.get(cid, cid) for cid, item in state["characters"].items() if item.get("in_frame", True)]
             lines = shot_dialogue_items(spec, table_shot)
+            if len(lines) > 2:
+                warnings.append(
+                    f"{sid} has {len(lines)} dialogue lines; Seedance line budget is 2 — replan, do not truncate"
+                )
             speakers = [item["character"] for item in lines if item.get("character")]
             # dialogue_delivery is the per-shot switch: on_camera = the model speaks it (native),
             # post = dubbed later. Under a native table a `post` shot opts out to post_dub.
@@ -1132,9 +1157,13 @@ def compile_packages_from_specs(
                 acting_lines = compile_acting_zh(
                     table_shot, spec, in_frame=in_frame, speakers=speakers, override=(frame_desc or {}).get("acting")
                 )
+            policy = load_show_policy(prod)
+            prompt_spec = dict(spec)
+            prompt_spec.setdefault("aspect_ratio", shot_list.get("aspect") or policy.aspect)
+            prompt_spec.setdefault("art_direction", policy.art_direction)
             if lang == "zh":
                 image_prompt = compile_keyframe_prompt_zh(
-                    spec, table_shot, frame_desc=frame_desc, slot="first", geo_layout=geo_layout, descriptors=descriptors
+                    prompt_spec, table_shot, frame_desc=frame_desc, slot="first", geo_layout=geo_layout, descriptors=descriptors
                 )
                 if len(refs) > 1 and not has_reference_roles(image_prompt):
                     image_prompt += compile_reference_roles_zh(refs, assets)
@@ -1182,7 +1211,7 @@ def compile_packages_from_specs(
                 pov_id = pov_cast_id(shot_list, writer)
                 pov_state = state["characters"].get(pov_id) or next(iter(state["characters"].values()), None)
             hard_list = hard_items_for_state(hard, episode_no, state) if state else []
-            from .codex_stills import StillPackError, missing_costume_state_files, pack_codex_still_refs
+            from .codex_stills import StillPackError, last_still_pack_report, missing_costume_state_files, pack_codex_still_refs
             from .prompts import rewrite_still_prompt
 
             for msg in missing_costume_state_files(prod, refs, assets):
@@ -1209,6 +1238,9 @@ def compile_packages_from_specs(
                         episode=episode_no,
                         strict_existing=False,
                     )
+                    report = last_still_pack_report()
+                    if report.get("dropped"):
+                        warnings.append(f"{sid} {report.get('risk') or 'still-ref over budget'}")
                 except StillPackError as exc:
                     compile_errors.append(f"{sid} {exc}")
             still_image_prompt = rewrite_still_prompt(image_prompt, still_files, assets) if still_files else ""
@@ -1227,7 +1259,7 @@ def compile_packages_from_specs(
                 **(
                     {
                         "last_image_prompt": compile_keyframe_prompt_zh(
-                            spec, table_shot, frame_desc=frame_desc, slot="last"
+                            prompt_spec, table_shot, frame_desc=frame_desc, slot="last"
                         )
                     }
                     if lang == "zh" and plan == "first_last"
@@ -1268,6 +1300,7 @@ def compile_packages_from_specs(
                 "paper_duration_sec": paper_sec,
                 "render_duration_sec": render_sec,
                 "seedance_min_sec": min_sec,
+                "seedance_max_sec": max_sec,
                 "confirmed": False,
                 "generate_audio": True,
                 "ref_exclusivity": (

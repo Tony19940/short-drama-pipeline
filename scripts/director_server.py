@@ -210,43 +210,50 @@ def api_pipeline_put(slug: str, name: str, payload: Optional[dict] = Body(None))
     payload = payload_dict(payload)
     if not name.endswith(".json"):
         name = name + ".json"
-    if name == "shot_list.json" and str(payload.get("schema") or "") == "shot-table-v2":
-        from director.pipeline import read_artifact
+    from director.pipeline import episode_artifact_name, parse_artifact_filename, read_artifact
+
+    kind, episode = parse_artifact_filename(name)
+    prod = get_prod(slug)
+    if kind == "shot_list.json" and str(payload.get("schema") or "") == "shot-table-v2":
         from director.shot_table import sanitize_shot_table
 
-        payload = sanitize_shot_table(payload, writer=read_artifact(get_prod(slug), "writer.json"))
+        payload = sanitize_shot_table(payload, writer=read_artifact(prod, episode_artifact_name("writer.json", episode)))
     validators = {
         "novel.json": validate_novel,
         "writer.json": validate_writer,
-        "assets.json": lambda data: validate_assets(data, get_prod(slug)),
-        "shot_list.json": lambda data: validate_shot_list(data, **_shot_list_context(get_prod(slug), data)),
-        "scene_cards.json": lambda data: _validate_scene_cards_artifact(data, get_prod(slug)),
-        "frame_descriptions.json": lambda data: _validate_frame_desc_artifact(data, get_prod(slug)),
-        "shot_specs.json": lambda data: validate_shot_specs(data, __import__("director.pipeline", fromlist=["read_artifact"]).read_artifact(get_prod(slug), "writer.json")),
-        "gen_packages.json": lambda data: validate_packages(data, __import__("director.pipeline", fromlist=["read_artifact"]).read_artifact(get_prod(slug), "assets.json"), __import__("director.pipeline", fromlist=["read_artifact"]).read_artifact(get_prod(slug), "shot_specs.json")),
+        "assets.json": lambda data: validate_assets(data, prod),
+        "shot_list.json": lambda data: validate_shot_list(data, **_shot_list_context(prod, data, episode)),
+        "scene_cards.json": lambda data: _validate_scene_cards_artifact(data, prod),
+        "frame_descriptions.json": lambda data: _validate_frame_desc_artifact(data, prod),
+        "shot_specs.json": lambda data: validate_shot_specs(data, read_artifact(prod, episode_artifact_name("writer.json", episode))),
+        "gen_packages.json": lambda data: validate_packages(
+            data,
+            read_artifact(prod, "assets.json"),
+            read_artifact(prod, episode_artifact_name("shot_specs.json", episode)),
+        ),
         "keyframes.json": validate_keyframes,
         "clips.json": __import__("director.pipeline", fromlist=["validate_clips"]).validate_clips,
         "cut.json": validate_cut,
     }
-    validator = validators.get(name)
+    validator = validators.get(kind)
     if validator:
         try:
             raise_if(validator(payload))
         except PermissionError as exc:
             return fail(exc, 409)
-    written = write_artifact(get_prod(slug), name, payload)
-    if name == "shot_list.json" and str(payload.get("schema") or "") == "shot-table-v2":
-        _rerender_shot_table(get_prod(slug), written)
+    written = write_artifact(prod, name, payload)
+    if kind == "shot_list.json" and str(payload.get("schema") or "") == "shot-table-v2":
+        _rerender_shot_table(prod, written)
     return written
 
 
-def _shot_list_context(prod: Path, data: dict) -> dict:
+def _shot_list_context(prod: Path, data: dict, episode=1) -> dict:
     """A v2 table saved from the studio is checked against the same writer / sets / look / profile as the agent's."""
     if str(data.get("schema") or "") != "shot-table-v2":
         return {}
     from director.shot_table import table_context
 
-    check = table_context(prod, str(data.get("target_model") or "") or None)
+    check = table_context(prod, str(data.get("target_model") or "") or None, episode=episode)
     return {"writer": check["writer"], "sets": check["sets"], "profile": check["profile"], "look_text": check["look_text"], "prod": prod}
 
 
@@ -859,6 +866,7 @@ def api_render_prepare(slug: str, payload: Optional[dict] = Body(None)):
             get_prod(slug),
             payload.get("shotIds"),
             bool(payload.get("reviewTrack")),
+            payload.get("episode") or 1,
         )
     except (PermissionError, ValueError) as exc:
         return fail(exc, 409 if isinstance(exc, PermissionError) else 400)
@@ -873,6 +881,7 @@ def api_render(slug: str, payload: Optional[dict] = Body(None)):
             payload.get("fingerprint"),
             payload.get("shotIds"),
             bool(payload.get("reviewTrack")),
+            payload.get("episode") or 1,
         )
     except (PermissionError, ValueError) as exc:
         return fail(exc, 409 if isinstance(exc, PermissionError) else 400)

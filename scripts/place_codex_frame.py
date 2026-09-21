@@ -31,7 +31,9 @@ if str(SCRIPTS) not in sys.path:
 
 from PIL import Image
 
+from director.defaults import production_aspect
 from director.paths import productions_root, safe_under
+from director.review_state import REVIEW_STATES, can_use_as_parent, default_place_state, normalize_review_state
 from place_codex_asset import next_version
 
 SHOT_ID = re.compile(r"^SH\d{3}$")
@@ -41,7 +43,16 @@ SLOTS = {
     "last": "{shot}-last.jpg",
 }
 PARENT_ROOTS = ("02-assets/", "04-frames/")
-FRAME_SIZE = (1672, 941)
+ASPECT_PIXELS = {
+    "16:9": (1672, 941),
+    "9:16": (941, 1672),
+}
+FRAME_SIZE = ASPECT_PIXELS["16:9"]
+ASPECT_TOLERANCE = 0.04
+
+
+class AspectMismatchError(ValueError):
+    """Source pixels are not the declared aspect and --crop was not given."""
 
 
 def episode_frame_dir(episode=1) -> str:
@@ -118,20 +129,13 @@ def previous_same_scene_frame(prod: Path, shot_id: str, episode=1) -> Optional[s
 
 
 def previous_same_scene_parent(prod: Path, shot_id: str, episode=1) -> Optional[str]:
-    """Parent for this shot's first frame: same-scene previous `-last`, else passing first."""
-    prev = previous_same_scene_shot(prod, shot_id, episode)
-    if not prev:
-        return None
-    pid = _t(prev.get("shot_id") or prev.get("id"))
-    if not SHOT_ID.match(pid):
-        return None
-    last = dest_rel(pid, "last", episode)
-    last_path = safe_under(prod, last)
-    if last_path.exists():
-        gate = identity_gate_of(prod, last)
-        if gate not in {"fail", "awaiting_user"}:
-            return last
-    return previous_passing_first_frame(prod, shot_id, episode)
+    """Parent for this shot's first frame: same-setup previous `-last`, else passing first.
+
+    A new camera setup does not inherit the previous shot's composition.
+    """
+    from director.setup_anchors import resolve_continuity_parent
+
+    return resolve_continuity_parent(prod, shot_id, episode)
 
 
 def parent_chain_errors(prod: Path, shots: Optional[list] = None, episode=1) -> list[str]:
@@ -167,9 +171,13 @@ def parent_chain_errors(prod: Path, shots: Optional[list] = None, episode=1) -> 
             continue
         if gate == "pass":
             if is_scene_master(parent) and not meta.get("allow_master"):
-                errors.append(
-                    f"{sid} parent is scene master ({parent}); previous same-scene frame is {prev_first}"
-                )
+                from director.setup_anchors import same_setup, shot_row
+
+                current = shot_row(prod, sid, episode)
+                if current is None or same_setup(prev, current):
+                    errors.append(
+                        f"{sid} parent is scene master ({parent}); previous same-setup frame is {prev_first}"
+                    )
         elif gate in {"fail", "awaiting_user"} and parent == prev_first:
             errors.append(f"{sid} parent is {prev_first} with identity_gate={gate}; should be scene master")
     return errors
@@ -183,15 +191,39 @@ def dest_rel(shot_id: str, slot: str, episode=1) -> str:
     return episode_frame_dir(episode) + "/" + SLOTS[slot].format(shot=shot_id)
 
 
-def write_frame_jpeg(src: Path, dest: Path) -> None:
+def frame_pixel_size(aspect: str = "16:9") -> tuple[int, int]:
+    return ASPECT_PIXELS.get(str(aspect or "16:9"), ASPECT_PIXELS["16:9"])
+
+
+def _center_crop_to_aspect(image: Image.Image, target_ratio: float) -> Image.Image:
+    w, h = image.size
+    if w <= 0 or h <= 0:
+        return image
+    src_ratio = w / h
+    if src_ratio > target_ratio:
+        new_w = max(1, int(round(h * target_ratio)))
+        left = max(0, (w - new_w) // 2)
+        return image.crop((left, 0, left + new_w, h))
+    new_h = max(1, int(round(w / target_ratio)))
+    top = max(0, (h - new_h) // 2)
+    return image.crop((0, top, w, top + new_h))
+
+
+def write_frame_jpeg(src: Path, dest: Path, *, aspect: str = "16:9", crop: bool = False) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.open(src)
-    if image.mode in {"RGBA", "LA", "P"}:
-        image = image.convert("RGB")
-    elif image.mode != "RGB":
-        image = image.convert("RGB")
-    if image.size != FRAME_SIZE:
-        image = image.resize(FRAME_SIZE, Image.Resampling.LANCZOS)
+    with Image.open(src) as raw:
+        image = raw.convert("RGB") if raw.mode != "RGB" else raw.copy()
+    target = frame_pixel_size(aspect)
+    target_ratio = target[0] / target[1]
+    src_ratio = image.size[0] / image.size[1] if image.size[1] else target_ratio
+    if abs(src_ratio - target_ratio) > ASPECT_TOLERANCE:
+        if not crop:
+            raise AspectMismatchError(
+                f"源图 {image.size[0]}×{image.size[1]} 不是 {aspect}，加 --crop 裁切，禁止拉伸"
+            )
+        image = _center_crop_to_aspect(image, target_ratio)
+    if image.size != target:
+        image = image.resize(target, Image.Resampling.LANCZOS)
     image.save(dest, format="JPEG", quality=92, optimize=True)
 
 
@@ -237,13 +269,17 @@ def resolve_parent(
     if not rel.startswith(PARENT_ROOTS):
         raise ValueError("父图只能来自 02-assets/（空镜、护照）或 04-frames/（已锁帧）")
     if rel.startswith("04-frames/"):
-        gate = identity_gate_of(prod, rel)
-        if gate in {"fail", "awaiting_user"}:
-            raise ValueError(f"父图 {rel} identity_gate={gate}，不能续。改用本场空镜 --allow-master")
+        gate = identity_gate_of(prod, rel) or "unknown"
+        own_first = dest_rel(shot_id, "first", episode=episode)
+        if slot == "last" and rel == own_first:
+            if gate in {"fail", "awaiting_user"}:
+                raise ValueError(f"父图 {rel} identity_gate={gate}，不能续。改用本场空镜 --allow-master")
+        elif not can_use_as_parent(gate):
+            raise ValueError(f"父图 {rel} identity_gate={gate}，未通过不能续。改用本场空镜 --allow-master")
     if slot == "first" and is_scene_master(rel) and not allow_master:
         prev = previous_same_scene_parent(prod, shot_id, episode)
         if prev:
-            raise ValueError(f"已有同场上一镜 {prev}，首帧不要用空镜 master。需要空镜时加 --allow-master")
+            raise ValueError(f"已有同机位上一镜 {prev}，首帧不要用空镜 master。换机位或需要空镜时加 --allow-master")
     path = safe_under(prod, rel)
     if not path.exists():
         raise FileNotFoundError(f"父图不存在：{rel}")
@@ -264,6 +300,8 @@ def place(
     allow_master: bool = False,
     identity_gate: Optional[str] = None,
     checks: Optional[dict] = None,
+    aspect: Optional[str] = None,
+    crop: bool = False,
 ) -> dict:
     rel = dest_rel(shot_id, slot, episode=episode)
     prod = prod.resolve()
@@ -276,29 +314,30 @@ def place(
         old_meta = sidecar_path(dest)
         if old_meta.exists():
             shutil.move(str(old_meta), str(sidecar_path(previous)))
-    write_frame_jpeg(src, dest)
+    write_frame_jpeg(src, dest, aspect=aspect or production_aspect(prod), crop=crop)
     previous_rel = str(previous.resolve().relative_to(prod)) if previous else None
-    gate = _t(identity_gate)
-    if not gate and slot == "first":
-        gate = "pass"
-    if gate and gate not in {"pass", "fail", "awaiting_user"}:
-        raise ValueError("identity_gate 只能是 pass / fail / awaiting_user")
+    gate = normalize_review_state(identity_gate, default=default_place_state())
+    dest_hash = _sha256(dest)
+    src_hash = _sha256(src)
+    evidence = dict(checks) if isinstance(checks, dict) else {}
+    evidence.setdefault("image_sha256", dest_hash)
     meta = {
         "shot": shot_id,
         "slot": slot,
         "dest": rel,
         "parent": parent_rel,
         "src": src.name,
-        "src_sha256": _sha256(src),
+        "src_sha256": src_hash,
+        "dest_sha256": dest_hash,
         "placed_at": int(time.time()),
         "previous": previous_rel,
         "tool": tool,
         "allow_master": bool(allow_master),
+        "identity_gate": gate,
+        "review_rule_version": _t(evidence.get("rule_version")) or "place-v1",
     }
-    if gate:
-        meta["identity_gate"] = gate
-    if checks:
-        meta["checks"] = checks
+    if evidence:
+        meta["checks"] = evidence
     sidecar_path(dest).write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {
         "ok": True,
@@ -323,8 +362,10 @@ def main() -> int:
         help="集数或标签。1=04-frames/；2=04-frames/ep02/；ep01-v2=04-frames/ep01-v2/",
     )
     parser.add_argument("--allow-master", action="store_true", help="允许用场景空镜 master 当父图，即使同场上一镜已锁")
-    parser.add_argument("--identity-gate", default="", choices=["", "pass", "fail", "awaiting_user"])
+    parser.add_argument("--identity-gate", default="", choices=["", *REVIEW_STATES])
     parser.add_argument("--checks", default="", help="JSON object of identity checks")
+    parser.add_argument("--aspect", default="", help="16:9 or 9:16; default from confirm / show policy")
+    parser.add_argument("--crop", action="store_true", help="center-crop a wrong-ratio source; never stretch")
     parser.add_argument("--replace", action="store_true")
     args = parser.parse_args()
 
@@ -351,6 +392,8 @@ def main() -> int:
             allow_master=args.allow_master,
             identity_gate=args.identity_gate or None,
             checks=checks,
+            aspect=args.aspect or None,
+            crop=args.crop,
         )
     except (ValueError, FileNotFoundError) as exc:
         raise SystemExit(str(exc))

@@ -612,10 +612,4 @@ def require_fresh_gate(prod: Path, gate_id: str) -> None:
 
 def ken_burns_blocked(path: Path) -> bool:
     name = path.name.lower()
-    text = ""
-    try:
-        # filename markers only; we do not parse video bytes here
-        text = name
-    except Exception:
-        text = name
-    return "kenburns" in text or "still-pass" in text or "animatic" in text or path.suffix.lower() == ".kenburns.mp4"
+    return "kenburns" in name or "still-pass" in name or "animatic" in name or name.endswith(".kenburns.mp4")

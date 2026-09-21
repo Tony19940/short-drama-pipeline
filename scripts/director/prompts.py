@@ -319,10 +319,10 @@ CAMERA_SIDE_ZH = {
 }
 # Ark guidance: Chinese prompt ≤500 chars. Soft guard; compile trims decoration first.
 MAX_ZH_PROMPT_CHARS = 500
-# Trim order when a motion prompt runs long. Line, voice card, GEO, action timing and the
-# first-frame lock are never dropped.
-TRIM_ORDER = ("style", "continuity", "lock_detail")
-TRIM_LABEL_ZH = {"style": "装饰风格词", "continuity": "重复连戏句", "lock_detail": "人物描述细节"}
+# Trim order when a motion prompt runs long. Continuity, line, voice, GEO, timing
+# and the first-frame lock are never dropped — report over_limit instead.
+TRIM_ORDER = ("style", "lock_detail")
+TRIM_LABEL_ZH = {"style": "装饰风格词", "lock_detail": "人物描述细节"}
 NEGATIVE_RE = re.compile(r"禁止|不要|不得|严禁")
 # Designer notes are written as bans; the motion prompt restates the few that matter as facts.
 NEGATIVE_REWRITES = (
@@ -463,31 +463,98 @@ def camera_sentence_zh(move: str, camera_side: str = "") -> str:
     return "，".join(bits) + "。"
 
 
-def action_timing_zh(action: str, start: str, end: str, render_sec: float) -> tuple[str, list[dict]]:
-    """ACTION TIMING from 0.0s: onset is already in the first frame; two beats when the clip has room.
+def _planned_performance_beats(shot: Optional[dict], spec: Optional[dict]) -> list[dict]:
+    for source in (shot, spec):
+        if not isinstance(source, dict):
+            continue
+        raw = source.get("action_timing") or source.get("performance_beats") or source.get("acting_beats")
+        if not isinstance(raw, list):
+            continue
+        beats: list[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = float(item.get("from_sec", item.get("from", 0)))
+                end = float(item.get("to_sec", item.get("to", start)))
+            except (TypeError, ValueError):
+                continue
+            text = str(item.get("text") or item.get("action") or "").strip().rstrip("。")
+            if not text:
+                continue
+            if "–" in text[:12] and "：" in text:
+                label = text if text.endswith("。") else text + "。"
+            else:
+                label = f"{start:g}–{end:g}s：{text}。"
+            beats.append({"from_sec": start, "to_sec": end, "text": label})
+        if beats:
+            return beats
+    return []
 
-    Beat 2 = 落幅 (out_to) + the emotional tail 「气还没平」. Each beat stays ≤3 short sentences.
+
+def _t0_head(phase: str, onset: str) -> str:
+    extra = f"（首帧已起手：{onset}）" if onset else ""
+    if phase == "hold":
+        return "0.0s 先停住" + (f"（{onset}）" if onset else "") + "。"
+    if phase == "mid":
+        return "0.0s 动作已在中段" + extra + "。"
+    if phase == "land":
+        return "0.0s 已近落幅" + extra + "。"
+    return "0.0s 起就在动" + extra + "。"
+
+
+def action_timing_zh(
+    action: str,
+    start: str,
+    end: str,
+    render_sec: float,
+    *,
+    shot: Optional[dict] = None,
+    spec: Optional[dict] = None,
+) -> tuple[str, list[dict]]:
+    """Performance timeline from the shot plan. Duration scales; t=0 is a director phase.
+
+    Without an explicit plan, the action window is 37.5% of render_sec (4s → 1.5s,
+    8s → 3s). Reaction / t0_phase=hold hold first. A written action_timing list wins.
     """
     try:
         total = float(render_sec or 4)
     except (TypeError, ValueError):
         total = 4.0
+    shot = shot or {}
+    spec = spec or {}
     act = str(action or "").strip().rstrip("。")
     onset = str(start or "").strip().rstrip("。")
     land = str(end or "").strip().rstrip("。")
+    phase = str(shot.get("t0_phase") or spec.get("t0_phase") or "").strip() or "onset"
+    coverage = str(shot.get("coverage_type") or spec.get("coverage_type") or "").strip()
+    planned = _planned_performance_beats(shot, spec)
+    if coverage == "reaction" and phase == "onset" and not planned:
+        phase = "hold"
+    head = _t0_head(phase, onset)
+    if planned:
+        return head + "".join(beat["text"] for beat in planned), planned
     total_label = f"{total:g}s"
-    head = "0.0s 起就在动" + (f"（首帧已起手：{onset}）" if onset else "") + "。"
-    beats: list[dict] = []
-    if total >= 4.0:
-        first = f"0.0–1.5s：{act}。" if act else "0.0–1.5s：动作已在进行。"
-        tail = f"1.5–{total_label}：" + (f"落幅——{land}，停住，气还没平。" if land else "动作收住，停在落幅，气还没平。")
-        beats = [
-            {"from_sec": 0.0, "to_sec": 1.5, "text": first},
-            {"from_sec": 1.5, "to_sec": total, "text": tail},
-        ]
-    else:
+    if total < 4.0:
         one = f"0.0–{total_label}：{act}" + (f"，落幅——{land}" if land else "") + "，气还没平。"
         beats = [{"from_sec": 0.0, "to_sec": total, "text": one}]
+        return head + one, beats
+    action_end = round(min(max(total * 0.375, 1.2), max(1.2, total - 1.0)), 1)
+    if phase == "hold":
+        hold_end = round(min(max(total * 0.55, 1.5), max(1.5, total - 0.8)), 1)
+        first = f"0.0–{hold_end:g}s：" + (f"先停住听，{act}。" if act else "先停住听。")
+        tail = f"{hold_end:g}–{total_label}：" + (f"落幅——{land}，停住，气还没平。" if land else "微动收住，气还没平。")
+        beats = [
+            {"from_sec": 0.0, "to_sec": hold_end, "text": first},
+            {"from_sec": hold_end, "to_sec": total, "text": tail},
+        ]
+        return head + "".join(beat["text"] for beat in beats), beats
+    first = f"0.0–{action_end:g}s：{act}。" if act else f"0.0–{action_end:g}s：动作已在进行。"
+    tail = f"{action_end:g}–{total_label}：" + (f"落幅——{land}，停住，气还没平。" if land else "动作收住，停在落幅，气还没平。")
+    beats = [
+        {"from_sec": 0.0, "to_sec": action_end, "text": first},
+        {"from_sec": action_end, "to_sec": total, "text": tail},
+    ]
     return head + "".join(beat["text"] for beat in beats), beats
 
 
@@ -555,12 +622,18 @@ def compile_keyframe_prompt_zh(
     the gesture may already have started, its result has not landed. Last slot uses out_to / still_end.
 
     `geo_layout` (the scene's GEO block) is prefixed verbatim; `descriptors` are the
-    per-character 「100% 以参考图为准」 sentences.
+    per-character 「100% 以参考图为准」 sentences. Aspect and art direction come from
+    the shot/spec / show policy, not a hardcoded 16:9 CG line.
     """
     shot = shot or {}
     from .frame_desc import description_sentence, normalize_item
+    from .show_policy import still_style_close, still_style_opener
     from .still_t0 import first_still_text, forbidden_result_clause, last_still_text
 
+    aspect = _spec_text(spec, "aspect_ratio") or str(shot.get("aspect") or shot.get("aspect_ratio") or "16:9")
+    art = _spec_text(spec, "art_direction") or str(shot.get("art_direction") or "digital_cg")
+    opener = still_style_opener(aspect, art)
+    closer = still_style_close(art)
     item = normalize_item(frame_desc) if frame_desc else {}
     picture = description_sentence(item) if item else ""
     size = SIZE_ZH.get(_spec_text(spec, "shot_size") or str(shot.get("scale") or ""), _spec_text(spec, "shot_size") or "中景")
@@ -588,7 +661,7 @@ def compile_keyframe_prompt_zh(
         still = last_still_text(item) or end
         bits = [
             geo,
-            "数字电影 CG 静帧，16:9，非真人、非 photoreal、非 real person。",
+            opener,
             f"{size}，{lens}，{angle}。",
             f"落幅定住：{end.rstrip('。')}。" if end else "",
             f"尾帧画面：{still.rstrip('。')}。" if still else "",
@@ -598,7 +671,7 @@ def compile_keyframe_prompt_zh(
             lock_line,
             light_line,
             "画动作已经完成的那一格，对得上 out_to。",
-            "数字电影感绘画静帧，有体积和绘画颗粒，不是照片，不是动漫。皮肤有纹理，保留毛孔，非磨皮塑料脸。",
+            closer,
             "画面干净：无字幕、无水印、无国旗、无现代天际线、无吴哥塔、无环绕构图。",
         ]
         return dedupe_sentences("".join(bit for bit in bits if bit))
@@ -607,7 +680,7 @@ def compile_keyframe_prompt_zh(
     holding = str((item.get("still_start") or {}).get("holding") or (item.get("subject") or {}).get("holding") or "").strip()
     bits = [
         geo,
-        "数字电影 CG 静帧，16:9，非真人、非 photoreal、非 real person。",
+        opener,
         f"{size}，{lens}，{angle}。",
         "画动作起点的那一格：可以已经起手，结果还没发生。",
         f"起幅定住：{start.rstrip('。')}。" if start else "",
@@ -622,7 +695,7 @@ def compile_keyframe_prompt_zh(
         light_line,
         f"本镜要做的动作（首帧只画起手，结果留给视频）：{action.rstrip('。')}。" if action else "",
         forbidden_result_clause(action),
-        "数字电影感绘画静帧，有体积和绘画颗粒，不是照片，不是动漫。皮肤有纹理，保留毛孔，非磨皮塑料脸。",
+        closer,
         "画面干净：无字幕、无水印、无国旗、无现代天际线、无吴哥塔、无环绕构图。",
     ]
     return dedupe_sentences("".join(bit for bit in bits if bit))
@@ -789,32 +862,53 @@ def sanitize_camera_state(text: str) -> str:
 
 
 def shot_dialogue_items(spec: dict, shot: Optional[dict] = None) -> list[dict]:
-    """Lines this shot speaks, in order, with speaker / track / manner when the table has them."""
+    """Lines this shot speaks. Dedup by line_id; same text with different ids is kept.
+
+    Count is not truncated here. A model line budget is a replan signal, not a silent cut.
+    """
     shot = shot or {}
     out: list[dict] = []
-    seen: set[str] = set()
-    for item in shot.get("dialogue_ref") or []:
-        if not isinstance(item, dict):
-            continue
+    seen_ids: set[str] = set()
+    seen_fallback: set[tuple[str, str]] = set()
+
+    def add(item: dict, *, fallback_character: str = "") -> None:
         line = str(item.get("line") or "").strip()
-        if not line or line in seen:
-            continue
-        seen.add(line)
+        if not line:
+            return
+        line_id = str(item.get("line_id") or "").strip()
+        speaker = str(item.get("speaker_id") or item.get("character") or item.get("speaker") or fallback_character).strip()
+        if line_id:
+            if line_id in seen_ids:
+                return
+            seen_ids.add(line_id)
+        else:
+            key = (speaker, line)
+            if key in seen_fallback:
+                return
+            seen_fallback.add(key)
         out.append({
-            "character": str(item.get("character") or item.get("speaker") or "").strip(),
+            "character": speaker,
+            "speaker_id": str(item.get("speaker_id") or "").strip(),
+            "line_id": line_id,
             "line": line,
             "track": str(item.get("track") or "").strip(),
             "manner": str(item.get("manner") or item.get("tone") or "").strip(),
         })
+
+    for item in shot.get("dialogue_ref") or []:
+        if isinstance(item, dict):
+            add(item)
     spec_lines = [str(item).strip() for item in ((spec or {}).get("dialogue_lines") or []) if str(item).strip()]
     single = _spec_text(spec or {}, "dialogue_line")
     if single and single not in spec_lines:
         spec_lines.insert(0, single)
+    have = {item["line"] for item in out}
     for line in spec_lines:
-        if line not in seen:
-            seen.add(line)
-            out.append({"character": "", "line": line, "track": "", "manner": ""})
-    return out[:2]
+        if line in have:
+            continue
+        add({"line": line})
+        have.add(line)
+    return out
 
 
 def compile_seedance_motion_detail(
@@ -853,7 +947,7 @@ def compile_seedance_motion_detail(
         duration = int(round(float(render_sec)))
     except (TypeError, ValueError):
         duration = 4
-    timing, beats = action_timing_zh(action, start, end, duration)
+    timing, beats = action_timing_zh(action, start, end, duration, shot=shot, spec=spec)
     segments: list[dict] = []
     if str(geo_layout or "").strip():
         segments.append({"tag": "geo", "text": str(geo_layout).strip()})

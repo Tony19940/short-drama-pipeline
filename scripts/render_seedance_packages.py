@@ -36,13 +36,20 @@ from director.pipeline import (
 )
 from director.prompts import MAX_ZH_PROMPT_CHARS
 from director.speech import DEFAULT_DIALOGUE_LANGUAGE, DEFAULT_SPEECH_MODE, SpeechLanguageError, check_dialogue_language
+from director.vendor_request import (
+    DurationOutOfRange,
+    UnsupportedTaskKind,
+    resolve_render_seconds,
+    seedance_mode_for_task,
+    task_kind_for_gen_mode,
+    vendor_request_from_package,
+)
 from director.video_fallback import render_seedance_or_h3_fallback
 from video_backends.seedance_ark import SeedanceArk
 
 SEEDANCE_MODE = {
     "i2v_first": "i2v",
     "flf2v": "flf",
-    "video_extend": "i2v",
 }
 FACE_TYPES = {"character", "costume_state"}
 MAX_REFS = 4
@@ -92,21 +99,8 @@ def _text(value) -> str:
 
 
 def render_seconds_for_package(pkg: dict) -> int:
-    """Legal Seedance/H3 seconds. Paper can be 1–3s; render bumps to model min."""
-    min_sec = int(pkg.get("seedance_min_sec") or 4)
-    max_sec = int(pkg.get("seedance_max_sec") or 15)
-    raw = pkg.get("render_duration_sec")
-    if raw in (None, ""):
-        raw = pkg.get("duration_sec") or min_sec
-    try:
-        seconds = int(round(float(raw)))
-    except (TypeError, ValueError):
-        seconds = min_sec
-    if seconds < min_sec:
-        seconds = min_sec
-    if seconds > max_sec:
-        seconds = max_sec
-    return seconds
+    """Legal Seedance/H3 seconds. Paper can be 1–3s; render bumps to model min. Over-max errors."""
+    return resolve_render_seconds(pkg)
 
 
 def handoff_markdown_name(episode) -> str:
@@ -169,10 +163,10 @@ def identity_ref_paths(prod: Path, pkg: dict, assets: dict[str, dict], first: Pa
 
 
 def seedance_mode(gen_mode: str) -> str:
-    mode = SEEDANCE_MODE.get(_text(gen_mode))
-    if not mode:
-        raise SystemExit(f"不支持的 gen_mode: {gen_mode}")
-    return mode
+    try:
+        return seedance_mode_for_task(task_kind_for_gen_mode(gen_mode))
+    except UnsupportedTaskKind as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, dict], episode=1) -> dict:
@@ -198,7 +192,13 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         errors.append(f"first_frame outside episode folder: {first_rel}")
     if last_rel and not _rel_under_episode(last_rel, frame_prefix):
         errors.append(f"last_frame outside episode folder: {last_rel}")
-    if not first.exists():
+    source_rel = _text(pkg.get("source_video") or pkg.get("reference_video") or kf.get("source_video"))
+    if gen_mode in {"video_extend", "edit"} and not source_rel:
+        errors.append("extend/edit missing source_video")
+    elif source_rel and not safe_under(prod, source_rel).exists():
+        errors.append(f"missing source video {source_rel}")
+    needs_first = gen_mode not in {"video_extend", "edit", "r2v"}
+    if needs_first and not first.exists():
         errors.append(f"missing first frame {first_rel}")
     wants_last = gen_mode == "flf2v" or plan == "first_last"
     if wants_last:
@@ -224,12 +224,36 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
     except SpeechLanguageError as exc:
         errors.append(str(exc))
     native_speech = speech_mode == "seedance_native" and bool(lines)
-    seconds = render_seconds_for_package(pkg)
+    seconds = 0
+    try:
+        seconds = render_seconds_for_package(pkg)
+    except DurationOutOfRange as exc:
+        errors.append(str(exc))
+    mode = ""
+    request = None
+    try:
+        mode = seedance_mode(gen_mode)
+        request = vendor_request_from_package(
+            prod,
+            {
+                **pkg,
+                "first_frame": first_rel,
+                "last_frame": last_rel if wants_last else "",
+                "source_video": source_rel,
+                "refs": [],
+            },
+            kf,
+            episode=episode,
+            refs=[],
+        )
+    except (UnsupportedTaskKind, SystemExit, ValueError) as exc:
+        errors.append(str(exc))
     refs = identity_ref_paths(prod, pkg, assets, first) if first.exists() else []
     return {
         "shot_id": sid,
         "gen_mode": gen_mode,
-        "seedance_mode": seedance_mode(gen_mode),
+        "seedance_mode": mode,
+        "vendor_request": request.to_dict() if request is not None else None,
         "keyframe_plan": plan,
         "prompt": prompt,
         "prompt_chars": len(prompt),
@@ -238,6 +262,8 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         "render_duration_sec": seconds,
         "first_frame": first_rel,
         "last_frame": last_rel if wants_last else "",
+        "source_video": source_rel,
+        "request_hash": request.fingerprint() if request is not None else "",
         "use_last_frame": bool(wants_last and last_rel),
         "refs": [str(path.relative_to(prod)) for path in refs],
         "dest": dest_rel,
@@ -338,9 +364,24 @@ def _extract_last(video: Path, dest: Path) -> None:
     print(f"  warn: could not extract last frame from {video.name}; official clip kept", flush=True)
 
 
+def _backend_for_item(item: dict) -> SeedanceArk:
+    req = item.get("vendor_request") or {}
+    if req.get("model") and req.get("profile_id"):
+        from director.video_profiles import get_profile
+
+        profile = get_profile(req["profile_id"])
+        return SeedanceArk(
+            model=req["model"],
+            resolution=req.get("resolution") or "720p",
+            min_duration=int(profile.get("min_shot_sec") or 4),
+            max_duration=int(profile.get("max_shot_sec") or 15),
+            generate_audio=bool(req.get("generate_audio", True)),
+        )
+    return SeedanceArk()
+
+
 def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
     load_dotenv()
-    backend = SeedanceArk()
     out_dir = prod / (plan.get("dest_dir") or episode_shot_dir(plan.get("episode") or 1))
     out_dir.mkdir(parents=True, exist_ok=True)
     for item in plan["shots"]:
@@ -356,11 +397,13 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
             archived = archive_existing_official(dest)
             if archived:
                 print(f"  archived existing {dest.name} -> {archived}", flush=True)
-        image = safe_under(prod, item["first_frame"])
+        image = safe_under(prod, item["first_frame"]) if item.get("first_frame") else dest
         last = safe_under(prod, item["last_frame"]) if item.get("use_last_frame") and item.get("last_frame") else None
+        source = safe_under(prod, item["source_video"]) if item.get("source_video") else None
         # Character portraits are listed on the plan for humans. Seedance 2.0
         # treats simulated faces as real-person privacy, so do not upload them.
         refs: list = []
+        backend = _backend_for_item(item)
         if item.get("force_h3_fallback"):
             from director.video_fallback import official_h3_fallback
 
@@ -385,8 +428,24 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
                 last_frame=last,
                 force=not skip_existing,
                 generate_audio=item.get("generate_audio", True),
+                source_video=source,
             )
         item["clip"] = record
+        try:
+            from director.takes import persist_take, take_from_render
+
+            persist_take(
+                prod,
+                take_from_render(
+                    shot_id=sid,
+                    dest=dest,
+                    request_hash=str(item.get("request_hash") or ""),
+                    episode_id=str(plan.get("episode_label") or ""),
+                    qc={"backend": (record or {}).get("backend")},
+                ),
+            )
+        except OSError:
+            pass
         extracted = prod / item["extracted_last"]
         _extract_last(dest, extracted)
         print(f"  extracted last {extracted.relative_to(prod)} (designed still untouched)")

@@ -8,14 +8,7 @@ from typing import Any, Optional
 CODEX_STILL_MAX_REFS = 5
 CHECK_KEYS = ("in_frame", "absent", "left_right", "costume", "bopha", "text")
 IDENTITY_GATES = ("pass", "fail", "awaiting_user")
-BLOCK_STILLS_FROM_EPISODE = 6
-
-REVIEW_SHOTS = {
-    2: {"starts": ["SH001", "SH014", "SH020"], "hardest": ["SH005", "SH013", "SH017", "SH028"]},
-    3: {"starts": ["SH001", "SH009", "SH021"], "hardest": ["SH006", "SH011", "SH023"]},
-    4: {"starts": ["SH001", "SH012", "SH021"], "hardest": ["SH007", "SH015", "SH024"]},
-    5: {"starts": ["SH001", "SH008", "SH014", "SH020"], "hardest": ["SH004", "SH010", "SH017", "SH029"]},
-}
+_LAST_PACK_REPORT: dict = {}
 
 
 class StillPackError(ValueError):
@@ -49,16 +42,15 @@ def scene_master_rel(location_id: str) -> str:
     return f"02-assets/scenes/{loc}/master.jpg"
 
 
-def review_role_for(episode, shot_id: str) -> str:
-    from director.pipeline import episode_number
+def last_still_pack_report() -> dict:
+    return dict(_LAST_PACK_REPORT)
 
-    spec = REVIEW_SHOTS.get(episode_number(episode)) or {}
-    sid = _text(shot_id)
-    if sid in (spec.get("starts") or []):
-        return "scene_start"
-    if sid in (spec.get("hardest") or []):
-        return "hardest"
-    return "normal"
+
+def review_role_for(episode, shot_id: str, prod: Optional[Path] = None) -> str:
+    from director.pipeline import episode_number
+    from director.show_policy import load_show_policy
+
+    return load_show_policy(prod).review_role(episode_number(episode), shot_id)
 
 
 def identity_gate_from_checks(checks: dict, review_role: str) -> str:
@@ -99,8 +91,11 @@ def parse_checks(raw: str) -> dict:
 def episode_still_blocked(prod: Path, episode) -> str:
     from director.pipeline import episode_number
 
-    if Path(prod).name == "010-gongpai" and episode_number(episode) >= BLOCK_STILLS_FROM_EPISODE:
-        return "010-gongpai EP06–EP15 静帧未开：闸门和 EP02 样片过了再出"
+    from director.show_policy import load_show_policy
+
+    policy = load_show_policy(prod)
+    if policy.block_stills_from_episode and episode_number(episode) >= policy.block_stills_from_episode:
+        return f"{Path(prod).name} EP{episode_number(episode):02d} 静帧未开：闸门过了再出"
     return ""
 
 
@@ -109,7 +104,7 @@ def item_is_costume_path(rel: str) -> bool:
     return "/rin-line-leader/" in path or "/rin-guest/" in path
 
 
-def pack_codex_still_refs(
+def pack_codex_still_refs_report(
     prod: Path,
     *,
     parent: str,
@@ -120,13 +115,10 @@ def pack_codex_still_refs(
     episode: int = 1,
     max_refs: int = CODEX_STILL_MAX_REFS,
     strict_existing: bool = True,
-) -> list[str]:
-    """Image 1 = this shot parent. Remaining slots = in-frame costume masters (faces if over cap).
-
-    Location plates are not repeated in slots 2-5. Missing costume_state master is a hard error.
-    """
-    from .continuity_hard import resolve_costume_token
-    from .pipeline import _pick_character_by_state, resolve_cast_bind
+) -> dict:
+    """Parent + scored identity/prop refs. Over-budget items are listed, never silently forgotten."""
+    from .continuity_hard import hard_items_for_state, resolve_costume_token
+    from .pipeline import _pick_assets, _pick_character_by_state, resolve_cast_bind
     from .shot_table import normalize_state
 
     parent_rel = _rel(parent)
@@ -142,10 +134,14 @@ def pack_codex_still_refs(
     chars = (norm or {}).get("characters") if isinstance(norm, dict) else {}
     if not isinstance(chars, dict):
         chars = {}
+    prop_ids = list((norm or {}).get("props") or []) if isinstance(norm, dict) else []
+    hard_list = hard_items_for_state(hard, episode, norm) if hard and norm else []
 
-    identity: list[tuple[str, str, str]] = []
+    candidates: list[dict] = []
+    seen_files: set[str] = set()
+    identity: list[tuple[str, str, str, int]] = []
     seen: set[str] = set()
-    for cid, cstate in chars.items():
+    for index, (cid, cstate) in enumerate(chars.items()):
         if not isinstance(cstate, dict) or cstate.get("in_frame") is False:
             continue
         bind = resolve_cast_bind(cid, bible, items)
@@ -193,20 +189,115 @@ def pack_codex_still_refs(
                 base_face = f"02-assets/characters/{bind}/face.jpg"
                 if (Path(prod) / base_face).exists():
                     face_rel = base_face
-        identity.append((bind, master_rel, face_rel))
+        score = 50
+        if cstate.get("binding") and cstate.get("binding") not in {"none", "unknown", ""}:
+            score = 80
+        if cstate.get("carrying"):
+            score = max(score, 85)
+        identity.append((bind, master_rel, face_rel, score))
+        candidates.append({
+            "role": "identity",
+            "name": bind,
+            "file": face_rel or master_rel,
+            "master": master_rel,
+            "face": face_rel,
+            "score": score,
+            "index": index,
+        })
 
-    files = [parent_rel]
+    for pid in list(prop_ids):
+        for aid in _pick_assets(items, pid, kind="prop"):
+            item = by_id.get(aid) or {}
+            rel = _rel(item.get("file"))
+            if rel and rel not in seen_files:
+                seen_files.add(rel)
+                candidates.append({
+                    "role": "prop",
+                    "name": pid,
+                    "file": rel,
+                    "score": 90 if pid in hard_list or any(pid in (cstate.get("carrying") or []) for cstate in chars.values() if isinstance(cstate, dict)) else 60,
+                    "index": 100 + len(candidates),
+                })
+    for cid, cstate in chars.items():
+        if not isinstance(cstate, dict):
+            continue
+        for pid in list(cstate.get("carrying") or []) + ([cstate.get("bound_with")] if cstate.get("bound_with") else []):
+            if not pid:
+                continue
+            for aid in _pick_assets(items, str(pid), kind="prop"):
+                item = by_id.get(aid) or {}
+                rel = _rel(item.get("file"))
+                if rel and rel not in seen_files:
+                    seen_files.add(rel)
+                    candidates.append({
+                        "role": "prop",
+                        "name": str(pid),
+                        "file": rel,
+                        "score": 90,
+                        "index": 100 + len(candidates),
+                    })
+
     slots = max(0, int(max_refs) - 1)
-    if len(identity) <= slots:
-        chosen = [master for _bind, master, _face in identity]
-    else:
-        chosen = [face or master for _bind, master, face in identity[:slots]]
-    for rel in chosen:
-        if rel and rel not in files:
-            files.append(rel)
+    over_identity = len(identity) > slots
+    ranked = sorted(candidates, key=lambda item: (-int(item["score"]), int(item["index"])))
+    files = [parent_rel]
+    kept: list[dict] = [{"role": "canvas", "name": "parent", "file": parent_rel, "score": 100}]
+    dropped: list[dict] = []
+    seen_drop: set[tuple[str, str]] = set()
+    for item in ranked:
+        rel = item.get("file") or ""
+        if over_identity and item.get("role") == "identity":
+            rel = item.get("face") or item.get("master") or rel
+        if not rel or rel in files:
+            continue
         if len(files) >= int(max_refs):
-            break
-    return files[: int(max_refs)]
+            key = (str(item["role"]), str(item["name"]))
+            if key not in seen_drop:
+                seen_drop.add(key)
+                dropped.append({"role": item["role"], "name": item["name"], "file": rel, "reason": "over_budget"})
+            continue
+        files.append(rel)
+        kept.append(item)
+    risk = ""
+    if dropped:
+        names = "、".join(f"{item['role']}:{item['name']}" for item in dropped)
+        risk = f"参考预算 {max_refs} 张，已丢 {names}；拆镜或合成补参考，勿静默出图"
+    return {
+        "files": files[: int(max_refs)],
+        "kept": kept,
+        "dropped": dropped,
+        "risk": risk,
+        "max_refs": int(max_refs),
+    }
+
+
+def pack_codex_still_refs(
+    prod: Path,
+    *,
+    parent: str,
+    state: Optional[dict],
+    assets: dict,
+    table: Optional[dict] = None,
+    hard: Optional[dict] = None,
+    episode: int = 1,
+    max_refs: int = CODEX_STILL_MAX_REFS,
+    strict_existing: bool = True,
+) -> list[str]:
+    """Image 1 = this shot parent. Remaining slots ranked by importance. See last_still_pack_report()."""
+    global _LAST_PACK_REPORT
+    report = pack_codex_still_refs_report(
+        prod,
+        parent=parent,
+        state=state,
+        assets=assets,
+        table=table,
+        hard=hard,
+        episode=episode,
+        max_refs=max_refs,
+        strict_existing=strict_existing,
+    )
+    _LAST_PACK_REPORT = report
+    return list(report["files"])
 
 
 def first_frame_parent(
@@ -225,14 +316,14 @@ def first_frame_parent(
     continuation rule silently replaces the table's parent with the previous
     frame.
     """
-    from place_codex_frame import previous_same_scene_parent
+    from director.setup_anchors import resolve_first_parent
 
     hint = _rel(still_parent)
     if hint:
         return hint, True
-    prev = previous_same_scene_parent(prod, shot_id, episode)
-    if prev:
-        return prev, False
+    parent, allow_master = resolve_first_parent(prod, shot_id, episode, location_id)
+    if parent:
+        return parent, allow_master
     return scene_master_rel(location_id), True
 
 

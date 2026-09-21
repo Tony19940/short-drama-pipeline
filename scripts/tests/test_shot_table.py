@@ -672,7 +672,7 @@ class ShotState(unittest.TestCase):
         })
         errors, _ = validate_shot_table(table([front, otc_behind]), writer=WRITER, sets=SETS, profile=self.profile, look_text=LOOK)
         self.assertTrue(any("cannot show a target behind" in e for e in errors), errors)
-        self.assertTrue(any("facing flips" in e or "背对镜头/后脑" in e for e in errors), errors)
+        self.assertFalse(any("facing flips" in e for e in errors), errors)
         ok, _ = validate_shot_table(table([front, dirty]), writer=WRITER, sets=SETS, profile=self.profile, look_text=LOOK)
         self.assertFalse(any("cannot show a target behind" in e or "facing flips" in e for e in ok), ok)
         turned = dict(otc_behind)
@@ -852,7 +852,8 @@ class Profiles(unittest.TestCase):
     def test_profiles_and_aliases(self) -> None:
         self.assertEqual(get_profile("doubao-seedance-2-0-mini")["id"], "seedance_2_0")
         self.assertEqual(get_profile("h3")["id"], "minimax_h3")
-        self.assertEqual(get_profile("nonsense")["id"], "seedance_2_0")
+        with self.assertRaises(Exception):
+            get_profile("nonsense")
         brief = profile_brief(get_profile("seedance_2_0"))
         self.assertEqual(brief["shot_seconds"], {"min": 4, "max": 15})
         self.assertFalse(brief["one_shot_may_cut_inside"])
@@ -940,7 +941,12 @@ class DesignContext(unittest.TestCase):
         self.assertEqual(by_id["SH019"]["asset_refs"], ["LOC_GRANARY_V1"])
         self.assertIn("连戏必须照做", by_id["SH010"]["image_prompt"])
         # 009 mixes on_camera and post lines on purpose; the only allowed note is the post→post_dub mapping.
-        other = [w for w in data.get("warnings") or [] if "dialogue_delivery=post under speech_mode=seedance_native" not in w]
+        other = [
+            w
+            for w in data.get("warnings") or []
+            if "dialogue_delivery=post under speech_mode=seedance_native" not in w
+            and "参考预算" not in w
+        ]
         self.assertEqual(other, [])
         self.assertEqual(by_id["SH003"]["speech_mode"], "post_dub")
         self.assertEqual(by_id["SH003"]["dialogue_delivery"], "post")

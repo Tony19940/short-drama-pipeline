@@ -13,8 +13,8 @@ from typing import Optional
 
 from .gates import i2v_source, ken_burns_blocked, require_fresh_gate, run_check
 from .paths import ROOT
-from .production import load_json
-from .store import load_jobs, save_jobs
+from .shot_repo import list_shots, select_shots
+from .store import exclusive_state_lock, load_jobs, save_jobs
 
 
 def gpu_configured() -> bool:
@@ -51,27 +51,34 @@ def default_render_backend() -> str:
     return ""
 
 
-def _shots(prod: Path) -> list[dict]:
-    return list(load_json(prod, "03-storyboard/shots.json", {"shots": []}).get("shots") or [])
+def _shots(prod: Path, episode=1) -> list[dict]:
+    return list_shots(prod, episode)
 
 
 def _append_job(prod: Path, job: dict) -> dict:
-    data = load_jobs(prod)
-    data.setdefault("jobs", [])
-    data["jobs"].insert(0, job)
-    save_jobs(prod, data)
-    return job
+    with exclusive_state_lock(prod, "jobs"):
+        data = load_jobs(prod)
+        data.setdefault("jobs", [])
+        data["jobs"].insert(0, job)
+        save_jobs(prod, data)
+        return job
 
 
 def _update_job(prod: Path, job_id: str, **fields) -> dict:
-    data = load_jobs(prod)
-    for job in data.get("jobs") or []:
-        if job.get("id") == job_id:
-            job.update(fields)
-            job["updated_at"] = int(time.time())
-            save_jobs(prod, data)
-            return job
-    raise FileNotFoundError(job_id)
+    try:
+        with exclusive_state_lock(prod, "jobs"):
+            data = load_jobs(prod)
+            for job in data.get("jobs") or []:
+                if job.get("id") == job_id:
+                    job.update(fields)
+                    job["updated_at"] = int(time.time())
+                    save_jobs(prod, data)
+                    return job
+            raise FileNotFoundError(job_id)
+    except (FileNotFoundError, OSError):
+        if not Path(prod).exists():
+            return {}
+        raise
 
 
 def enqueue_render(prod: Path, shot_ids: Optional[list[str]] = None, review_track: bool = False) -> dict:
@@ -83,6 +90,7 @@ def enqueue_render_confirmed(
     fingerprint: Optional[str] = None,
     shot_ids: Optional[list[str]] = None,
     review_track: bool = False,
+    episode=1,
 ) -> dict:
     require_fresh_gate(prod, "C")
     from .pipeline import assert_clips_passed, assert_keyframes_passed, assert_packages_confirmed, uses_pipeline
@@ -90,24 +98,28 @@ def enqueue_render_confirmed(
         require_fresh_gate(prod, "C2")
         assert_packages_confirmed(prod)
         assert_keyframes_passed(prod)
+        from .show_policy import load_show_policy
+
+        if load_show_policy(prod).animatic_required:
+            from .animatic import require_animatic_approval
+
+            require_animatic_approval(prod, episode)
     check = run_check(prod)
     if not check["ok"]:
         raise PermissionError(check["stderr"] or check["stdout"] or "check_prod 未过，不能出视频")
-    shots = _shots(prod)
-    want = set(shot_ids or [])
-    selected = [shot for shot in shots if not want or shot["id"] in want]
-    if not selected:
-        raise ValueError("没有可出的镜头")
+    selected = select_shots(prod, shot_ids, episode)
+    shots = _shots(prod, episode)
     for shot in selected:
         dest = prod / shot.get("frame", f"04-frames/{shot['id']}.jpg")
         if not dest.exists():
             raise PermissionError(f"{shot['id']} 还没有锁定首帧")
-        source = i2v_source(prod, shot, shots)
-        if not source["exists"]:
-            raise PermissionError(f"{shot['id']} 缺 I2V 源：{source['reason']}")
+        if not uses_pipeline(prod):
+            source = i2v_source(prod, shot, shots)
+            if not source["exists"]:
+                raise PermissionError(f"{shot['id']} 缺 I2V 源：{source['reason']}")
     from .fingerprint import consume_render_fingerprint
 
-    used = consume_render_fingerprint(prod, fingerprint, [shot["id"] for shot in selected], review_track)
+    used = consume_render_fingerprint(prod, fingerprint, [shot["id"] for shot in selected], review_track, episode)
     job = {
         "id": f"job-{uuid.uuid4().hex[:10]}",
         "kind": "render",
@@ -117,6 +129,7 @@ def enqueue_render_confirmed(
         "gpu": gpu_configured(),
         "backend": default_render_backend() or None,
         "fingerprint": used,
+        "episode": episode,
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
         "log": [],
@@ -132,10 +145,8 @@ def enqueue_render_confirmed(
     return job
 
 
-def enqueue_review(prod: Path, shot_ids: Optional[list[str]] = None) -> dict:
-    shots = _shots(prod)
-    want = set(shot_ids or [])
-    selected = [shot for shot in shots if not want or shot["id"] in want]
+def enqueue_review(prod: Path, shot_ids: Optional[list[str]] = None, episode=1) -> dict:
+    selected = select_shots(prod, shot_ids, episode)
     missing = [shot["id"] for shot in selected if not (prod / "05-shots" / f"{shot['id']}.mp4").exists()]
     if missing:
         raise PermissionError("缺单镜视频：" + ", ".join(missing))
@@ -176,6 +187,8 @@ def _run_render(prod: Path, job_id: str) -> None:
         ]
         if job.get("shot_ids"):
             cmd += ["--only", *job["shot_ids"]]
+        if job.get("episode") not in (None, "", 1, "1"):
+            cmd += ["--episode", str(job["episode"])]
     else:
         cmd = [
             sys.executable,

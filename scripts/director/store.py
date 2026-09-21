@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .paths import director_dir
 
@@ -61,3 +63,14 @@ def save_jobs(prod: Path, data: dict) -> dict:
     data["updated_at"] = int(time.time())
     _write(jobs_path(prod), data)
     return data
+
+
+@contextmanager
+def exclusive_state_lock(prod: Path, name: str = "approvals") -> Iterator[None]:
+    lock = director_dir(prod, create=True) / f"{name}.lock"
+    with lock.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

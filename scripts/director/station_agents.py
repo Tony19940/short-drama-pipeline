@@ -63,17 +63,17 @@ from .production import load_json, read_text, write_text
 from .shot_table import (
     compile_specs_from_shot_table,
     needed_seconds,
-    pack_dialogue_for_budget,
     render_shot_table_md,
     sanitize_shot_table,
     table_context,
     validate_shot_table,
+    writer_dialogue_records,
     writer_lines,
-    clauses_of,
     lock_is_present,
-    BASE_ACTION_SEC,
 )
 from .video_profiles import profile_brief, resolve_target_model
+from .context import ProductionContext, active_episode_token, set_active_episode_token, set_current_context
+from .pipeline import episode_number
 
 DESIGN_EFFORT = os.environ.get("GROK_DESIGN_EFFORT", "medium")
 DESIGN_TIMEOUT = int(os.environ.get("GROK_DESIGN_TIMEOUT", "420"))
@@ -82,7 +82,6 @@ DESIGN_CACHE = "design.cache.json"
 # How many versions of every scene the design station drafts before the critic picks. 1 = old behaviour.
 DESIGN_CANDIDATES = max(1, int(os.environ.get("GROK_DESIGN_CANDIDATES", "3") or 3))
 CANDIDATES_FILE = "design.candidates.json"
-_ACTIVE_EPISODE = 1
 
 
 def _design_retries() -> int:
@@ -96,19 +95,20 @@ def _design_retries() -> int:
 DESIGN_RETRIES = _design_retries()
 
 
-def active_episode() -> int:
-    return int(_ACTIVE_EPISODE or 1)
+def active_episode():
+    return active_episode_token()
 
 
-def set_active_episode(episode: Optional[int]) -> int:
-    global _ACTIVE_EPISODE
-    prev = active_episode()
-    _ACTIVE_EPISODE = max(1, int(episode or 1))
-    return prev
+def set_active_episode(episode=None):
+    return set_active_episode_token(episode)
 
 
-def _ep() -> int:
+def _ep():
     return active_episode()
+
+
+def _ep_no(episode=None) -> int:
+    return episode_number(episode if episode is not None else _ep())
 
 
 def writer_artifact_name(episode: int = 1) -> str:
@@ -153,12 +153,12 @@ def storyboard_md_name(filename: str, episode=1) -> str:
     return f"03-storyboard/{filename}.{label}"
 
 
-def design_cache_name(episode: int = 1) -> str:
-    return DESIGN_CACHE if int(episode) == 1 else f"design.cache.ep{int(episode):02d}.json"
+def design_cache_name(episode=1) -> str:
+    return episode_artifact_name(DESIGN_CACHE, episode)
 
 
-def candidates_name(episode: int = 1) -> str:
-    return CANDIDATES_FILE if int(episode) == 1 else f"design.candidates.ep{int(episode):02d}.json"
+def candidates_name(episode=1) -> str:
+    return episode_artifact_name(CANDIDATES_FILE, episode)
 
 STATION_FILES = {
     "novel": "novel.json",
@@ -213,8 +213,8 @@ def _clip(text: str, limit: int = 8000) -> str:
     return raw[:limit] + "\n..."
 
 
-def _episode_text(prod: Path, episode: Optional[int] = None) -> str:
-    ep = int(episode or _ep())
+def _episode_text(prod: Path, episode=None) -> str:
+    ep = episode_number(episode if episode is not None else _ep())
     text = read_text(prod, f"01-bible/ep{ep:02d}.md")
     if text:
         return text
@@ -231,7 +231,8 @@ def _context(prod: Path, station: str) -> dict:
     ep = _ep()
     ctx: dict[str, Any] = {
         "project_id": prod.name,
-        "episode_no": ep,
+        "episode_no": episode_number(ep),
+        "episode_id": str(ProductionContext.resolve(prod, ep).episode_id or f"ep{episode_number(ep):02d}"),
         "brief": _clip(_brief(prod), 2500),
         "look": _clip(read_text(prod, "02-assets/LOOK.md"), 1500),
         "confirm": _clip(read_text(prod, "01-bible/confirm.md"), 1500),
@@ -401,32 +402,56 @@ def _design_cache_key(prod: Path, brief: str, profile_id: str, system: str) -> s
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
 
+def _scene_content_hashes(prod: Path) -> dict[str, str]:
+    import hashlib
+
+    writer = read_artifact(prod, writer_artifact_name(_ep()))
+    look = read_text(prod, "02-assets/LOOK.md")
+    out: dict[str, str] = {}
+    for scene in writer.get("scenes") or []:
+        sid = str(scene.get("scene_id") or "")
+        if not sid:
+            continue
+        blob = json.dumps(scene, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "|" + look
+        out[sid] = hashlib.sha1(blob.encode("utf-8")).hexdigest()
+    return out
+
+
 def _load_design_cache(prod: Path, key: str) -> dict:
     path = pipeline_dir(prod) / design_cache_name(_ep())
+    empty = {"key": key, "header": None, "analysis": None, "scenes": {}, "scene_hashes": {}, "candidates": {}, "verdicts": {}}
     if not path.exists():
-        return {"key": key, "header": None, "scenes": {}}
+        return empty
     try:
         cache = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {"key": key, "header": None, "scenes": {}}
+        return empty
     if cache.get("key") != key:
-        writer_ids = {
-            str(s.get("scene_id") or "")
-            for s in (read_artifact(prod, writer_artifact_name(_ep())).get("scenes") or [])
+        current = _scene_content_hashes(prod)
+        stored = cache.get("scene_hashes") or {}
+        kept = {}
+        kept_hashes = {}
+        for sid, shots in (cache.get("scenes") or {}).items():
+            if shots and stored.get(sid) and stored.get(sid) == current.get(sid):
+                kept[sid] = shots
+                kept_hashes[sid] = stored[sid]
+        return {
+            "key": key,
+            "header": None,
+            "analysis": None,
+            "scenes": kept,
+            "scene_hashes": kept_hashes,
+            "candidates": {},
+            "verdicts": {},
         }
-        kept = {sid: shots for sid, shots in (cache.get("scenes") or {}).items() if sid in writer_ids and shots}
-        if cache.get("header") and cache.get("analysis") and writer_ids:
-            cache["key"] = key
-            cache["scenes"] = kept
-            cache.setdefault("candidates", {})
-            cache.setdefault("verdicts", {})
-            return cache
-        return {"key": key, "header": None, "scenes": {}}
     cache.setdefault("scenes", {})
+    cache.setdefault("scene_hashes", {})
     return cache
 
 
 def _save_design_cache(prod: Path, cache: dict) -> None:
+    cache = dict(cache)
+    cache.setdefault("scene_hashes", _scene_content_hashes(prod))
     path = pipeline_dir(prod, create=True) / design_cache_name(_ep())
     path.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -723,90 +748,66 @@ def _run_critic(prod: Path, *, sid: str, scene: dict, card: Optional[dict], gram
     return fallback_verdict(candidates, card, " / ".join(last_errors[:2]) or "评审未返回可用结果")
 
 
-def _repair_writer_lines(shots: list[dict], writer: dict, scene_id: str) -> None:
-    """Map paraphrased dialogue onto unused writer lines so coverage does not fail verbatim check."""
-    allowed = list(writer_lines(writer).get(scene_id) or [])
-    if not allowed:
-        return
-    used: list[str] = []
+def _repair_writer_lines(shots: list[dict], writer: dict, scene_id: str) -> list[dict]:
+    """Attach line_id on exact/fragment matches. Never steal the next unused writer line."""
+    records = list(writer_dialogue_records(writer).get(scene_id) or [])
+    if not records:
+        return []
+    used_ids: list[str] = []
+    proposals: list[dict] = []
 
-    def pick(line: str) -> str:
-        unused = [w for w in allowed if used.count(w) < allowed.count(w)]
-        for pool in (unused, allowed):
-            for writer_line in pool:
-                if line == writer_line or (line and (line in writer_line or writer_line in line)):
-                    return writer_line
-        return ""
+    def pick(item: dict) -> Optional[dict]:
+        line = str(item.get("line") or "").strip()
+        line_id = str(item.get("line_id") or "").strip()
+        unused = [row for row in records if used_ids.count(row["line_id"]) < 1]
+        if line_id:
+            for row in unused:
+                if row["line_id"] == line_id:
+                    return row
+        for row in unused:
+            if line == row["line"] or (line and (line in row["line"] or row["line"] in line)):
+                return row
+        return None
 
     for shot in shots:
         for item in shot.get("dialogue_ref") or []:
             if not isinstance(item, dict):
                 continue
-            line = str(item.get("line") or "").strip()
-            match = pick(line)
+            match = pick(item)
             if match:
-                item["line"] = match
-                used.append(match)
-    missing = [line for line in allowed if used.count(line) < allowed.count(line)]
-    for shot in shots:
-        for item in shot.get("dialogue_ref") or []:
-            if not isinstance(item, dict):
-                continue
-            line = str(item.get("line") or "").strip()
-            if line and line not in allowed and missing:
-                item["line"] = missing.pop(0)
+                item["line"] = match["line"]
+                item["line_id"] = match["line_id"]
+                item["speaker_id"] = match["speaker_id"]
+                if match["character"] and not str(item.get("character") or "").strip():
+                    item["character"] = match["character"]
+                used_ids.append(match["line_id"])
+            elif str(item.get("line") or "").strip():
+                proposals.append({
+                    "kind": "unmatched_dialogue",
+                    "shot_id": str(shot.get("shot_id") or ""),
+                    "scene_id": scene_id,
+                    "line": str(item.get("line") or "").strip(),
+                    "speaker": str(item.get("character") or item.get("speaker_id") or ""),
+                })
+    return proposals
 
 
 def _split_overlong_shots(shots: list[dict], max_sec: int) -> list[dict]:
-    """If a shot's dialogue+action needs more than the model max, split extra lines or a long monologue."""
-    import math
-
+    """Do not invent reaction shots or drop action clauses. Mark over-budget shots for replan."""
     out: list[dict] = []
-    budget = max(4.0, float(max_sec) - BASE_ACTION_SEC - 1.0)
     for shot in shots:
-        need = needed_seconds(shot)
-        lines = [item for item in (shot.get("dialogue_ref") or []) if isinstance(item, dict)]
-        if need <= max_sec:
-            out.append(shot)
-            continue
-        if len(lines) >= 2:
-            first = dict(shot)
-            first["dialogue_ref"] = [lines[0]]
-            first["duration_sec"] = min(max_sec, max(3, int(math.ceil(needed_seconds(first) - 1e-9))))
-            rest = dict(shot)
-            rest["dialogue_ref"] = lines[1:]
-            rest["coverage_type"] = "reaction"
-            rest["scale"] = "close" if str(shot.get("scale") or "") != "close" else "otc"
-            rest["shot_job"] = (str(shot.get("shot_job") or "") + "（拆出下一句）").strip()
-            rest["one_action"] = "听完，停一拍。"
-            rest["duration_sec"] = min(max_sec, max(3, int(math.ceil(needed_seconds(rest) - 1e-9))))
-            rest.pop("shot_id", None)
-            out.extend([first, rest])
-            continue
-        if len(lines) == 1:
-            packs = pack_dialogue_for_budget(str(lines[0].get("line") or ""), budget)
-            if len(packs) > 1:
-                for index, pack in enumerate(packs):
-                    piece = dict(shot)
-                    piece["dialogue_ref"] = [{**lines[0], "line": pack}]
-                    if index:
-                        piece["coverage_type"] = "reaction" if index % 2 else "reverse"
-                        piece["scale"] = "close" if str(shot.get("scale") or "") != "close" else "otc"
-                        piece["shot_job"] = (str(shot.get("shot_job") or "") + f"（对白拆 {index + 1}）").strip()
-                        piece["one_action"] = "接着说下一句。" if index % 2 == 0 else "听着，停一拍。"
-                        piece.pop("shot_id", None)
-                    else:
-                        clauses = clauses_of(shot.get("one_action") or "")
-                        if len(clauses) > 1:
-                            piece["one_action"] = clauses[0] + "。"
-                    piece["duration_sec"] = min(max_sec, max(3, int(math.ceil(needed_seconds(piece) - 1e-9))))
-                    out.append(piece)
-                continue
-        if need > max_sec:
-            clauses = clauses_of(shot.get("one_action") or "")
-            if len(clauses) > 1:
-                shot["one_action"] = clauses[0] + "。"
-        out.append(shot)
+        item = dict(shot)
+        need = needed_seconds(item)
+        try:
+            planned = float(item.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            planned = 0
+        if need > max_sec or planned > max_sec:
+            item["replan"] = (
+                f"needs {max(need, planned):.1f}s > model max {max_sec}s; replan required, "
+                "do not auto-split or invent a listen/reaction shot"
+            )
+        out.append(item)
     return out
 
 
@@ -826,7 +827,7 @@ def run_design_table(
     target_model: Optional[str] = None,
     resume: bool = True,
     candidates: Optional[int] = None,
-    episode: int = 1,
+    episode=1,
 ) -> dict:
     """Shot-table design, film-grade path.
 
@@ -841,6 +842,7 @@ def run_design_table(
     EP02+ writes suffixed artifacts and does not touch EP01 `shot_list.json`.
     """
     prev_ep = set_active_episode(episode)
+    prev_ctx = set_current_context(ProductionContext.resolve(prod, episode))
     try:
         return _run_design_table_body(
             prod,
@@ -850,6 +852,7 @@ def run_design_table(
             candidates=candidates,
         )
     finally:
+        set_current_context(prev_ctx)
         set_active_episode(prev_ep)
 
 
@@ -883,7 +886,7 @@ def _run_design_table_body(
     scene_cards = analysis["scene_cards"]
     grammar = analysis["visual_grammar"]
     write_artifact(prod, scene_cards_artifact_name(ep), _merge_status({"schema": SCENE_CARD_SCHEMA, "scene_cards": scene_cards, "visual_grammar": grammar}, "analysis"))
-    write_text(prod, storyboard_md_name("scene-cards.draft.md", ep), render_scene_cards_md(scene_cards, grammar, title=f"第 {ep:02d} 集"))
+    write_text(prod, storyboard_md_name("scene-cards.draft.md", ep), render_scene_cards_md(scene_cards, grammar, title=f"第 {_ep_no(ep):02d} 集"))
 
     # 2. header
     header_ctx = dict(base)
@@ -1011,7 +1014,7 @@ def _finalize_design(
     candidate_rows: list[dict],
     scene_reports: list[dict],
 ) -> dict:
-    ep = _ep()
+    ep = episode_number(_ep())
     payload = sanitize_shot_table(
         {
             "schema": SHOT_TABLE_SCHEMA,
@@ -1045,14 +1048,14 @@ def _finalize_design(
     specs = _merge_status(compile_specs_from_shot_table(written, aspect=written.get("aspect") or "16:9"), "spec")
     specs["origin"] = "compiled-from-shot-table"
     write_artifact(prod, shot_specs_artifact_name(ep), specs)
-    title = str((read_artifact(prod, writer_artifact_name(ep)).get("episode_outline") or [{}])[0].get("title") or f"第 {ep:02d} 集")
+    title = str((read_artifact(prod, writer_artifact_name(ep)).get("episode_outline") or [{}])[0].get("title") or f"第 {_ep_no(ep):02d} 集")
     descriptions = frame_desc_index(read_artifact(prod, frame_desc_artifact_name(ep)))
     write_text(
         prod,
         storyboard_md_name("shot-list.draft.md", ep),
-        render_shot_table_md(written, title=f"第 {ep:02d} 集 {title}", profile=profile, warnings=warnings, frame_descriptions=descriptions),
+        render_shot_table_md(written, title=f"第 {_ep_no(ep):02d} 集 {title}", profile=profile, warnings=warnings, frame_descriptions=descriptions),
     )
-    write_text(prod, storyboard_md_name("shot-candidates.draft.md", ep), render_candidates_md(candidate_rows, title=f"第 {ep:02d} 集 {title}"))
+    write_text(prod, storyboard_md_name("shot-candidates.draft.md", ep), render_candidates_md(candidate_rows, title=f"第 {_ep_no(ep):02d} 集 {title}"))
     return written
 
 
@@ -1122,12 +1125,14 @@ def pick_candidate(prod: Path, scene_id: str, index: int, *, target_model: Optio
     return {"ok": True, "scene_id": scene_id, "pick": int(index), "artifact": written, "used_tokens": False}
 
 
-def run_frame_descriptions(prod: Path, *, brief: str = "", scene_ids: Optional[list[str]] = None, episode: int = 1) -> dict:
+def run_frame_descriptions(prod: Path, *, brief: str = "", scene_ids: Optional[list[str]] = None, episode=1) -> dict:
     """Second descriptive layer: one call per scene, every shot gets layers / light / hands / composition."""
     prev_ep = set_active_episode(episode)
+    prev_ctx = set_current_context(ProductionContext.resolve(prod, episode))
     try:
         return _run_frame_descriptions_body(prod, brief=brief, scene_ids=scene_ids)
     finally:
+        set_current_context(prev_ctx)
         set_active_episode(prev_ep)
 
 
@@ -1213,13 +1218,13 @@ def _run_frame_descriptions_body(prod: Path, *, brief: str = "", scene_ids: Opti
         _dump_station(prod, "frame_desc", "invalid", {"errors": errors, "payload": payload})
         raise PermissionError("frame_desc: " + " / ".join(errors[:6]))
     written = write_artifact(prod, frame_desc_artifact_name(ep), payload)
-    title = str((writer.get("episode_outline") or [{}])[0].get("title") or f"第 {ep:02d} 集")
-    write_text(prod, storyboard_md_name("frame-descriptions.draft.md", ep), render_frame_descriptions_md(written, title=f"第 {ep:02d} 集 {title}"))
+    title = str((writer.get("episode_outline") or [{}])[0].get("title") or f"第 {_ep_no(ep):02d} 集")
+    write_text(prod, storyboard_md_name("frame-descriptions.draft.md", ep), render_frame_descriptions_md(written, title=f"第 {_ep_no(ep):02d} 集 {title}"))
     profile = table_context(prod, table.get("target_model"), episode=ep)["profile"]
     write_text(
         prod,
         storyboard_md_name("shot-list.draft.md", ep),
-        render_shot_table_md(table, title=f"第 {ep:02d} 集 {title}", profile=profile, warnings=table.get("warnings") or [], frame_descriptions=frame_desc_index(written)),
+        render_shot_table_md(table, title=f"第 {_ep_no(ep):02d} 集 {title}", profile=profile, warnings=table.get("warnings") or [], frame_descriptions=frame_desc_index(written)),
     )
     return {
         "ok": True,
@@ -1274,8 +1279,8 @@ def _infer_int_ext(scene: dict) -> str:
     return "内"
 
 
-def _sanitize_writer(data: dict, episode: Optional[int] = None) -> dict:
-    ep = int(episode or _ep())
+def _sanitize_writer(data: dict, episode=None) -> dict:
+    ep = episode_number(episode if episode is not None else _ep())
     prefix = f"EP{ep:02d}"
     payload = dict(data or {})
     for index, scene in enumerate(payload.get("scenes") or [], start=1):
@@ -1286,12 +1291,18 @@ def _sanitize_writer(data: dict, episode: Optional[int] = None) -> dict:
         if scene.get("dialogue") is None:
             scene["dialogue"] = []
         speakers: list[str] = []
-        for item in scene.get("dialogue") or []:
+        for d_index, item in enumerate(scene.get("dialogue") or [], start=1):
+            if not isinstance(item, dict):
+                continue
             if not item.get("speaker") and item.get("character"):
                 item["speaker"] = item.get("character")
             speaker = str(item.get("speaker") or item.get("character") or "").strip()
             if speaker and speaker not in speakers:
                 speakers.append(speaker)
+            if str(item.get("line") or "").strip() and not str(item.get("line_id") or "").strip():
+                item["line_id"] = f"{scene['scene_id']}:d{d_index:02d}"
+            if speaker and not str(item.get("speaker_id") or "").strip():
+                item["speaker_id"] = speaker
         if not scene.get("time_of_day"):
             scene["time_of_day"] = _infer_scene_time(scene)
         if not scene.get("int_ext"):
@@ -1419,11 +1430,12 @@ def run_station_agent(
     resume: bool = True,
     candidates: Optional[int] = None,
     scene_ids: Optional[list[str]] = None,
-    episode: int = 1,
+    episode=1,
 ) -> dict:
     if station not in STATION_FILES:
         raise ValueError("unknown station " + station)
     prev_ep = set_active_episode(episode)
+    prev_ctx = set_current_context(ProductionContext.resolve(prod, episode))
     try:
         return _run_station_agent_body(
             prod,
@@ -1435,6 +1447,7 @@ def run_station_agent(
             scene_ids=scene_ids,
         )
     finally:
+        set_current_context(prev_ctx)
         set_active_episode(prev_ep)
 
 
@@ -1458,7 +1471,7 @@ def _run_station_agent_body(
         payload = _merge_status({"schema": SCENE_CARD_SCHEMA, **analysis}, "analysis")
         written = write_artifact(prod, scene_cards_artifact_name(ep), payload)
         md = storyboard_md_name("scene-cards.draft.md", ep)
-        write_text(prod, md, render_scene_cards_md(written.get("scene_cards"), written.get("visual_grammar"), title=f"第 {ep:02d} 集"))
+        write_text(prod, md, render_scene_cards_md(written.get("scene_cards"), written.get("visual_grammar"), title=f"第 {_ep_no(ep):02d} 集"))
         return {"ok": True, "station": "analysis", "episode": ep, "file": scene_cards_artifact_name(ep), "origin": "station-agent", "used_tokens": True, "artifact": written, "md": md}
     if station == "frame_desc":
         return run_frame_descriptions(prod, brief=brief, scene_ids=scene_ids, episode=ep)

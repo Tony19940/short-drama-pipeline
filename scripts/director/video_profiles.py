@@ -164,12 +164,18 @@ def profile_ids() -> list[str]:
     return sorted(PROFILES)
 
 
+class UnknownProfileError(ValueError):
+    """A named model/profile that is not in PROFILES / ALIASES."""
+
+
 def get_profile(model: Optional[str]) -> dict[str, Any]:
     key = str(model or "").strip().lower()
+    if not key:
+        return dict(PROFILES[DEFAULT_PROFILE])
     key = ALIASES.get(key, key)
     if key in PROFILES:
         return dict(PROFILES[key])
-    return dict(PROFILES[DEFAULT_PROFILE])
+    raise UnknownProfileError(f"unknown model/profile: {model}")
 
 
 def _profile_from_text(text: str) -> str:
@@ -219,6 +225,13 @@ def resolve_target_model(prod: Optional[Path] = None, explicit: Optional[str] = 
     if os.environ.get("ARK_API_KEY", "").strip():
         return "seedance_2_0"
     return DEFAULT_PROFILE
+
+
+def capabilities(model: Optional[str] = None):
+    """Vendor limits only. House rules live on ShowPolicy."""
+    from .show_policy import model_capabilities
+
+    return model_capabilities(model)
 
 
 def profile_brief(profile: dict[str, Any]) -> dict[str, Any]:

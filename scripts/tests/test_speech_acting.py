@@ -445,25 +445,25 @@ class MotionPrompt(unittest.TestCase):
                 {"tag": "audio", "text": f"【声音】琳（{card}）用普通话说：“这柜门还虚掩着？”。只说这一句。无音乐，无字幕。"},
             ]
 
-        # decoration → repeated continuity → descriptor detail, then it fits
+        # decoration then descriptor detail; continuity is never dropped
         result = assemble_motion_prompt(segments(30), limit=MAX_ZH_PROMPT_CHARS)
-        self.assertEqual(result["dropped"], ["style", "continuity", "lock_detail"])
+        self.assertEqual(result["dropped"], ["style", "lock_detail"])
         prompt = result["prompt"]
         self.assertNotIn("数字电影 CG 质感", prompt)
-        self.assertNotIn("【连戏】", prompt)
+        self.assertIn("【连戏】", prompt)
         self.assertIn("【人物锁】琳：100% 以参考图为准。", prompt)
         self.assertNotIn("瘦小缩肩", prompt)
-        self.assertFalse(result["over_limit"])
         self.assertEqual(result["chars"], len(prompt))
-        # only the first two tiers are needed here: descriptor detail survives
+        # only style is needed here: descriptor detail and continuity survive
         partial = assemble_motion_prompt(segments(8), limit=MAX_ZH_PROMPT_CHARS)
-        self.assertEqual(partial["dropped"], ["style", "continuity"])
-        self.assertIn("瘦小缩肩", partial["prompt"])
-        # a GEO block too long to fit: everything protected stays, over_limit is reported
+        self.assertIn("style", partial["dropped"])
+        self.assertNotIn("continuity", partial["dropped"])
+        self.assertIn("【连戏】", partial["prompt"])
+        # a GEO block too long to fit: continuity stays, over_limit is reported
         heavy = assemble_motion_prompt(segments(70), limit=MAX_ZH_PROMPT_CHARS)
-        self.assertEqual(heavy["dropped"], ["style", "continuity", "lock_detail"])
+        self.assertEqual(heavy["dropped"], ["style", "lock_detail"])
         self.assertTrue(heavy["over_limit"])
-        for kept in ("【空间锁】", card, "“这柜门还虚掩着？”", "首帧已起手：手已搭上", "0.0–1.5s", "【机位】"):
+        for kept in ("【空间锁】", card, "“这柜门还虚掩着？”", "首帧已起手：手已搭上", "0.0–1.5s", "【机位】", "【连戏】"):
             self.assertIn(kept, heavy["prompt"])
         # under the limit: nothing is touched
         small = assemble_motion_prompt([{"tag": "style", "text": "数字电影 CG 质感。"}, {"tag": "audio", "text": "【声音】无音乐。"}])

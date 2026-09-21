@@ -272,6 +272,69 @@ def build_animatic(
     }
 
 
+def animatic_input_fingerprint(prod: Path, episode: int = 1) -> str:
+    """Hash of the shot list durations plus each still's bytes. Approval binds to this."""
+    import hashlib
+
+    from .vendor_request import media_hash
+
+    plan = plan_animatic(prod, episode)
+    parts = []
+    for item in plan:
+        rel = _t(item.get("image"))
+        digest = media_hash(prod, rel) if rel else "missing"
+        parts.append(f"{item.get('shot_id')}:{item.get('seconds')}:{rel}:{digest}:{item.get('part')}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def animatic_approval_path(prod: Path, episode: int = 1) -> Path:
+    return Path(prod) / ANIMATIC_DIR / f"ep{int(episode):02d}.approval.json"
+
+
+def write_animatic_approval(prod: Path, episode: int = 1, reviewer: str = "") -> dict:
+    dest = animatic_approval_path(prod, episode)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    body = {
+        "episode": int(episode),
+        "fingerprint": animatic_input_fingerprint(prod, episode),
+        "reviewer": _t(reviewer) or "unknown",
+        "approved_at": __import__("time").time(),
+        "file": animatic_rel(episode),
+    }
+    dest.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return body
+
+
+def animatic_approval_status(prod: Path, episode: int = 1) -> dict:
+    path = animatic_approval_path(prod, episode)
+    current = animatic_input_fingerprint(prod, episode)
+    if not path.is_file():
+        return {"exists": False, "ok": False, "stale": False, "fingerprint": "", "current": current}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"exists": True, "ok": False, "stale": True, "fingerprint": "", "current": current}
+    stored = _t(data.get("fingerprint"))
+    stale = stored != current
+    return {
+        "exists": True,
+        "ok": bool(stored) and not stale,
+        "stale": stale,
+        "fingerprint": stored,
+        "current": current,
+        "reviewer": _t(data.get("reviewer")),
+    }
+
+
+def require_animatic_approval(prod: Path, episode: int = 1) -> dict:
+    status = animatic_approval_status(prod, episode)
+    if not status["exists"]:
+        raise PermissionError("animatic 未审批，不能收费出片")
+    if status["stale"]:
+        raise PermissionError("animatic 审批已过期（镜头表或首帧已变），重新审预演")
+    return status
+
+
 def snapshot_animatic(prod: Path, episode: int = 1) -> dict:
     """What the studio shows before/after building: the plan, the file if it exists."""
     from .paths import media_url
@@ -301,4 +364,5 @@ def snapshot_animatic(prod: Path, episode: int = 1) -> dict:
         "ffmpeg": ffmpeg_available(),
         "frames": frames,
         "last_frames": last_frames,
+        "approval": animatic_approval_status(prod, episode),
     }

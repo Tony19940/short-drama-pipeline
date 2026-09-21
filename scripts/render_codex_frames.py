@@ -82,7 +82,7 @@ def build_job(prod: Path, episode: int, shot: dict, packages: dict, assets: dict
     parent, allow_master = first_frame_parent(
         prod, sid, episode, location_id, still_parent=str(shot.get("still_parent") or "")
     )
-    role = review_role_for(episode, sid)
+    role = review_role_for(episode, sid, prod)
     hard = load_continuity_hard(prod)
     table = read_artifact(prod, episode_artifact_name("shot_list.json", episode))
     still_files = pack_codex_still_refs(
@@ -163,12 +163,17 @@ def print_job(prod: Path, episode: int, shot_id: str) -> dict:
     return job
 
 
-def _source_is_16x9(path: Path) -> bool:
+def _source_matches_aspect(path: Path, aspect: str = "16:9") -> bool:
     with Image.open(path) as image:
         w, h = image.size
     if h <= 0:
         return False
-    return abs((w / h) - (16 / 9)) <= 0.03
+    try:
+        aw, ah = (int(p) for p in str(aspect).split(":", 1))
+        target = aw / ah
+    except (TypeError, ValueError, ZeroDivisionError):
+        target = 16 / 9
+    return abs((w / h) - target) <= 0.03
 
 
 def promote(prod: Path, episode: int, shot_id: str, src: Path, checks_raw: str) -> dict:
@@ -186,10 +191,13 @@ def promote(prod: Path, episode: int, shot_id: str, src: Path, checks_raw: str) 
         raise SystemExit(reason)
     if not src.exists():
         raise SystemExit(f"没有这张图：{src}")
-    if not _source_is_16x9(src):
-        raise SystemExit(f"{src.name} 不是 16:9，拒绝落盘")
+    from director.show_policy import load_show_policy
+
+    policy = load_show_policy(prod)
+    if not _source_matches_aspect(src, policy.aspect):
+        raise SystemExit(f"{src.name} 不是 {policy.aspect}，拒绝落盘（加裁切后再 promote，禁止拉伸）")
     checks = parse_checks(checks_raw)
-    role = review_role_for(episode, shot_id)
+    role = review_role_for(episode, shot_id, prod)
     gate = identity_gate_from_checks(checks, role)
     job = build_job(prod, episode, shot, _packages(prod, episode), _assets(prod))
     cand = candidate_dir(prod, episode) / f"{shot_id}{src.suffix.lower() or '.png'}"
@@ -234,7 +242,7 @@ def status_episode(prod: Path, episode: int) -> dict:
         rows.append({
             "shot_id": sid,
             "scene_id": shot.get("scene_id"),
-            "review_role": review_role_for(episode, sid),
+            "review_role": review_role_for(episode, sid, prod),
             "exists": exists,
             "identity_gate": identity_gate_of(prod, rel) if exists else "",
             "parent": read_sidecar(prod, rel).get("parent") if exists else "",

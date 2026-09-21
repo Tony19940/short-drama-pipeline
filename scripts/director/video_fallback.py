@@ -107,6 +107,7 @@ def render_seedance_or_h3_fallback(
     last_frame: Optional[Path] = None,
     force: bool = False,
     generate_audio: bool = True,
+    source_video: Optional[Path] = None,
     render_fn: Optional[Callable[..., None]] = None,
     scale_fn: Optional[Callable[[Path, Path], list[str]]] = None,
 ) -> dict:
@@ -125,6 +126,7 @@ def render_seedance_or_h3_fallback(
             last_frame=last_frame,
             force=force,
             generate_audio=generate_audio,
+            source_video=source_video,
         )
         return {"backend": "seedance", "dest": str(dest)}
     try:
@@ -139,6 +141,7 @@ def render_seedance_or_h3_fallback(
             last_frame=last_frame,
             force=force,
             generate_audio=generate_audio,
+            source_video=source_video,
         )
         return {"backend": "seedance", "dest": str(dest)}
     except SeedanceFaceBlock as exc:
@@ -168,12 +171,14 @@ def _seedance_render(
     last_frame: Optional[Path],
     force: bool,
     generate_audio: bool,
+    source_video: Optional[Path] = None,
 ) -> None:
     kwargs = {
         "refs": refs or [],
         "mode": mode,
         "last_frame": last_frame,
         "force": force,
+        "source_video": source_video,
     }
     try:
         backend.render(image, prompt, seconds, dest, generate_audio=generate_audio, **kwargs)

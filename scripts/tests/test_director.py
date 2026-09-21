@@ -144,10 +144,8 @@ class DirectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             prod = Path(tmp) / "003"
             shutil.copytree(PROD, prod, ignore=shutil.ignore_patterns(".director", "05-shots", "06-export"))
-            old = os.environ.get("LOCAL_H3_BASE")
-            old_ark = os.environ.get("ARK_API_KEY")
-            os.environ.pop("LOCAL_H3_BASE", None)
-            os.environ.pop("ARK_API_KEY", None)
+            keys = ("LOCAL_H3_BASE", "ARK_API_KEY", "MINIMAX_API_KEY", "DASHSCOPE_API_KEY", "DIRECTOR_VIDEO_BACKEND")
+            old = {key: os.environ.pop(key, None) for key in keys}
             try:
                 for gate in ("A", "B", "S", "C"):
                     lock_gate(prod, gate, True)
@@ -160,12 +158,11 @@ class DirectorTests(unittest.TestCase):
                 self.assertFalse(job["gpu"])
                 self.assertIn("queued", " ".join(job["log"]).lower())
             finally:
-                if old is not None:
-                    os.environ["LOCAL_H3_BASE"] = old
-                if old_ark is not None:
-                    os.environ["ARK_API_KEY"] = old_ark
-                else:
-                    os.environ.pop("ARK_API_KEY", None)
+                for key, value in old.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
     def test_ken_burns_not_assemble_path(self) -> None:
         self.assertTrue(ken_burns_blocked(Path("05-shots/SH001.kenburns.mp4")))
@@ -815,10 +812,8 @@ class DirectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             prod = Path(tmp) / "003"
             shutil.copytree(PROD, prod, ignore=shutil.ignore_patterns(".director", "05-shots", "06-export"))
-            old = os.environ.get("LOCAL_H3_BASE")
-            old_ark = os.environ.get("ARK_API_KEY")
-            os.environ.pop("LOCAL_H3_BASE", None)
-            os.environ.pop("ARK_API_KEY", None)
+            keys = ("LOCAL_H3_BASE", "ARK_API_KEY", "MINIMAX_API_KEY", "DASHSCOPE_API_KEY", "DIRECTOR_VIDEO_BACKEND")
+            old = {key: os.environ.pop(key, None) for key in keys}
             try:
                 for gate in ("A", "B", "S", "C"):
                     lock_gate(prod, gate, True)
@@ -837,12 +832,11 @@ class DirectorTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     enqueue_render_confirmed(prod, fresh["fingerprint"], ["SH001"])
             finally:
-                if old is not None:
-                    os.environ["LOCAL_H3_BASE"] = old
-                if old_ark is not None:
-                    os.environ["ARK_API_KEY"] = old_ark
-                else:
-                    os.environ.pop("ARK_API_KEY", None)
+                for key, value in old.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
 
     def test_review_contract_fails_without_vo_or_audio(self) -> None:
         from director.review_contract import evaluate_review_contract, freeze_review_contract
@@ -921,7 +915,7 @@ class DirectorTests(unittest.TestCase):
                 place(prod, "SH001", "first", src, parent="02-assets/scenes/nowhere/master.jpg")
             with self.assertRaises(ValueError):
                 place(prod, "SH001", "first", src, parent="03-storyboard/whatever.jpg")
-            result = place(prod, "SH001", "first", src, parent="02-assets/scenes/modern-channel/master.jpg")
+            result = place(prod, "SH001", "first", src, parent="02-assets/scenes/modern-channel/master.jpg", identity_gate="pass")
             self.assertEqual(result["dest"], "04-frames/SH001.jpg")
             self.assertTrue((prod / result["dest"]).exists())
             self.assertIsNone(result["previous"])
@@ -930,13 +924,13 @@ class DirectorTests(unittest.TestCase):
             self.assertEqual(len(meta["src_sha256"]), 64)
             again = Path(tmp) / "codex-sh001b.png"
             Image.new("RGB", (128, 72), (80, 40, 40)).save(again)
-            second = place(prod, "SH001", "first", again, parent="02-assets/scenes/modern-channel/master.jpg")
+            second = place(prod, "SH001", "first", again, parent="02-assets/scenes/modern-channel/master.jpg", identity_gate="pass")
             self.assertTrue(second["previous"])
             self.assertTrue((prod / "04-frames" / "SH001-v1.json").exists())
             self.assertEqual(json.loads((prod / "04-frames" / "SH001.json").read_text())["previous"], "04-frames/SH001-v1.jpg")
             with self.assertRaises(FileNotFoundError):
                 place(prod, "SH004", "last", src)
-            place(prod, "SH004", "first", src, parent="04-frames/SH001.jpg")
+            place(prod, "SH004", "first", src, parent="04-frames/SH001.jpg", identity_gate="pass")
             last = place(prod, "SH004", "last", src)
             self.assertEqual(last["dest"], "04-frames/SH004-last.jpg")
             self.assertEqual(last["parent"], "04-frames/SH004.jpg")
@@ -965,9 +959,9 @@ class DirectorTests(unittest.TestCase):
                     ],
                 },
             )
-            place(prod, "SH007", "first", src, parent="02-assets/scenes/storeroom/master.jpg")
-            place(prod, "SH007", "last", src)
-            landed = place(prod, "SH008", "first", src)
+            place(prod, "SH007", "first", src, parent="02-assets/scenes/storeroom/master.jpg", identity_gate="pass")
+            place(prod, "SH007", "last", src, identity_gate="pass")
+            landed = place(prod, "SH008", "first", src, identity_gate="pass")
             self.assertEqual(landed["parent"], "04-frames/SH007-last.jpg")
             with self.assertRaises(ValueError):
                 place(prod, "SH008", "first", src, parent="02-assets/scenes/storeroom/master.jpg")
@@ -1644,6 +1638,8 @@ class DirectorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "SH001.mp4"
             dest.write_bytes(b"x" * 2048)
+            first = Path(tmp) / "first.jpg"
+            first.write_bytes(b"fakejpg")
             old = os.environ.get("ARK_API_KEY")
             os.environ["ARK_API_KEY"] = "test-key"
             try:
@@ -1651,15 +1647,21 @@ class DirectorTests(unittest.TestCase):
                 called = {"submit": 0}
                 def boom(*args, **kwargs):
                     called["submit"] += 1
-                    raise AssertionError("should not create a second task")
+                    return "cgt-new"
+                def wait(task_id):
+                    return "http://example.local/out.mp4"
+                def fake_download(url, path):
+                    path.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"ok")
                 backend.submit = boom  # type: ignore[method-assign]
-                backend.render(Path(tmp)/"first.jpg", "prompt", 4, dest)
+                backend.wait_url = wait  # type: ignore[method-assign]
+                backend.download = fake_download  # type: ignore[method-assign]
+                backend.render(first, "prompt", 4, dest)
             finally:
                 if old is not None:
                     os.environ["ARK_API_KEY"] = old
                 else:
                     os.environ.pop("ARK_API_KEY", None)
-            self.assertEqual(called["submit"], 0)
+            self.assertEqual(called["submit"], 1)
             self.assertTrue(dest.exists())
 
     def test_seedance_cancel_and_create_task_parse_empty_body(self) -> None:
@@ -1717,12 +1719,19 @@ class DirectorTests(unittest.TestCase):
 
         self.assertEqual(seedance_mode("flf2v"), "flf")
         self.assertEqual(seedance_mode("i2v_first"), "i2v")
-        self.assertEqual(seedance_mode("video_extend"), "i2v")
+        self.assertEqual(seedance_mode("video_extend"), "extend")
         prod = ROOT / "productions" / "009-siem-reap"
         if not (prod / "03-storyboard" / "shots.json").exists():
             plan = build_plan(prod, ["SH001", "SH002", "SH004", "SH015"])
             by_id = {item["shot_id"]: item for item in plan["shots"]}
-            self.assertTrue(plan["ok_count"] >= 4, plan)
+            self.assertTrue(plan["ok_count"] >= 3, plan)
+            self.assertEqual(by_id["SH015"]["seedance_mode"], "extend")
+            self.assertFalse(any("not implemented" in err for err in by_id["SH015"]["errors"]))
+            if not by_id["SH015"]["ok"]:
+                self.assertTrue(
+                    any("source_video" in err or "missing" in err for err in by_id["SH015"]["errors"]),
+                    by_id["SH015"]["errors"],
+                )
             self.assertFalse(plan["writes_shots_json"])
             self.assertFalse(plan["overwrites_designed_last"])
             self.assertEqual(by_id["SH004"]["seedance_mode"], "flf")

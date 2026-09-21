@@ -33,6 +33,7 @@ FORBIDDEN_KEYS = ("prompt", "video_prompt", "image_prompt", "motion_prompt", "as
 # Per-shot world state. Costume is a free state id that must resolve to an asset; binding is an enum so the
 # machine can tell "hands behind" from "hands in front" without reading Chinese.
 BINDINGS = ("none", "wrists_front", "wrists_behind", "pillar", "snared", "held")
+BINDING_UNKNOWN = "unknown"
 # Body orientation of the foreground person. Eyeline is where they look — do not reuse it as facing.
 BODY_FACING = ("朝镜头", "四分之三", "侧脸", "背对镜头", "无人")
 CAMERA_SIDE = ("front", "front-left", "front-right", "behind", "left", "right")
@@ -202,7 +203,14 @@ def turn_is_written(shot: dict) -> bool:
 
 
 def orientation_errors(shots: list[dict]) -> list[str]:
-    """Hard filmability: OTC cannot see behind the foreground person; no unmotivated front↔back flip."""
+    """World facing vs camera projection.
+
+    A reverse / OTC camera change may flip front↔back without 转身.
+    Same-setup facing flips still need a written turn. Foreground OTC
+    shoulder/后脑 is the camera, not the subject turning around.
+    """
+    from .setup_anchors import camera_projection_changed
+
     errors: list[str] = []
     prev: Optional[dict] = None
     for shot in shots:
@@ -221,19 +229,22 @@ def orientation_errors(shots: list[dict]) -> list[str]:
                 f"(肩后/身后); use a dirty single from in front, not over-shoulder"
             )
         if coverage in OTC_COVERAGE and facing_class(shot) == "back":
-            errors.append(
-                f"{sid} {coverage} describes the shoulder owner as 背对镜头/后脑; "
-                f"over-shoulder is not turning them around"
-            )
+            left = _t(shot.get("left"))
+            if not re.search(r"肩|后脑|背", left):
+                errors.append(
+                    f"{sid} {coverage} describes the subject as 背对镜头/后脑; "
+                    f"over-shoulder is not turning them around"
+                )
         if prev is not None and _t(prev.get("scene_id")) == _t(shot.get("scene_id")):
-            prev_face = facing_class(prev)
-            this_face = facing_class(shot)
-            if prev_face and this_face and prev_face != this_face:
-                if not (turn_is_written(prev) or turn_is_written(shot)):
-                    errors.append(
-                        f"{sid} facing flips {prev_face}→{this_face} from {_t(prev.get('shot_id'))} "
-                        f"with no 转身/回头 in in_from/out_to/one_action"
-                    )
+            if not camera_projection_changed(prev, shot):
+                prev_face = facing_class(prev)
+                this_face = facing_class(shot)
+                if prev_face and this_face and prev_face != this_face:
+                    if not (turn_is_written(prev) or turn_is_written(shot)):
+                        errors.append(
+                            f"{sid} facing flips {prev_face}→{this_face} from {_t(prev.get('shot_id'))} "
+                            f"with no 转身/回头 in in_from/out_to/one_action"
+                        )
         prev = shot
     return errors
 
@@ -345,8 +356,10 @@ def needed_seconds(shot: dict) -> float:
 
 
 def has_long_take_reason(shot: dict) -> bool:
-    blob = _t(shot.get("shot_job")) + _t(shot.get("one_action"))
-    return LONG_TAKE_REASON in blob
+    if shot.get("approved_long_take") or shot.get("long_take_approved"):
+        return True
+    blob = _t(shot.get("shot_job")) + _t(shot.get("one_action")) + _t(shot.get("long_take_reason"))
+    return LONG_TAKE_REASON in blob or bool(_t(shot.get("long_take_reason")))
 
 
 def has_compound_action(shot: dict) -> bool:
@@ -457,13 +470,33 @@ def _check_shot_pace(
             _spm_flag(f"scene {scene_id}", group)
 
 
-def writer_lines(writer: Optional[dict]) -> dict[str, list[str]]:
-    """scene_id -> verbatim lines (dialogue only; narration is not a shot line)."""
-    out: dict[str, list[str]] = {}
+def writer_dialogue_records(writer: Optional[dict]) -> dict[str, list[dict]]:
+    """scene_id -> immutable dialogue records with line_id + speaker_id."""
+    out: dict[str, list[dict]] = {}
     for scene in (writer or {}).get("scenes") or []:
         sid = _t(scene.get("scene_id"))
-        out[sid] = [_t(item.get("line")) for item in scene.get("dialogue") or [] if _t(item.get("line"))]
+        rows: list[dict] = []
+        for index, item in enumerate(scene.get("dialogue") or [], start=1):
+            if not isinstance(item, dict):
+                continue
+            line = _t(item.get("line"))
+            if not line:
+                continue
+            speaker = _t(item.get("speaker_id") or item.get("character") or item.get("id"))
+            rows.append({
+                "line_id": _t(item.get("line_id")) or f"{sid}:d{index:02d}",
+                "speaker_id": speaker,
+                "character": _t(item.get("character")) or speaker,
+                "scene_id": sid,
+                "line": line,
+            })
+        out[sid] = rows
     return out
+
+
+def writer_lines(writer: Optional[dict]) -> dict[str, list[str]]:
+    """scene_id -> verbatim lines (dialogue only; narration is not a shot line)."""
+    return {sid: [item["line"] for item in rows] for sid, rows in writer_dialogue_records(writer).items()}
 
 
 def writer_locations(writer: Optional[dict]) -> dict[str, str]:
@@ -536,9 +569,14 @@ def normalize_state(state: Any) -> Optional[dict]:
         carrying = item.get("carrying")
         if isinstance(carrying, str):
             carrying = [carrying]
+        raw_binding = item.get("binding")
+        if raw_binding is None or not _t(raw_binding):
+            binding = "none"
+        else:
+            binding = _t(raw_binding)
         characters[_t(cid)] = {
             "costume": _t(item.get("costume")),
-            "binding": _t(item.get("binding")) or "none",
+            "binding": binding,
             "bound_with": _t(item.get("bound_with")),
             "carrying": sorted(_t(x) for x in (carrying or []) if _t(x)),
             "in_frame": item.get("in_frame", True) is not False,
@@ -1166,9 +1204,6 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
         if coverage in coverage_alias:
             shot["coverage_type"] = coverage_alias[coverage]
         duration = _sec(shot.get("duration_sec"), 0)
-        if duration > 15:
-            shot["duration_sec"] = 15
-            duration = 15
         if duration > 0:
             need = needed_seconds(shot)
             hook_keep = (
@@ -1181,7 +1216,7 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
                 and not payload.get("keep_paper_duration")
                 and duration + 0.05 < need <= duration + 1.0
             ):
-                shot["duration_sec"] = store_duration(min(15, duration + 1))
+                shot["duration_sec"] = store_duration(duration + 1)
         if not _t(shot.get("angle")):
             shot["angle"] = "eye"
         if shot.get("key_sfx") is None:
@@ -1209,9 +1244,7 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
                 if not isinstance(item, dict):
                     continue
                 if item.get("binding") not in BINDINGS:
-                    item["binding"] = "none"
-                if item.get("binding") != "none" and not item.get("bound_with"):
-                    item["binding"] = "none"
+                    item["binding"] = BINDING_UNKNOWN
             shot["state"] = state
             shot["state_changes"] = change_tags(shot.get("state_changes"))
         shots.append(shot)
@@ -1306,20 +1339,21 @@ def compile_specs_from_shot_table(data: dict, *, aspect: str = "16:9") -> dict:
     return {"shot_specs": specs, "status": "draft", "origin": "compiled-from-shot-table", "schema": SCHEMA}
 
 
-def table_context(prod, target_model: Optional[str] = None, episode: int = 1) -> dict:
+def table_context(prod, target_model: Optional[str] = None, episode=1) -> dict:
     """Everything the validator and the renderer need from disk: writer, sets, look text, model profile."""
-    from .pipeline import episode_artifact_name, read_artifact
+    from .pipeline import episode_artifact_name, episode_label, episode_number, read_artifact
     from .production import load_json, read_text
     from .video_profiles import get_profile, resolve_target_model
 
     model = resolve_target_model(prod, target_model)
     writer_name = episode_artifact_name("writer.json", episode)
     writer = read_artifact(prod, writer_name)
-    if not writer.get("scenes") and int(episode) != 1:
+    if not writer.get("scenes") and episode_number(episode) != 1:
         writer = read_artifact(prod, "writer.json")
-    sets_rel = "03-storyboard/sets.json" if int(episode) == 1 else f"03-storyboard/sets.ep{int(episode):02d}.json"
+    label = episode_label(episode)
+    sets_rel = "03-storyboard/sets.json" if not label else f"03-storyboard/sets.{label}.json"
     sets = load_json(prod, sets_rel, {"sets": []})
-    if int(episode) != 1 and not (sets.get("sets") or []):
+    if label and not (sets.get("sets") or []):
         sets = load_json(prod, "03-storyboard/sets.json", {"sets": []})
     return {
         "writer": writer,

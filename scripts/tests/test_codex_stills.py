@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 from director.codex_stills import (  # noqa: E402
     StillPackError,
+    last_still_pack_report,
     missing_costume_state_files,
     pack_codex_still_refs,
 )
@@ -86,6 +87,9 @@ class StillPack(unittest.TestCase):
             self.assertLessEqual(len(files), 5)
             self.assertEqual(files[0], parent)
             self.assertTrue(all(item.endswith("face.jpg") for item in files[1:]))
+            report = last_still_pack_report()
+            self.assertTrue(report["dropped"], report)
+            self.assertIn("参考预算", report["risk"])
             self.assertNotIn(parent, files[1:])
             roles = compile_reference_roles_from_files(files, assets)
             for i, rel in enumerate(files, 1):
