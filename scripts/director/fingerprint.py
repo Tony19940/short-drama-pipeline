@@ -13,7 +13,19 @@ from .pipeline import episode_artifact_name, read_artifact, uses_pipeline
 from .prompts import compile_h3_fields, compile_video_prompt, identity_refs, still_refs, video_mode
 from .shot_repo import select_shots
 from .store import exclusive_state_lock, load_approvals, save_approvals
-from .vendor_request import COMPILER_VERSION, media_hash, vendor_request_from_package
+from .vendor_request import (
+    COMPILER_VERSION,
+    VendorRequest,
+    media_hash,
+    task_kind_for_gen_mode,
+    task_needs_first_frame,
+    task_needs_last_frame,
+    task_needs_refs,
+    task_needs_source_video,
+    vendor_request_from_package,
+)
+
+SNAPSHOT_DIR = ".pipeline/confirmed-requests"
 
 
 def _shots(prod: Path, episode: Any = 1) -> list[dict]:
@@ -81,14 +93,121 @@ def _pipeline_specs(prod: Path, shot_ids: Optional[list[str]], episode: Any = 1)
         pkg = by_id.get(sid)
         if not pkg:
             raise ValueError(f"{sid} 没有生成包")
-        request = vendor_request_from_package(prod, pkg, frames.get(sid) or {}, episode=episode, refs=[])
+        request = vendor_request_from_package(prod, pkg, frames.get(sid) or {}, episode=episode)
+        from .pipeline import episode_shot_dir
+
         specs.append({
             "id": sid,
             "vendor_request": request.to_dict(),
             "fingerprint": request.fingerprint(),
-            "dest": f"{request.episode_id and '' or ''}{shot.get('frame')}",
+            "dest": f"{episode_shot_dir(episode)}/{sid}.mp4",
         })
     return specs
+
+
+def confirmed_snapshot_rel(fingerprint: str) -> str:
+    return f"{SNAPSHOT_DIR}/{str(fingerprint).strip()}.json"
+
+
+def write_confirmed_snapshot(
+    prod: Path,
+    fingerprint: str,
+    *,
+    episode: Any,
+    shot_ids: list[str],
+    requests: list[dict],
+    extra: Optional[dict] = None,
+) -> str:
+    rel = confirmed_snapshot_rel(fingerprint)
+    dest = Path(prod) / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    body = {
+        "fingerprint": fingerprint,
+        "compiler_version": COMPILER_VERSION,
+        "episode": episode,
+        "shot_ids": list(shot_ids),
+        "requests": list(requests),
+        "at": int(time.time()),
+    }
+    if extra:
+        body.update(extra)
+    tmp = dest.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(dest)
+    return rel
+
+
+def load_confirmed_snapshot(prod: Path, fingerprint_or_rel: str) -> dict:
+    raw = str(fingerprint_or_rel or "").strip()
+    if not raw:
+        raise PermissionError("missing confirmed snapshot")
+    path = Path(raw)
+    if not path.is_absolute():
+        rel = raw if raw.endswith(".json") or "/" in raw else confirmed_snapshot_rel(raw)
+        path = Path(prod) / rel
+    if not path.is_file():
+        raise PermissionError(f"confirmed snapshot missing: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PermissionError(f"confirmed snapshot unreadable: {path}") from exc
+    if not isinstance(data, dict) or not data.get("requests"):
+        raise PermissionError("confirmed snapshot has no requests")
+    return data
+
+
+def snapshot_requests(data: dict) -> list[VendorRequest]:
+    return [VendorRequest.from_dict(item) for item in (data.get("requests") or []) if isinstance(item, dict)]
+
+
+def require_task_inputs(prod: Path, selected: list[dict], episode: Any = 1) -> None:
+    """Gate inputs by task_kind. Extend/edit/reference do not invent a first frame."""
+    from .pipeline import episode_artifact_name, episode_frame_dir, read_artifact, uses_pipeline
+
+    if not uses_pipeline(prod):
+        shots = _shots(prod, episode)
+        for shot in selected:
+            dest = prod / (shot.get("frame") or f"{episode_frame_dir(episode)}/{shot['id']}.jpg")
+            if not dest.exists():
+                raise PermissionError(f"{shot['id']} 还没有锁定首帧")
+            source = i2v_source(prod, shot, shots)
+            if not source["exists"]:
+                raise PermissionError(f"{shot['id']} 缺 I2V 源：{source['reason']}")
+        return
+    pkg_data = read_artifact(prod, episode_artifact_name("gen_packages.json", episode))
+    packages = {
+        item.get("shot_id"): item
+        for item in (pkg_data.get("packages") or pkg_data.get("gen_packages") or [])
+    }
+    frames = {
+        item.get("shot_id"): item
+        for item in (read_artifact(prod, episode_artifact_name("keyframes.json", episode)).get("keyframes") or [])
+        if item.get("shot_id")
+    }
+    for shot in selected:
+        sid = shot["id"]
+        pkg = packages.get(sid) or {}
+        kf = frames.get(sid) or {}
+        kind = task_kind_for_gen_mode(str(pkg.get("gen_mode") or "i2v_first"))
+        if task_needs_first_frame(kind):
+            rel = str(shot.get("frame") or kf.get("first_frame_file") or pkg.get("first_frame") or f"{episode_frame_dir(episode)}/{sid}.jpg")
+            if not (Path(prod) / rel).exists():
+                raise PermissionError(f"{sid} 还没有锁定首帧")
+        if task_needs_last_frame(kind):
+            last = str(kf.get("last_frame_file") or pkg.get("last_frame") or "")
+            if not last or not (Path(prod) / last).exists():
+                raise PermissionError(f"{sid} 缺尾帧")
+        if task_needs_refs(kind):
+            refs = [str(item).strip() for item in (pkg.get("refs") or []) if str(item).strip()]
+            if not refs:
+                raise PermissionError(f"{sid} reference 缺参考图")
+            for rel in refs:
+                if not (Path(prod) / rel).exists():
+                    raise PermissionError(f"{sid} 缺参考 {rel}")
+        if task_needs_source_video(kind):
+            src = str(pkg.get("source_video") or pkg.get("reference_video") or kf.get("source_video") or "")
+            if not src or not (Path(prod) / src).exists():
+                raise PermissionError(f"{sid} {kind} 缺 source_video")
 
 
 def fingerprint_for(prod: Path, shot_ids: Optional[list[str]] = None, episode: Any = 1) -> tuple[str, list[dict]]:
@@ -126,27 +245,21 @@ def prepare_render(
     from .pipeline import assert_keyframes_passed, assert_packages_confirmed, uses_pipeline
     if uses_pipeline(prod):
         require_fresh_gate(prod, "C2")
-        assert_packages_confirmed(prod)
-        assert_keyframes_passed(prod)
+        assert_packages_confirmed(prod, episode)
+        assert_keyframes_passed(prod, episode)
     check = run_check(prod)
     if not check["ok"]:
         raise PermissionError(check["stderr"] or check["stdout"] or "check_prod 未过，不能出视频")
     selected = _selected(prod, shot_ids, episode)
-    if not uses_pipeline(prod):
-        shots = _shots(prod, episode)
-        for shot in selected:
-            dest = prod / shot.get("frame", f"04-frames/{shot['id']}.jpg")
-            if not dest.exists():
-                raise PermissionError(f"{shot['id']} 还没有锁定首帧")
-            source = i2v_source(prod, shot, shots)
-            if not source["exists"]:
-                raise PermissionError(f"{shot['id']} 缺 I2V 源：{source['reason']}")
-    else:
-        for shot in selected:
-            dest = prod / shot.get("frame", f"04-frames/{shot['id']}.jpg")
-            if not dest.exists():
-                raise PermissionError(f"{shot['id']} 还没有锁定首帧")
+    require_task_inputs(prod, selected, episode)
     fingerprint, specs = fingerprint_for(prod, [shot["id"] for shot in selected], episode)
+    snapshot = write_confirmed_snapshot(
+        prod,
+        fingerprint,
+        episode=episode,
+        shot_ids=[shot["id"] for shot in selected],
+        requests=[item.get("vendor_request") for item in specs if item.get("vendor_request")],
+    )
     with exclusive_state_lock(prod, "approvals"):
         approvals = load_approvals(prod)
         approvals["render"] = {
@@ -155,6 +268,7 @@ def prepare_render(
             "review_track": bool(review_track),
             "consumed": False,
             "episode": episode,
+            "snapshot": snapshot,
             "at": int(time.time()),
         }
         save_approvals(prod, approvals)
@@ -194,6 +308,13 @@ def consume_render_fingerprint(
         rec["consumed"] = True
         rec["used_at"] = int(time.time())
         rec["review_track"] = bool(review_track)
+        rec["snapshot"] = write_confirmed_snapshot(
+            prod,
+            fingerprint,
+            episode=episode,
+            shot_ids=want,
+            requests=[item.get("vendor_request") for item in _specs if item.get("vendor_request")],
+        )
         approvals["render"] = rec
         save_approvals(prod, approvals)
         return fingerprint

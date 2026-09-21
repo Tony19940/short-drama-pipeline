@@ -101,18 +101,39 @@ def main() -> None:
     p.add_argument("--prod", required=True)
     p.add_argument("--only", nargs="*")
     p.add_argument("--out", required=True)
+    p.add_argument("--episode", default="1")
     args = p.parse_args()
 
     prod = Path(args.prod).resolve()
-    shots = json.loads((prod / "03-storyboard" / "shots.json").read_text())["shots"]
     want = args.only or []
-    selected = [s for s in shots if not want or s["id"] in want]
+    selected = []
+    shot_dir = "05-shots"
+    try:
+        import sys
+
+        scripts = Path(__file__).resolve().parent
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from director.pipeline import episode_shot_dir
+        from director.shot_repo import select_shots
+
+        shot_dir = episode_shot_dir(args.episode)
+        rows = select_shots(prod, want or None, args.episode)
+        selected = [{"id": row.get("id") or row.get("shot_id")} for row in rows]
+    except Exception:
+        selected = []
+    if not selected:
+        shots = json.loads((prod / "03-storyboard" / "shots.json").read_text())["shots"]
+        selected = [s for s in shots if not want or s["id"] in want]
     if not selected:
         raise SystemExit("no shots")
 
     clips = []
     for s in selected:
-        mp4 = prod / "05-shots" / f"{s['id']}.mp4"
+        sid = s.get("id") or s.get("shot_id")
+        mp4 = prod / shot_dir / f"{sid}.mp4"
+        if not mp4.exists() and shot_dir != "05-shots":
+            mp4 = prod / "05-shots" / f"{sid}.mp4"
         if not mp4.exists():
             raise SystemExit(f"missing {mp4}")
         clips.append((s, mp4, probe_duration(mp4)))

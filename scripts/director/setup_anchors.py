@@ -17,9 +17,6 @@ def _t(value: Any) -> str:
     return str(value or "").strip()
 
 
-REVERSE_COVERAGE = {"reverse", "otc", "ots"}
-
-
 def setup_id_of(shot: Optional[dict]) -> str:
     shot = shot or {}
     explicit = _t(shot.get("setup_id"))
@@ -29,26 +26,17 @@ def setup_id_of(shot: Optional[dict]) -> str:
     coverage = _t(shot.get("coverage_type"))
     side = _t(shot.get("camera_side"))
     scale = _t(shot.get("scale") or shot.get("shot_size"))
-    return f"{scene}|{coverage}|{side}|{scale}"
+    camera = _t(shot.get("camera_id"))
+    return f"{scene}|{coverage}|{side}|{scale}|{camera}"
 
 
 def camera_projection_changed(prev: Optional[dict], shot: Optional[dict]) -> bool:
-    """True when the camera, not the subject, moved."""
+    """True when the camera placement, not the subject, changed."""
     if not prev or not shot:
         return False
     if _t(prev.get("scene_id")) != _t(shot.get("scene_id")):
         return True
-    a, b = _t(prev.get("setup_id")), _t(shot.get("setup_id"))
-    if a and b and a != b:
-        return True
-    cov_a, cov_b = _t(prev.get("coverage_type")), _t(shot.get("coverage_type"))
-    side_a, side_b = _t(prev.get("camera_side")), _t(shot.get("camera_side"))
-    if cov_b in REVERSE_COVERAGE or cov_a in REVERSE_COVERAGE:
-        if cov_a != cov_b or (side_a and side_b and side_a != side_b):
-            return True
-    if side_a and side_b and side_a != side_b:
-        return True
-    return False
+    return setup_id_of(prev) != setup_id_of(shot)
 
 
 def same_setup(prev: Optional[dict], shot: Optional[dict]) -> bool:
@@ -56,7 +44,7 @@ def same_setup(prev: Optional[dict], shot: Optional[dict]) -> bool:
         return False
     if _t(prev.get("scene_id")) != _t(shot.get("scene_id")):
         return False
-    return not camera_projection_changed(prev, shot)
+    return setup_id_of(prev) == setup_id_of(shot)
 
 
 def shot_row(prod: Path, shot_id: str, episode=1) -> Optional[dict]:

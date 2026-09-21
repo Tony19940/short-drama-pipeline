@@ -39,6 +39,14 @@ def _truthy(name: str, default: str = "0") -> bool:
 FACE_BLOCK_CODE = "InputImageSensitiveContentDetected.PrivacyInformation"
 
 
+def looks_like_mp4_file(path: Path) -> bool:
+    dest = Path(path)
+    if not dest.is_file() or dest.stat().st_size <= 1024:
+        return False
+    head = dest.read_bytes()[:32]
+    return b"ftyp" in head
+
+
 class SeedanceFaceBlock(RuntimeError):
     """First-frame real-person privacy block. Official path may fall back to MiniMax-H3."""
 
@@ -110,13 +118,15 @@ class SeedanceArk:
         if not isinstance(request, VendorRequest):
             raise TypeError("from_request expects VendorRequest")
         profile = get_profile(request.profile_id)
-        return cls(
+        inst = cls(
             model=request.model,
             resolution=request.resolution,
             min_duration=int(profile.get("min_shot_sec") or 4),
             max_duration=int(profile.get("max_shot_sec") or 15),
             generate_audio=request.generate_audio,
         )
+        inst.watermark = bool(getattr(request, "watermark", False))
+        return inst
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -220,10 +230,25 @@ class SeedanceArk:
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
     def looks_like_mp4(self, path: Path) -> bool:
-        if not path.is_file() or path.stat().st_size <= 1024:
+        return looks_like_mp4_file(path)
+
+    @staticmethod
+    def clip_matches_request(dest: Path, request_hash: str) -> bool:
+        if not looks_like_mp4_file(dest):
             return False
-        head = path.read_bytes()[:32]
-        return b"ftyp" in head
+        path = dest.with_suffix(dest.suffix + ".ark-task.json")
+        if not path.is_file():
+            return False
+        try:
+            ticket = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(ticket, dict):
+            return False
+        stored = str(ticket.get("request_hash") or "").strip()
+        if not stored or stored != str(request_hash or "").strip():
+            return False
+        return str(ticket.get("status") or "") in {"succeeded", "downloaded", "verified"}
 
     def build_payload(
         self,
@@ -236,12 +261,14 @@ class SeedanceArk:
         ratio: str | None = None,
         generate_audio: bool | None = None,
         source_video: Path | None = None,
+        watermark: bool | None = None,
     ) -> dict:
         if mode == "video_extend":
             mode = "extend"
         if mode not in {"i2v", "flf", "extend", "edit", "reference"}:
             raise RuntimeError(f"unsupported Seedance mode: {mode}")
         audio = self.generate_audio if generate_audio is None else bool(generate_audio)
+        mark = self.watermark if watermark is None else bool(watermark)
         if mode in {"extend", "edit"}:
             if source_video is None or not Path(source_video).is_file():
                 raise RuntimeError(f"{mode} requires reference_video")
@@ -253,9 +280,9 @@ class SeedanceArk:
                     self._video_item(Path(source_video), "reference_video"),
                 ],
                 "duration": duration,
-                "ratio": "adaptive",
+                "ratio": ratio or "adaptive",
                 "resolution": self.resolution,
-                "watermark": self.watermark,
+                "watermark": mark,
                 "generate_audio": audio,
                 "return_last_frame": True,
             }
@@ -275,7 +302,7 @@ class SeedanceArk:
                 "duration": self.clamp_duration(seconds),
                 "ratio": ratio or "adaptive",
                 "resolution": self.resolution,
-                "watermark": self.watermark,
+                "watermark": mark,
                 "generate_audio": audio,
                 "return_last_frame": True,
             }
@@ -295,16 +322,19 @@ class SeedanceArk:
                 if ref.resolve() == image.resolve():
                     continue
                 content.append(self._image_item(ref, "reference_image"))
-        submit_ratio = ratio or ("adaptive" if self._is_25() else _aspect_of(image))
-        if self._is_25() and mode in {"i2v", "flf"}:
+        if ratio:
+            submit_ratio = ratio
+        elif self._is_25() and mode in {"i2v", "flf"}:
             submit_ratio = "adaptive"
+        else:
+            submit_ratio = _aspect_of(image)
         return {
             "model": self.model,
             "content": content,
             "duration": duration,
             "ratio": submit_ratio,
             "resolution": self.resolution,
-            "watermark": self.watermark,
+            "watermark": mark,
             "generate_audio": audio,
             "return_last_frame": True,
         }
@@ -320,6 +350,8 @@ class SeedanceArk:
         idempotency_key: str | None = None,
         generate_audio: bool | None = None,
         source_video: Path | None = None,
+        ratio: str | None = None,
+        watermark: bool | None = None,
     ) -> str:
         if mode == "t2v":
             raise RuntimeError("Seedance 成片路径不能走文生视频")
@@ -332,6 +364,8 @@ class SeedanceArk:
             last_frame=last_frame,
             generate_audio=generate_audio,
             source_video=source_video,
+            ratio=ratio,
+            watermark=watermark,
         )
         headers = self._headers()
         if idempotency_key:
@@ -412,9 +446,14 @@ class SeedanceArk:
 
     def download(self, url: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
+        part = dest.with_name(dest.name + ".part")
         response = requests.get(url, timeout=600)
         response.raise_for_status()
-        dest.write_bytes(response.content)
+        part.write_bytes(response.content)
+        if not looks_like_mp4_file(part):
+            part.unlink(missing_ok=True)
+            raise RuntimeError("downloaded file failed mp4 technical check")
+        part.replace(dest)
 
     def render(
         self,
@@ -429,6 +468,9 @@ class SeedanceArk:
         generate_audio: bool | None = None,
         source_video: Path | None = None,
         request_hash: str = "",
+        ratio: str | None = None,
+        watermark: bool | None = None,
+        submit_duration: int | None = None,
     ) -> None:
         dropped = mode == "flf" and last_frame is not None and last_frame.exists() and bool(refs)
         req_hash = request_hash or self.compute_request_hash(
@@ -448,20 +490,26 @@ class SeedanceArk:
         )
         ticket = {} if force else self._read_ticket(dest)
         ticket_hash = str(ticket.get("request_hash") or "")
+        if not force and self.clip_matches_request(dest, req_hash):
+            print(f"  skip existing {dest}", flush=True)
+            return
         if not force and dest.exists() and dest.stat().st_size > 1024:
-            if ticket_hash == req_hash and self.looks_like_mp4(dest):
-                print(f"  skip existing {dest}", flush=True)
-                return
             print(f"  dest exists but request changed or clip unreadable; not skipping", flush=True)
         task_id = "" if force else str(ticket.get("task_id") or "").strip()
-        if task_id and ticket_hash and ticket_hash != req_hash:
+        if task_id and not ticket_hash:
+            print("  legacy ticket has no request_hash; refusing to resume", flush=True)
             task_id = ""
+        elif task_id and ticket_hash != req_hash:
+            task_id = ""
+        sent_seconds = seconds if submit_duration is None else submit_duration
         if not task_id:
-            if mode not in {"edit"}:
+            if mode not in {"edit"} and sent_seconds != -1:
                 self.clamp_duration(seconds, shot_id=dest.stem)
-            key = f"{dest.resolve().as_posix()}:{req_hash[:16]}"
-            if force or str(ticket.get("status") or "") == "submitting":
-                key = f"{key}:{int(time.time())}"
+            key = str(ticket.get("idempotency_key") or "")
+            if force or not key or ticket_hash != req_hash:
+                key = f"{dest.resolve().as_posix()}:{req_hash[:16]}"
+                if force:
+                    key = f"{key}:{int(time.time())}"
             self._write_ticket(
                 dest,
                 {"status": "submitting", "idempotency_key": key, "dest": str(dest), "request_hash": req_hash},
@@ -469,13 +517,15 @@ class SeedanceArk:
             task_id = self.submit(
                 image,
                 prompt,
-                seconds,
+                sent_seconds if mode != "edit" else seconds,
                 refs=refs,
                 mode=mode,
                 last_frame=last_frame,
                 idempotency_key=key,
                 generate_audio=generate_audio,
                 source_video=source_video,
+                ratio=ratio,
+                watermark=watermark,
             )
             self._write_ticket(
                 dest,
@@ -493,7 +543,50 @@ class SeedanceArk:
         url = self.wait_url(task_id)
         self._write_ticket(
             dest,
-            {"task_id": task_id, "status": "succeeded", "url": url, "dest": str(dest), "request_hash": req_hash},
+            {
+                "task_id": task_id,
+                "status": "remote_succeeded",
+                "url": url,
+                "dest": str(dest),
+                "request_hash": req_hash,
+            },
         )
         self.download(url, dest)
+        self._write_ticket(
+            dest,
+            {
+                "task_id": task_id,
+                "status": "verified",
+                "url": url,
+                "dest": str(dest),
+                "request_hash": req_hash,
+            },
+        )
         print(f"  wrote {dest}", flush=True)
+
+    def render_request(self, request: object, dest: Path, *, prod: Path, force: bool = False) -> None:
+        from director.vendor_request import VendorRequest
+        from director.paths import safe_under
+
+        if not isinstance(request, VendorRequest):
+            raise TypeError("render_request expects VendorRequest")
+        image = safe_under(prod, request.first_frame) if request.first_frame else dest
+        last = safe_under(prod, request.last_frame) if request.last_frame else None
+        source = safe_under(prod, request.source_video) if request.source_video else None
+        refs = [safe_under(prod, rel) for rel in request.refs if rel]
+        self.render(
+            image,
+            request.prompt,
+            int(request.duration_sec),
+            dest,
+            refs=refs,
+            mode=request.seedance_mode(),
+            last_frame=last,
+            force=force,
+            generate_audio=request.generate_audio,
+            source_video=source,
+            request_hash=request.fingerprint(),
+            ratio=request.submit_ratio or request.ratio,
+            watermark=request.watermark,
+            submit_duration=int(request.submit_duration_sec),
+        )

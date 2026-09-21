@@ -34,7 +34,7 @@ DESIGN_FORBIDDEN = {"prompt", "video_prompt", "asset_id", "image_file", "image_p
 SPEC_FORBIDDEN = {"prompt", "asset_id", "keyframe_file", "image_prompt", "motion_prompt"}
 COVERAGE_TYPES = {"master", "otc", "ots", "reverse", "reaction", "insert", "empty", "continuous", "close", "single", "pov", "follow"}
 SHOT_TABLE_SCHEMA = "shot-table-v2"
-GEN_MODES = {"i2v_first", "flf2v", "video_extend"}
+GEN_MODES = {"i2v_first", "flf2v", "video_extend", "r2v", "edit"}
 MODELS_ZH = {
     "seedance_2_5",
     "seedance",
@@ -270,7 +270,7 @@ def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional
         if pkg.get("keyframe_files"):
             errors.append(f"{sid} package cannot name keyframe files")
         if pkg.get("gen_mode") not in GEN_MODES:
-            errors.append(f"{sid} gen_mode must be i2v_first/flf2v/video_extend")
+            errors.append(f"{sid} gen_mode must be i2v_first/flf2v/video_extend/r2v/edit")
         if _text(pkg.get("gen_mode")) == "t2v":
             errors.append(f"{sid} t2v cannot be the finish path")
         if not pkg.get("asset_refs"):
@@ -348,10 +348,9 @@ def validate_keyframes(
         return errors
     if not _text(data.get("reviewed_by")):
         errors.append("keyframes need reviewed_by: a human name, not an agent")
-    plans = {
-        _text(p.get("shot_id")): _text(p.get("keyframe_plan"))
-        for p in ((packages or {}).get("packages") or (packages or {}).get("gen_packages") or [])
-    }
+    pkg_rows = (packages or {}).get("packages") or (packages or {}).get("gen_packages") or []
+    plans = {_text(p.get("shot_id")): _text(p.get("keyframe_plan")) for p in pkg_rows}
+    gen_modes = {_text(p.get("shot_id")): _text(p.get("gen_mode")) for p in pkg_rows}
     tight: set[str] = set()
     for shot in (table or {}).get("shots") or []:
         sid = _text(shot.get("shot_id"))
@@ -365,7 +364,8 @@ def validate_keyframes(
         qc = item.get("qc") or {}
         first = _text(item.get("first_frame_file"))
         last = _text(item.get("last_frame_file"))
-        if not first:
+        needs_first = gen_modes.get(sid, "i2v_first") not in {"r2v", "video_extend", "edit"}
+        if needs_first and not first:
             errors.append(f"{sid} missing first_frame_file")
         for key in KEYFRAME_QC_KEYS:
             if not qc.get(key):
@@ -1404,27 +1404,27 @@ def confirm_packages(prod: Path, confirmed: bool = True) -> dict:
     data["status"] = "ready" if confirmed else "draft"
     return write_artifact(prod, "gen_packages.json", data)
 
-def assert_packages_confirmed(prod: Path) -> None:
+def assert_packages_confirmed(prod: Path, episode: Any = 1) -> None:
     if not uses_pipeline(prod):
         return
-    data = read_artifact(prod, "gen_packages.json")
+    data = read_artifact(prod, episode_artifact_name("gen_packages.json", episode))
     if not data:
         return
     if not packages_confirmed(data):
         raise PermissionError("packages not confirmed")
 
-def assert_keyframes_passed(prod: Path) -> None:
+def assert_keyframes_passed(prod: Path, episode: Any = 1) -> None:
     if not uses_pipeline(prod):
         return
-    data = read_artifact(prod, "keyframes.json")
+    data = read_artifact(prod, episode_artifact_name("keyframes.json", episode))
     if not data:
         return
-    raise_if(validate_keyframes(data, **keyframe_context(prod)))
+    raise_if(validate_keyframes(data, **keyframe_context(prod, episode)))
 
-def assert_clips_passed(prod: Path) -> None:
+def assert_clips_passed(prod: Path, episode: Any = 1) -> None:
     if not uses_pipeline(prod):
         return
-    data = read_artifact(prod, "clips.json")
+    data = read_artifact(prod, episode_artifact_name("clips.json", episode))
     if not data:
         return
     raise_if(validate_clips(data))

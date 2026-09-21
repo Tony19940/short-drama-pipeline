@@ -694,6 +694,7 @@ FRAME_DESC_SHOT_KEYS = (
     "shot_id", "beat", "shot_job", "coverage_type", "scale", "angle", "height", "lens", "move_type", "move_reason",
     "left", "right", "eyeline", "body_facing", "camera_side", "one_action", "duration_sec", "dialogue_ref", "light",
     "in_from", "out_to", "state", "emotion_level",
+    "setup_id", "camera_id", "t0_phase", "action_timing",
 )
 
 
@@ -759,14 +760,23 @@ def _repair_writer_lines(shots: list[dict], writer: dict, scene_id: str) -> list
     def pick(item: dict) -> Optional[dict]:
         line = str(item.get("line") or "").strip()
         line_id = str(item.get("line_id") or "").strip()
+        speaker = str(item.get("speaker_id") or item.get("character") or "").strip()
         unused = [row for row in records if used_ids.count(row["line_id"]) < 1]
         if line_id:
             for row in unused:
                 if row["line_id"] == line_id:
                     return row
-        for row in unused:
-            if line == row["line"] or (line and (line in row["line"] or row["line"] in line)):
-                return row
+            return None
+        if not line:
+            return None
+        matches = [row for row in unused if row["line"] == line]
+        if speaker:
+            matches = [
+                row for row in matches
+                if row.get("speaker_id") == speaker or row.get("character") == speaker
+            ]
+        if len(matches) == 1:
+            return matches[0]
         return None
 
     for shot in shots:
@@ -781,12 +791,14 @@ def _repair_writer_lines(shots: list[dict], writer: dict, scene_id: str) -> list
                 if match["character"] and not str(item.get("character") or "").strip():
                     item["character"] = match["character"]
                 used_ids.append(match["line_id"])
-            elif str(item.get("line") or "").strip():
+            elif str(item.get("line") or "").strip() or str(item.get("line_id") or "").strip():
+                kind = "unknown_line_id" if str(item.get("line_id") or "").strip() else "unmatched_dialogue"
                 proposals.append({
-                    "kind": "unmatched_dialogue",
+                    "kind": kind,
                     "shot_id": str(shot.get("shot_id") or ""),
                     "scene_id": scene_id,
                     "line": str(item.get("line") or "").strip(),
+                    "line_id": str(item.get("line_id") or "").strip(),
                     "speaker": str(item.get("character") or item.get("speaker_id") or ""),
                 })
     return proposals

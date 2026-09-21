@@ -38,12 +38,17 @@ from director.prompts import MAX_ZH_PROMPT_CHARS
 from director.speech import DEFAULT_DIALOGUE_LANGUAGE, DEFAULT_SPEECH_MODE, SpeechLanguageError, check_dialogue_language
 from director.vendor_request import (
     DurationOutOfRange,
+    GEN_MODE_TO_TASK,
     UnsupportedTaskKind,
+    VendorRequest,
     resolve_render_seconds,
     seedance_mode_for_task,
     task_kind_for_gen_mode,
+    task_needs_first_frame,
     vendor_request_from_package,
 )
+
+TASK_TO_GEN = {value: key for key, value in GEN_MODE_TO_TASK.items()}
 from director.video_fallback import render_seedance_or_h3_fallback
 from video_backends.seedance_ark import SeedanceArk
 
@@ -175,18 +180,25 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
     qc = kf.get("qc") or {}
     frame_prefix = episode_frame_dir(episode)
     shot_prefix = episode_shot_dir(episode)
-    first_rel = _text(kf.get("first_frame_file")) or _text(pkg.get("first_frame")) or f"{frame_prefix}/{sid}.jpg"
-    last_rel = _text(kf.get("last_frame_file")) or _text(pkg.get("last_frame"))
     gen_mode = _text(pkg.get("gen_mode"))
     plan = _text(pkg.get("keyframe_plan"))
-    first = safe_under(prod, first_rel)
+    try:
+        kind = task_kind_for_gen_mode(gen_mode or "i2v_first")
+    except UnsupportedTaskKind:
+        kind = ""
+    first_rel = _text(kf.get("first_frame_file")) or _text(pkg.get("first_frame"))
+    if not first_rel and task_needs_first_frame(kind):
+        first_rel = f"{frame_prefix}/{sid}.jpg"
+    last_rel = _text(kf.get("last_frame_file")) or _text(pkg.get("last_frame"))
+    first = safe_under(prod, first_rel) if first_rel else None
     last = safe_under(prod, last_rel) if last_rel else None
     dest_rel = f"{shot_prefix}/{sid}.mp4"
     extracted_rel = f"{shot_prefix}/{sid}-last.jpg"
     errors: list[str] = []
     if not pkg.get("confirmed"):
         errors.append("package not confirmed")
-    if _text(qc.get("status")) != "pass":
+    needs_first = task_needs_first_frame(kind) if kind else gen_mode not in {"video_extend", "edit", "r2v"}
+    if needs_first and _text(qc.get("status")) != "pass":
         errors.append("keyframe not passed")
     if first_rel and not _rel_under_episode(first_rel, frame_prefix):
         errors.append(f"first_frame outside episode folder: {first_rel}")
@@ -197,8 +209,13 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         errors.append("extend/edit missing source_video")
     elif source_rel and not safe_under(prod, source_rel).exists():
         errors.append(f"missing source video {source_rel}")
-    needs_first = gen_mode not in {"video_extend", "edit", "r2v"}
-    if needs_first and not first.exists():
+    pkg_refs = [_text(item) for item in (pkg.get("refs") or []) if _text(item)]
+    if gen_mode == "r2v" and not pkg_refs:
+        errors.append("reference missing refs")
+    for rel in pkg_refs:
+        if not safe_under(prod, rel).exists():
+            errors.append(f"missing reference {rel}")
+    if needs_first and (first is None or not first.exists()):
         errors.append(f"missing first frame {first_rel}")
     wants_last = gen_mode == "flf2v" or plan == "first_last"
     if wants_last:
@@ -240,15 +257,19 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
                 "first_frame": first_rel,
                 "last_frame": last_rel if wants_last else "",
                 "source_video": source_rel,
-                "refs": [],
+                "refs": pkg_refs,
             },
             kf,
             episode=episode,
-            refs=[],
+            refs=pkg_refs,
         )
     except (UnsupportedTaskKind, SystemExit, ValueError) as exc:
         errors.append(str(exc))
-    refs = identity_ref_paths(prod, pkg, assets, first) if first.exists() else []
+    refs = identity_ref_paths(prod, pkg, assets, first) if first is not None and first.exists() else []
+    vendor_refs = list(request.refs) if request is not None else pkg_refs
+    dest_path = prod / dest_rel
+    request_hash = request.fingerprint() if request is not None else ""
+    reusable = bool(request_hash) and SeedanceArk.clip_matches_request(dest_path, request_hash)
     return {
         "shot_id": sid,
         "gen_mode": gen_mode,
@@ -263,9 +284,10 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         "first_frame": first_rel,
         "last_frame": last_rel if wants_last else "",
         "source_video": source_rel,
-        "request_hash": request.fingerprint() if request is not None else "",
+        "request_hash": request_hash,
         "use_last_frame": bool(wants_last and last_rel),
-        "refs": [str(path.relative_to(prod)) for path in refs],
+        "refs": vendor_refs or [str(path.relative_to(prod)) for path in refs],
+        "allow_h3_fallback": bool(request.allow_h3_fallback) if request is not None else False,
         "dest": dest_rel,
         "extracted_last": extracted_rel,
         "overwrite_designed_last": False,
@@ -279,7 +301,8 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
         "loses_lines_on_h3": native_speech,
         "errors": errors,
         "ok": not errors,
-        "exists": (prod / dest_rel).exists() and (prod / dest_rel).stat().st_size > 1024,
+        "exists": dest_path.exists() and dest_path.stat().st_size > 1024,
+        "reusable": reusable,
     }
 
 
@@ -364,6 +387,78 @@ def _extract_last(video: Path, dest: Path) -> None:
     print(f"  warn: could not extract last frame from {video.name}; official clip kept", flush=True)
 
 
+def plan_from_snapshot(prod: Path, snapshot_rel: str, only: Optional[list[str]] = None) -> dict:
+    """Paid path: execute the confirmed requests. Do not recompile packages."""
+    from director.fingerprint import load_confirmed_snapshot, snapshot_requests
+    from director.vendor_request import media_hash
+
+    snap = load_confirmed_snapshot(prod, snapshot_rel)
+    episode = snap.get("episode") or 1
+    dest_dir = episode_shot_dir(episode)
+    want = set(only or [])
+    shots = []
+    for request in snapshot_requests(snap):
+        if want and request.shot_id not in want:
+            continue
+        errors: list[str] = []
+        for rel, digest in request.media_hash_map().items():
+            live = media_hash(prod, rel)
+            if digest and live != digest:
+                errors.append(f"{rel} changed since confirm")
+            if rel and not (prod / rel).exists():
+                errors.append(f"missing {rel}")
+        dest_rel = f"{dest_dir}/{request.shot_id}.mp4"
+        item = {
+            "shot_id": request.shot_id,
+            "gen_mode": TASK_TO_GEN.get(request.task_kind, request.task_kind),
+            "seedance_mode": request.seedance_mode(),
+            "vendor_request": request.to_dict(),
+            "prompt": request.prompt,
+            "prompt_chars": len(request.prompt),
+            "duration_sec": request.duration_sec,
+            "first_frame": request.first_frame,
+            "last_frame": request.last_frame,
+            "source_video": request.source_video,
+            "request_hash": request.fingerprint(),
+            "use_last_frame": bool(request.last_frame),
+            "refs": list(request.refs),
+            "dest": dest_rel,
+            "extracted_last": f"{dest_dir}/{request.shot_id}-last.jpg",
+            "overwrite_designed_last": False,
+            "hardest": False,
+            "generate_audio": request.generate_audio,
+            "allow_h3_fallback": request.allow_h3_fallback,
+            "errors": errors,
+            "ok": not errors,
+            "exists": (prod / dest_rel).exists() and (prod / dest_rel).stat().st_size > 1024,
+            "reusable": SeedanceArk.clip_matches_request(prod / dest_rel, request.fingerprint()),
+        }
+        shots.append(item)
+    missing = sorted(want - {item["shot_id"] for item in shots}) if want else []
+    if missing:
+        raise SystemExit("快照里没有这些镜头：" + ", ".join(missing))
+    return {
+        "prod": str(prod),
+        "episode": episode,
+        "episode_no": episode_number(episode),
+        "episode_label": episode_label(episode),
+        "dest_dir": dest_dir,
+        "from_snapshot": snapshot_rel,
+        "shots": shots,
+        "count": len(shots),
+        "ok_count": sum(1 for item in shots if item.get("ok")),
+        "first_last_count": sum(1 for item in shots if item.get("use_last_frame")),
+        "missing_first": 0,
+        "hardest": [],
+        "native_speech_count": 0,
+        "h3_line_loss": [],
+        "max_prompt_chars": max((int(item.get("prompt_chars") or 0) for item in shots), default=0),
+        "writes_shots_json": False,
+        "overwrites_designed_last": False,
+        "overwrites_unsuffixed_shots": dest_dir == "05-shots",
+    }
+
+
 def _backend_for_item(item: dict) -> SeedanceArk:
     req = item.get("vendor_request") or {}
     if req.get("model") and req.get("profile_id"):
@@ -390,45 +485,61 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
             raise SystemExit(f"{sid} 还不能出片：" + "; ".join(item.get("errors") or []))
         dest = prod / item["dest"]
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if skip_existing and item.get("exists"):
-            print(f"  {sid} already has {item['dest']}, skip")
+        request = VendorRequest.from_dict(item["vendor_request"]) if item.get("vendor_request") else None
+        if skip_existing and request is not None and SeedanceArk.clip_matches_request(dest, request.fingerprint()):
+            print(f"  {sid} reusable {item['dest']}, skip")
             continue
+        if skip_existing and item.get("exists") and request is None:
+            raise SystemExit(f"{sid} existing clip has no confirmed request; refuse to skip")
         if not skip_existing:
             archived = archive_existing_official(dest)
             if archived:
                 print(f"  archived existing {dest.name} -> {archived}", flush=True)
-        image = safe_under(prod, item["first_frame"]) if item.get("first_frame") else dest
-        last = safe_under(prod, item["last_frame"]) if item.get("use_last_frame") and item.get("last_frame") else None
-        source = safe_under(prod, item["source_video"]) if item.get("source_video") else None
-        # Character portraits are listed on the plan for humans. Seedance 2.0
-        # treats simulated faces as real-person privacy, so do not upload them.
-        refs: list = []
+        image = safe_under(prod, request.first_frame if request else item.get("first_frame")) if (request and request.first_frame) or item.get("first_frame") else dest
+        last = None
+        if request and request.last_frame:
+            last = safe_under(prod, request.last_frame)
+        elif item.get("use_last_frame") and item.get("last_frame"):
+            last = safe_under(prod, item["last_frame"])
+        source = None
+        if request and request.source_video:
+            source = safe_under(prod, request.source_video)
+        elif item.get("source_video"):
+            source = safe_under(prod, item["source_video"])
+        refs = [safe_under(prod, rel) for rel in ((request.refs if request else item.get("refs")) or []) if rel]
         backend = _backend_for_item(item)
+        allow_h3 = bool(item.get("force_h3_fallback") or item.get("allow_h3_fallback") or (request and request.allow_h3_fallback))
         if item.get("force_h3_fallback"):
             from director.video_fallback import official_h3_fallback
 
             record = official_h3_fallback(
                 image,
-                item["prompt"],
-                int(item["duration_sec"]),
+                request.prompt if request else item["prompt"],
+                int(request.duration_sec if request else item["duration_sec"]),
                 dest,
                 last_frame=last,
-                mode=item["seedance_mode"],
+                mode=request.seedance_mode() if request else item["seedance_mode"],
                 force=not skip_existing,
             )
         else:
             record = render_seedance_or_h3_fallback(
                 backend,
                 image,
-                item["prompt"],
-                int(item["duration_sec"]),
+                request.prompt if request else item["prompt"],
+                int(request.duration_sec if request else item["duration_sec"]),
                 dest,
                 refs=refs,
-                mode=item["seedance_mode"],
+                mode=request.seedance_mode() if request else item["seedance_mode"],
                 last_frame=last,
                 force=not skip_existing,
-                generate_audio=item.get("generate_audio", True),
+                generate_audio=request.generate_audio if request else item.get("generate_audio", True),
                 source_video=source,
+                allow_h3_fallback=allow_h3,
+                request=request,
+                request_hash=request.fingerprint() if request else str(item.get("request_hash") or ""),
+                ratio=request.submit_ratio if request else None,
+                watermark=request.watermark if request else None,
+                prod=prod,
             )
         item["clip"] = record
         try:
@@ -567,11 +678,19 @@ def main() -> None:
         default="1",
         help="集数或标签：1、2、ep01-v2。标签成片落到 05-shots/<label>/，不覆盖无后缀 05-shots/",
     )
+    parser.add_argument(
+        "--from-snapshot",
+        default="",
+        help="confirmed request snapshot (.pipeline/confirmed-requests/<hash>.json). Worker must pass this.",
+    )
     args = parser.parse_args()
     prod = _prod(args.prod)
     if not prod.is_dir():
         raise SystemExit(f"没有这个项目：{prod}")
-    plan = build_plan(prod, args.only, episode=args.episode)
+    if args.from_snapshot:
+        plan = plan_from_snapshot(prod, args.from_snapshot, args.only)
+    else:
+        plan = build_plan(prod, args.only, episode=args.episode)
     summary_keys = (
         "prod",
         "episode",

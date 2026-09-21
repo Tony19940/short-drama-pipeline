@@ -110,10 +110,17 @@ def render_seedance_or_h3_fallback(
     source_video: Optional[Path] = None,
     render_fn: Optional[Callable[..., None]] = None,
     scale_fn: Optional[Callable[[Path, Path], list[str]]] = None,
+    allow_h3_fallback: bool = False,
+    request: Any = None,
+    request_hash: str = "",
+    ratio: str | None = None,
+    watermark: bool | None = None,
+    prod: Optional[Path] = None,
 ) -> dict:
-    """Run Seedance. On face-block only, official H3 + local scale. Smoke dest never falls back."""
+    """Run Seedance. H3 only when this request authorized a fallback."""
     from video_backends.seedance_ark import SeedanceFaceBlock
 
+    allowed = bool(allow_h3_fallback or (request is not None and getattr(request, "allow_h3_fallback", False)))
     if is_smoke_output(dest):
         _seedance_render(
             backend,
@@ -127,6 +134,11 @@ def render_seedance_or_h3_fallback(
             force=force,
             generate_audio=generate_audio,
             source_video=source_video,
+            request=request,
+            request_hash=request_hash,
+            ratio=ratio,
+            watermark=watermark,
+            prod=prod,
         )
         return {"backend": "seedance", "dest": str(dest)}
     try:
@@ -142,10 +154,17 @@ def render_seedance_or_h3_fallback(
             force=force,
             generate_audio=generate_audio,
             source_video=source_video,
+            request=request,
+            request_hash=request_hash,
+            ratio=ratio,
+            watermark=watermark,
+            prod=prod,
         )
         return {"backend": "seedance", "dest": str(dest)}
     except SeedanceFaceBlock as exc:
-        print(f"  face-block {exc.code}; official MiniMax-H3 fallback (no CompShare)", flush=True)
+        if not allowed:
+            raise
+        print(f"  face-block {exc.code}; authorized MiniMax-H3 fallback (no CompShare)", flush=True)
         return official_h3_fallback(
             image,
             prompt,
@@ -172,17 +191,31 @@ def _seedance_render(
     force: bool,
     generate_audio: bool,
     source_video: Optional[Path] = None,
+    request: Any = None,
+    request_hash: str = "",
+    ratio: str | None = None,
+    watermark: bool | None = None,
+    prod: Optional[Path] = None,
 ) -> None:
+    if request is not None and hasattr(backend, "render_request") and prod is not None:
+        backend.render_request(request, dest, prod=prod, force=force)
+        return
     kwargs = {
         "refs": refs or [],
         "mode": mode,
         "last_frame": last_frame,
         "force": force,
         "source_video": source_video,
+        "request_hash": request_hash,
+        "ratio": ratio,
+        "watermark": watermark,
     }
     try:
         backend.render(image, prompt, seconds, dest, generate_audio=generate_audio, **kwargs)
     except TypeError:
+        kwargs.pop("request_hash", None)
+        kwargs.pop("ratio", None)
+        kwargs.pop("watermark", None)
         backend.render(image, prompt, seconds, dest, **kwargs)
 
 

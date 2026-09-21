@@ -133,6 +133,7 @@ class SeedanceOrH3(unittest.TestCase):
                 dest,
                 render_fn=fake_h3,
                 scale_fn=fake_scale,
+                allow_h3_fallback=True,
             )
         self.assertEqual(h3["n"], 1)
         self.assertEqual(record["backend"], "minimax_h3")

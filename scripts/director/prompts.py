@@ -609,6 +609,20 @@ def state_note_of(spec: dict, shot: Optional[dict] = None) -> str:
     return state_sentence(state) if state else ""
 
 
+def first_still_phase_line(shot: Optional[dict] = None, spec: Optional[dict] = None) -> str:
+    """Still sentence follows t0_phase. Default onset keeps the old lock."""
+    shot = shot or {}
+    spec = spec or {}
+    phase = str(shot.get("t0_phase") or spec.get("t0_phase") or "").strip() or "onset"
+    lines = {
+        "onset": "画动作起点的那一格：可以已经起手，结果还没发生。",
+        "mid": "画动作中段的那一格：动作已经进行到一半，结果还没发生。",
+        "hold": "画停住听的那一格：先停住，结果还没发生。",
+        "land": "画已近落幅的那一格：接近结束，结果仍未完全落地。",
+    }
+    return lines.get(phase, lines["onset"])
+
+
 def compile_keyframe_prompt_zh(
     spec: dict,
     shot: Optional[dict] = None,
@@ -682,7 +696,14 @@ def compile_keyframe_prompt_zh(
         geo,
         opener,
         f"{size}，{lens}，{angle}。",
-        "画动作起点的那一格：可以已经起手，结果还没发生。",
+        first_still_phase_line(shot, spec),
+        (
+            "表演时间轴："
+            + "".join(str(item.get("text") or "") for item in (shot.get("action_timing") or spec.get("action_timing") or []) if isinstance(item, dict))
+            + "。"
+            if (shot.get("action_timing") or spec.get("action_timing"))
+            else ""
+        ),
         f"起幅定住：{start.rstrip('。')}。" if start else "",
         f"首帧（第0秒）：{still_para.rstrip('。')}。" if still_para else "",
         f"起幅拿着：{holding.rstrip('。')}。" if holding else "",

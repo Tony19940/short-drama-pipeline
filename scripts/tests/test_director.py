@@ -1686,12 +1686,18 @@ class DirectorTests(unittest.TestCase):
         from video_backends.seedance_ark import SeedanceArk
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "SH002.mp4"
+            first = Path(tmp) / "first.jpg"
+            first.write_bytes(b"fakejpg")
             ticket = dest.with_suffix(dest.suffix + ".ark-task.json")
-            ticket.write_text('{"task_id": "cgt-existing"}\n', encoding="utf-8")
             old = os.environ.get("ARK_API_KEY")
             os.environ["ARK_API_KEY"] = "test-key"
             try:
                 backend = SeedanceArk()
+                req_hash = backend.compute_request_hash(first, "prompt", 4, mode="i2v")
+                ticket.write_text(
+                    json.dumps({"task_id": "cgt-existing", "request_hash": req_hash, "status": "submitted"}) + "\n",
+                    encoding="utf-8",
+                )
                 called = {"submit": 0, "wait": []}
                 def boom(*args, **kwargs):
                     called["submit"] += 1
@@ -1704,7 +1710,7 @@ class DirectorTests(unittest.TestCase):
                 backend.submit = boom  # type: ignore[method-assign]
                 backend.wait_url = wait  # type: ignore[method-assign]
                 backend.download = fake_download  # type: ignore[method-assign]
-                backend.render(Path(tmp)/"first.jpg", "prompt", 4, dest)
+                backend.render(first, "prompt", 4, dest)
             finally:
                 if old is not None:
                     os.environ["ARK_API_KEY"] = old

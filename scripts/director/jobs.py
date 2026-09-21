@@ -11,10 +11,10 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from .gates import i2v_source, ken_burns_blocked, require_fresh_gate, run_check
+from .gates import ken_burns_blocked, require_fresh_gate, run_check
 from .paths import ROOT
 from .shot_repo import list_shots, select_shots
-from .store import exclusive_state_lock, load_jobs, save_jobs
+from .store import exclusive_state_lock, load_approvals, load_jobs, save_jobs
 
 
 def gpu_configured() -> bool:
@@ -96,8 +96,8 @@ def enqueue_render_confirmed(
     from .pipeline import assert_clips_passed, assert_keyframes_passed, assert_packages_confirmed, uses_pipeline
     if uses_pipeline(prod):
         require_fresh_gate(prod, "C2")
-        assert_packages_confirmed(prod)
-        assert_keyframes_passed(prod)
+        assert_packages_confirmed(prod, episode)
+        assert_keyframes_passed(prod, episode)
         from .show_policy import load_show_policy
 
         if load_show_policy(prod).animatic_required:
@@ -108,18 +108,12 @@ def enqueue_render_confirmed(
     if not check["ok"]:
         raise PermissionError(check["stderr"] or check["stdout"] or "check_prod 未过，不能出视频")
     selected = select_shots(prod, shot_ids, episode)
-    shots = _shots(prod, episode)
-    for shot in selected:
-        dest = prod / shot.get("frame", f"04-frames/{shot['id']}.jpg")
-        if not dest.exists():
-            raise PermissionError(f"{shot['id']} 还没有锁定首帧")
-        if not uses_pipeline(prod):
-            source = i2v_source(prod, shot, shots)
-            if not source["exists"]:
-                raise PermissionError(f"{shot['id']} 缺 I2V 源：{source['reason']}")
-    from .fingerprint import consume_render_fingerprint
+    from .fingerprint import consume_render_fingerprint, require_task_inputs
 
+    require_task_inputs(prod, selected, episode)
     used = consume_render_fingerprint(prod, fingerprint, [shot["id"] for shot in selected], review_track, episode)
+    approvals = load_approvals(prod)
+    snapshot = str((approvals.get("render") or {}).get("snapshot") or "")
     job = {
         "id": f"job-{uuid.uuid4().hex[:10]}",
         "kind": "render",
@@ -129,6 +123,7 @@ def enqueue_render_confirmed(
         "gpu": gpu_configured(),
         "backend": default_render_backend() or None,
         "fingerprint": used,
+        "snapshot": snapshot,
         "episode": episode,
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
@@ -146,12 +141,15 @@ def enqueue_render_confirmed(
 
 
 def enqueue_review(prod: Path, shot_ids: Optional[list[str]] = None, episode=1) -> dict:
+    from .pipeline import episode_shot_dir
+
     selected = select_shots(prod, shot_ids, episode)
-    missing = [shot["id"] for shot in selected if not (prod / "05-shots" / f"{shot['id']}.mp4").exists()]
+    shot_dir = episode_shot_dir(episode)
+    missing = [shot["id"] for shot in selected if not (prod / shot_dir / f"{shot['id']}.mp4").exists()]
     if missing:
         raise PermissionError("缺单镜视频：" + ", ".join(missing))
     for shot in selected:
-        video = prod / "05-shots" / f"{shot['id']}.mp4"
+        video = prod / shot_dir / f"{shot['id']}.mp4"
         if ken_burns_blocked(video):
             raise PermissionError(f"{video.name} 是 Ken Burns 路径，不能进审片")
     job = {
@@ -159,6 +157,7 @@ def enqueue_review(prod: Path, shot_ids: Optional[list[str]] = None, episode=1) 
         "kind": "review",
         "status": "queued",
         "shot_ids": [shot["id"] for shot in selected],
+        "episode": episode,
         "created_at": int(time.time()),
         "updated_at": int(time.time()),
         "log": [],
@@ -179,16 +178,22 @@ def _run_render(prod: Path, job_id: str) -> None:
     from .pipeline import uses_pipeline
 
     if uses_pipeline(prod) and backend in {"seedance", "ark"}:
+        snapshot = str(job.get("snapshot") or "").strip()
+        if not snapshot:
+            _update_job(prod, job_id, status="failed", error="missing confirmed snapshot; worker will not recompile")
+            return
         cmd = [
             sys.executable,
             str(ROOT / "scripts" / "render_seedance_packages.py"),
             "--prod",
             str(prod),
+            "--from-snapshot",
+            snapshot,
+            "--episode",
+            str(job.get("episode") or 1),
         ]
         if job.get("shot_ids"):
             cmd += ["--only", *job["shot_ids"]]
-        if job.get("episode") not in (None, "", 1, "1"):
-            cmd += ["--episode", str(job["episode"])]
     else:
         cmd = [
             sys.executable,
@@ -219,6 +224,8 @@ def _run_render(prod: Path, job_id: str) -> None:
                 str(prod),
                 "--out",
                 str(out),
+                "--episode",
+                str(job.get("episode") or 1),
             ]
             if selected_ids:
                 mix += ["--only", *selected_ids]
@@ -232,12 +239,16 @@ def _run_render(prod: Path, job_id: str) -> None:
         fallback_from = None
         scaled_to = None
         used_backend = backend
+        from .pipeline import episode_frame_dir, episode_shot_dir
         from .video_fallback import read_clip_record
 
+        episode = job.get("episode") or 1
+        shot_dir = episode_shot_dir(episode)
+        frame_dir = episode_frame_dir(episode)
         for shot_id in job.get("shot_ids") or []:
-            video = prod / "05-shots" / f"{shot_id}.mp4"
-            last = prod / "04-frames" / f"{shot_id}-last.jpg"
-            extracted = prod / "05-shots" / f"{shot_id}-last.jpg"
+            video = prod / shot_dir / f"{shot_id}.mp4"
+            last = prod / frame_dir / f"{shot_id}-last.jpg"
+            extracted = prod / shot_dir / f"{shot_id}-last.jpg"
             if video.exists() and ken_burns_blocked(video):
                 video.unlink()
                 _update_job(
@@ -248,7 +259,7 @@ def _run_render(prod: Path, job_id: str) -> None:
                 )
                 return
             if video.exists():
-                outputs.append(f"05-shots/{shot_id}.mp4")
+                outputs.append(f"{shot_dir}/{shot_id}.mp4")
                 record = read_clip_record(video)
                 if record:
                     clip_records.append(record)
@@ -257,9 +268,9 @@ def _run_render(prod: Path, job_id: str) -> None:
                         fallback_from = record.get("fallback_from")
                         scaled_to = record.get("scaled_to")
             if last.exists():
-                outputs.append(f"04-frames/{shot_id}-last.jpg")
+                outputs.append(f"{frame_dir}/{shot_id}-last.jpg")
             elif extracted.exists():
-                outputs.append(f"05-shots/{shot_id}-last.jpg")
+                outputs.append(f"{shot_dir}/{shot_id}-last.jpg")
         fields = {
             "status": "ready",
             "log": [log[-2000:]],
@@ -282,7 +293,7 @@ def _run_review(prod: Path, job_id: str) -> None:
     data = load_jobs(prod)
     job = next(item for item in data["jobs"] if item["id"] == job_id)
     out = prod / "06-export" / ("preview-vo.mp4" if not job.get("shot_ids") else "preview-partial-vo.mp4")
-    if len(job.get("shot_ids") or []) == len(_shots(prod)):
+    if len(job.get("shot_ids") or []) == len(_shots(prod, job.get("episode") or 1)):
         out = prod / "06-export" / "preview-vo.mp4"
     cmd = [
         sys.executable,
@@ -291,6 +302,8 @@ def _run_review(prod: Path, job_id: str) -> None:
         str(prod),
         "--out",
         str(out),
+        "--episode",
+        str(job.get("episode") or 1),
     ]
     if job.get("shot_ids"):
         cmd += ["--only", *job["shot_ids"]]
@@ -331,8 +344,8 @@ def assemble_episode(prod: Path) -> dict:
     )
 
     if uses_pipeline(prod):
-        assert_clips_passed(prod)
-    shots = _shots(prod)
+        assert_clips_passed(prod, 1)
+    shots = _shots(prod, 1)
     cut = read_artifact(prod, "cut.json")
     timeline = list(cut.get("timeline") or [])
     if not timeline:
@@ -345,7 +358,9 @@ def assemble_episode(prod: Path) -> dict:
     used = [item for item in timeline if item.get("used", True)]
     if not used:
         raise PermissionError("时间线没有采用任何镜头")
-    shot_dir = prod / "05-shots"
+    from .pipeline import episode_shot_dir
+
+    shot_dir = prod / episode_shot_dir(1)
     if shot_dir.exists():
         for path in shot_dir.iterdir():
             if path.is_file() and ken_burns_blocked(path):
@@ -353,7 +368,7 @@ def assemble_episode(prod: Path) -> dict:
     missing = []
     for item in used:
         sid = item.get("shot_id")
-        video = prod / "05-shots" / f"{sid}.mp4"
+        video = shot_dir / f"{sid}.mp4"
         if not video.exists():
             missing.append(sid)
         elif ken_burns_blocked(video):
@@ -372,7 +387,7 @@ def assemble_episode(prod: Path) -> dict:
     lines = []
     for item in used:
         sid = item["shot_id"]
-        src = prod / "05-shots" / f"{sid}.mp4"
+        src = shot_dir / f"{sid}.mp4"
         inn = float(item.get("in_point") or 0)
         out = float(item.get("out_point") or duration_for_shot(prod, sid, 4))
         duration = max(0.1, out - inn)
