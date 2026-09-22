@@ -9,6 +9,7 @@ job never read that folder.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 import tempfile
@@ -48,16 +49,31 @@ def _sec(value: Any, default: float = 4.0) -> float:
     return out if out > 0 else default
 
 
-def episode_shot_list_name(episode: int) -> str:
-    return "shot_list.json" if int(episode) == 1 else f"shot_list.ep{int(episode):02d}.json"
+def _episode_token(episode: Any = 1) -> str:
+    from .takes import episode_key
+
+    return episode_key(episode)
 
 
-def episode_frames_dir(episode: int) -> str:
-    return "04-frames" if int(episode) == 1 else f"04-frames/ep{int(episode):02d}"
+def _animatic_stem(episode: Any = 1) -> str:
+    key = _episode_token(episode)
+    return "ep01" if key == "1" else key
 
 
-def animatic_rel(episode: int) -> str:
-    return f"{ANIMATIC_DIR}/ep{int(episode):02d}.animatic.mp4"
+def episode_shot_list_name(episode: Any = 1) -> str:
+    from .pipeline import episode_artifact_name
+
+    return episode_artifact_name("shot_list.json", episode)
+
+
+def episode_frames_dir(episode: Any = 1) -> str:
+    from .pipeline import episode_frame_dir
+
+    return episode_frame_dir(episode)
+
+
+def animatic_rel(episode: Any = 1) -> str:
+    return f"{ANIMATIC_DIR}/{_animatic_stem(episode)}.animatic.mp4"
 
 
 def animatic_output_path(prod: Path, episode: int = 1, out: Optional[str] = None) -> Path:
@@ -107,7 +123,10 @@ def load_shots(prod: Path, episode: int = 1) -> list[dict]:
         rows = rows_from(list(table.get("shots") or []), v2=True)
         if rows:
             return rows
-    legacy_rel = "03-storyboard/shots.json" if int(episode) == 1 else f"03-storyboard/shots.ep{int(episode):02d}.json"
+    from .pipeline import episode_label
+
+    label = episode_label(episode)
+    legacy_rel = "03-storyboard/shots.json" if not label else f"03-storyboard/shots.{label}.json"
     legacy = load_json(prod, legacy_rel, {"shots": []})
     rows = rows_from(list(legacy.get("shots") or []), v2=False)
     if rows:
@@ -128,40 +147,52 @@ def _label(row: dict, seconds: float, part: str = "") -> str:
     return " · ".join(bits)
 
 
-def _beat_splits(row: dict, seconds: float) -> Optional[list[tuple[float, str]]]:
-    """Performance-node windows. None means keep the old first/last half split."""
+def _absolute_beats(row: dict, seconds: float) -> Optional[list[dict]]:
+    """Keep from/to. Overlaps are refused instead of being rescaled into a sequence."""
     raw = row.get("action_timing") or []
     if not isinstance(raw, list) or not raw:
         return None
-    windows: list[tuple[float, str]] = []
+    windows: list[dict] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
         try:
-            start = float(item.get("from_sec", item.get("from", 0)) or 0)
-            end = float(item.get("to_sec", item.get("to", start)) or start)
-        except (TypeError, ValueError):
-            continue
-        dur = max(0.0, end - start)
-        if dur <= 0:
-            continue
-        label = _t(item.get("text") or item.get("action") or item.get("stimulus"))
-        windows.append((dur, label))
+            start = float(item.get("from_sec", item.get("from", 0)))
+            end = float(item.get("to_sec", item.get("to", start)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{row.get('shot_id')} beat times must be numbers") from exc
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            raise ValueError(f"{row.get('shot_id')} beat needs a finite range with to > from")
+        if start < -0.001 or end > seconds + 0.05:
+            raise ValueError(f"{row.get('shot_id')} beat {start:g}-{end:g}s is outside {seconds:g}s")
+        windows.append({
+            "from_sec": round(start, 3),
+            "to_sec": round(min(end, seconds), 3),
+            "text": _t(item.get("text") or item.get("action") or item.get("stimulus")),
+        })
     if not windows:
         return None
-    total = sum(item[0] for item in windows)
-    if total <= 0:
-        return None
-    scale = seconds / total
-    return [(round(dur * scale, 3), label) for dur, label in windows]
+    windows.sort(key=lambda item: (item["from_sec"], item["to_sec"]))
+    for prev, nxt in zip(windows, windows[1:]):
+        if nxt["from_sec"] < prev["to_sec"] - 0.001:
+            raise ValueError(f"{row.get('shot_id')} beats overlap; refusing to play them in sequence")
+    return windows
 
 
-def plan_animatic(prod: Path, episode: int = 1) -> list[dict]:
+def _card_image(from_sec: float, to_sec: float, seconds: float, first_rel: str, last_rel: str, first_ok: bool, last_ok: bool) -> tuple[Optional[str], str, bool]:
+    """t=0 uses the first still. The last still is only the window that lands at the end."""
+    if from_sec <= 0.001:
+        return (first_rel if first_ok else None), "first", not first_ok
+    if last_ok and abs(to_sec - seconds) <= 0.05 and from_sec > 0.001:
+        return last_rel, "last", False
+    return None, "hold", True
+
+
+def plan_animatic(prod: Path, episode: Any = 1) -> list[dict]:
     """Pure: which image shows for how long, in table order. No PIL, no ffmpeg.
 
-    Performance beats, when present, decide when the picture changes.
+    Written beats keep their absolute times. Gaps are explicit holds.
     Without beats, a locked last frame still splits first half / second half.
-    A shot without a first frame becomes a grey card flagged `missing`.
     """
     frames = episode_frames_dir(episode)
     plan: list[dict] = []
@@ -172,47 +203,58 @@ def plan_animatic(prod: Path, episode: int = 1) -> list[dict]:
         last_rel = f"{frames}/{sid}-last.jpg"
         first_ok = (prod / first_rel).exists()
         last_ok = first_ok and (prod / last_rel).exists()
-        splits = _beat_splits(row, seconds)
-        if splits and last_ok:
-            last_index = len(splits) - 1
-            for index, (dur, beat_label) in enumerate(splits):
-                part = "last" if index == last_index else "first"
-                image = last_rel if part == "last" else first_rel
-                tag = "尾" if part == "last" else "首"
-                extra = f" {beat_label[:24]}" if beat_label else ""
+        beats = _absolute_beats(row, seconds)
+        if beats:
+            cursor = 0.0
+            spans: list[dict] = []
+            for beat in beats:
+                if beat["from_sec"] > cursor + 0.001:
+                    spans.append({"from_sec": round(cursor, 3), "to_sec": beat["from_sec"], "text": "空档", "hold": True})
+                spans.append({**beat, "hold": False})
+                cursor = beat["to_sec"]
+            if cursor < seconds - 0.001:
+                spans.append({"from_sec": round(cursor, 3), "to_sec": round(seconds, 3), "text": "空档", "hold": True})
+            for span in spans:
+                image, part, missing = _card_image(span["from_sec"], span["to_sec"], seconds, first_rel, last_rel, first_ok, last_ok)
+                dur = round(span["to_sec"] - span["from_sec"], 3)
+                if span.get("hold") or missing:
+                    note = "该状态尚无图" if missing and not span.get("hold") else span["text"]
+                    if missing and span.get("hold") and span["from_sec"] > 0.001:
+                        note = "空档·该状态尚无图"
+                else:
+                    note = span["text"]
+                extra = f" {note[:24]}" if note else ""
                 plan.append({
                     "shot_id": sid,
                     "image": image,
                     "seconds": dur,
-                    "label": _label(row, seconds, tag) + extra,
-                    "missing": False,
+                    "from_sec": span["from_sec"],
+                    "to_sec": span["to_sec"],
+                    "label": _label(row, seconds, "尾" if part == "last" else "首") + extra + ("" if not missing else " · 缺图"),
+                    "missing": missing,
                     "part": part,
-                    "beat": beat_label,
+                    "beat": span["text"],
+                    "stimulus": row.get("stimulus") or "",
+                    "one_action": row.get("one_action") or "",
                 })
-        elif splits:
-            for index, (dur, beat_label) in enumerate(splits):
-                extra = f" {beat_label[:24]}" if beat_label else ""
-                plan.append({
-                    "shot_id": sid,
-                    "image": first_rel if first_ok else None,
-                    "seconds": dur,
-                    "label": _label(row, seconds) + extra + ("" if first_ok else " · 缺首帧"),
-                    "missing": not first_ok,
-                    "part": "first" if index == 0 else f"beat{index + 1}",
-                    "beat": beat_label,
-                })
-        elif last_ok:
+            continue
+        if last_ok:
             half = round(seconds / 2, 3)
-            plan.append({"shot_id": sid, "image": first_rel, "seconds": half, "label": _label(row, seconds, "首"), "missing": False, "part": "first"})
-            plan.append({"shot_id": sid, "image": last_rel, "seconds": round(seconds - half, 3), "label": _label(row, seconds, "尾"), "missing": False, "part": "last"})
+            plan.append({"shot_id": sid, "image": first_rel, "seconds": half, "from_sec": 0, "to_sec": half, "label": _label(row, seconds, "首"), "missing": False, "part": "first", "beat": "", "stimulus": row.get("stimulus") or "", "one_action": row.get("one_action") or ""})
+            plan.append({"shot_id": sid, "image": last_rel, "seconds": round(seconds - half, 3), "from_sec": half, "to_sec": round(seconds, 3), "label": _label(row, seconds, "尾"), "missing": False, "part": "last", "beat": "", "stimulus": row.get("stimulus") or "", "one_action": row.get("one_action") or ""})
         else:
             plan.append({
                 "shot_id": sid,
                 "image": first_rel if first_ok else None,
                 "seconds": round(seconds, 3),
+                "from_sec": 0,
+                "to_sec": round(seconds, 3),
                 "label": _label(row, seconds) + ("" if first_ok else " · 缺首帧"),
                 "missing": not first_ok,
                 "part": "first",
+                "beat": "",
+                "stimulus": row.get("stimulus") or "",
+                "one_action": row.get("one_action") or "",
             })
     return plan
 
@@ -318,14 +360,14 @@ def build_animatic(
             raise RuntimeError((proc.stderr or proc.stdout or "ffmpeg 失败")[-1200:])
     sidecar = dest.with_suffix(".json")
     sidecar.write_text(
-        json.dumps({"episode": int(episode), "fps": fps, "total_sec": total, "audio": _t(audio) or None, "plan": plan}, ensure_ascii=False, indent=2) + "\n",
+        json.dumps({"episode": _episode_token(episode), "fps": fps, "total_sec": total, "audio": _t(audio) or None, "plan": plan}, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     return {
         "ok": True,
         "file": str(dest.relative_to(prod)),
         "sidecar": str(sidecar.relative_to(prod)),
-        "episode": int(episode),
+        "episode": _episode_token(episode),
         "fps": fps,
         "total_sec": total,
         "cards": len(plan),
@@ -335,40 +377,56 @@ def build_animatic(
     }
 
 
-def animatic_input_fingerprint(prod: Path, episode: int = 1) -> str:
-    """Hash of the shot list durations plus each still's bytes. Approval binds to this."""
+def animatic_input_fingerprint(prod: Path, episode: Any = 1) -> str:
+    """Bind approval to picture bytes and the performance plan, not duration alone."""
     import hashlib
 
     from .vendor_request import media_hash
 
     plan = plan_animatic(prod, episode)
-    parts = []
-    for item in plan:
-        rel = _t(item.get("image"))
-        digest = media_hash(prod, rel) if rel else "missing"
-        parts.append(f"{item.get('shot_id')}:{item.get('seconds')}:{rel}:{digest}:{item.get('part')}")
-    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    payload = {
+        "version": "rehearsal-v2",
+        "episode": _episode_token(episode),
+        "cards": [
+            {
+                "shot_id": item.get("shot_id"),
+                "from_sec": item.get("from_sec"),
+                "to_sec": item.get("to_sec"),
+                "seconds": item.get("seconds"),
+                "part": item.get("part"),
+                "beat": item.get("beat") or "",
+                "stimulus": item.get("stimulus") or "",
+                "one_action": item.get("one_action") or "",
+                "image": item.get("image") or "",
+                "image_hash": media_hash(prod, _t(item.get("image"))) if item.get("image") else "missing",
+            }
+            for item in plan
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def animatic_approval_path(prod: Path, episode: int = 1) -> Path:
-    return Path(prod) / ANIMATIC_DIR / f"ep{int(episode):02d}.approval.json"
+def animatic_approval_path(prod: Path, episode: Any = 1) -> Path:
+    return Path(prod) / ANIMATIC_DIR / f"{_animatic_stem(episode)}.approval.json"
 
 
-def write_animatic_approval(prod: Path, episode: int = 1, reviewer: str = "") -> dict:
+def write_animatic_approval(prod: Path, episode: Any = 1, reviewer: str = "") -> dict:
     dest = animatic_approval_path(prod, episode)
     dest.parent.mkdir(parents=True, exist_ok=True)
     body = {
-        "episode": int(episode),
+        "episode": _episode_token(episode),
         "fingerprint": animatic_input_fingerprint(prod, episode),
         "reviewer": _t(reviewer) or "unknown",
         "approved_at": __import__("time").time(),
         "file": animatic_rel(episode),
+        "kind": "rehearsal",
     }
     dest.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return body
 
 
-def animatic_approval_status(prod: Path, episode: int = 1) -> dict:
+def animatic_approval_status(prod: Path, episode: Any = 1) -> dict:
     path = animatic_approval_path(prod, episode)
     current = animatic_input_fingerprint(prod, episode)
     if not path.is_file():
@@ -389,7 +447,7 @@ def animatic_approval_status(prod: Path, episode: int = 1) -> dict:
     }
 
 
-def require_animatic_approval(prod: Path, episode: int = 1) -> dict:
+def require_animatic_approval(prod: Path, episode: Any = 1) -> dict:
     status = animatic_approval_status(prod, episode)
     if not status["exists"]:
         raise PermissionError("animatic 未审批，不能收费出片")
@@ -398,7 +456,7 @@ def require_animatic_approval(prod: Path, episode: int = 1) -> dict:
     return status
 
 
-def snapshot_animatic(prod: Path, episode: int = 1) -> dict:
+def snapshot_animatic(prod: Path, episode: Any = 1) -> dict:
     """What the studio shows before/after building: the plan, the file if it exists."""
     from .paths import media_url
 
@@ -417,7 +475,7 @@ def snapshot_animatic(prod: Path, episode: int = 1) -> dict:
             elif item.get("part") == "first":
                 frames[item["shot_id"]] = url
     return {
-        "episode": int(episode),
+        "episode": _episode_token(episode),
         "exists": path.exists(),
         "file": rel if path.exists() else None,
         "url": media_url(prod, rel),

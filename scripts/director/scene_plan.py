@@ -118,5 +118,25 @@ def performance_intent_of(shot: Optional[dict], scene: Optional[dict] = None) ->
         "beats": beats,
         "cut_in": _t(shot.get("cut_in") or shot.get("in_from")),
         "cut_out": _t(shot.get("cut_out") or shot.get("out_to")),
-        "beat_ids": [_t(item.get("beat_id")) for item in _list(shot.get("covers") or shot.get("beat_ids")) if _t(item if not isinstance(item, dict) else item.get("beat_id"))],
+        "beat_ids": _beat_refs(shot.get("beat_ids") if shot.get("beat_ids") is not None else shot.get("covers"), plan),
     }
+
+
+def _beat_refs(raw: Any, plan: dict) -> list[str]:
+    known = {str(item.get("beat_id") or "") for item in (plan.get("beats") or []) if isinstance(item, dict)}
+    known.discard("")
+    refs: list[str] = []
+    for item in _list(raw):
+        if isinstance(item, str):
+            ref = _t(item)
+        elif isinstance(item, dict):
+            ref = _t(item.get("beat_id") or item.get("id"))
+        else:
+            raise ValueError("beat reference must be a string or an object with beat_id")
+        if not ref:
+            continue
+        if known and ref not in known:
+            raise ValueError(f"beat_id {ref} is not in this scene")
+        if ref not in refs:
+            refs.append(ref)
+    return refs

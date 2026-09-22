@@ -513,8 +513,8 @@ def _record_plan_take(prod: Path, plan: dict, item: dict, dest: Path, request, r
             qc={"backend": (record or {}).get("backend")},
             new_attempt=new_attempt,
         )
-    except (OSError, PermissionError):
-        pass
+    except (OSError, PermissionError) as exc:
+        raise SystemExit(f"{item.get('shot_id')} 已生成但素材登记失败：{exc}") from exc
 
 
 def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:

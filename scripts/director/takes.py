@@ -228,17 +228,17 @@ def take_media_file(prod: Path, take: Take | dict) -> Path:
 
 
 def resolve_shot_media(prod: Path, shot_id: str, episode: Any = 1) -> Path:
+    """Default media only. Never borrow another episode's same shot id."""
     take = selected_take(prod, shot_id, episode)
     if take:
+        if take.episode_id and episode_key(take.episode_id) != episode_key(episode):
+            raise PermissionError(f"{shot_id} selected take belongs to {take.episode_id}, not {episode_key(episode)}")
         return take_media_file(prod, take)
     from .pipeline import episode_shot_dir
 
     official = Path(prod) / episode_shot_dir(episode) / f"{shot_id}.mp4"
     if official.is_file():
         return official
-    fallback = Path(prod) / "05-shots" / f"{shot_id}.mp4"
-    if fallback.is_file():
-        return fallback
     raise PermissionError(f"缺单镜视频：{shot_id}")
 
 
@@ -254,9 +254,12 @@ def _set_selected(prod: Path, shot_id: str, take_id: str, episode: Any = 1) -> N
 
 
 def select_take(prod: Path, shot_id: str, take_id: str, episode: Any = 1) -> Take:
+    """Point the workspace default at a take. Does not rewrite an existing cut."""
     take = get_take(prod, take_id)
     if take is None or take.shot_id != shot_id:
         raise PermissionError(f"take {take_id} is not a candidate for {shot_id}")
+    if take.episode_id and episode_key(take.episode_id) != episode_key(episode):
+        raise PermissionError(f"take {take_id} belongs to episode {take.episode_id}, not {episode_key(episode)}")
     src = take_media_file(prod, take)
     from .pipeline import episode_shot_dir
 
@@ -267,25 +270,47 @@ def select_take(prod: Path, shot_id: str, take_id: str, episode: Any = 1) -> Tak
         shutil.copyfile(src, tmp)
         tmp.replace(official)
     _set_selected(prod, shot_id, take.take_id, episode)
-    _retarget_cut(prod, shot_id, take.take_id, episode)
     return take
 
 
-def _retarget_cut(prod: Path, shot_id: str, take_id: str, episode: Any = 1) -> None:
+def replace_segment_take(
+    prod: Path,
+    segment_id: str,
+    take_id: str,
+    episode: Any = 1,
+    *,
+    role: str = "picture",
+) -> dict:
+    """Change one cut segment. Bumps the cut version and drops a ready approval."""
     from .pipeline import episode_artifact_name, read_artifact, write_artifact
 
+    take = get_take(prod, take_id)
+    if take is None:
+        raise PermissionError(f"take missing: {take_id}")
+    if take.episode_id and episode_key(take.episode_id) != episode_key(episode):
+        raise PermissionError(f"take {take_id} belongs to episode {take.episode_id}, not {episode_key(episode)}")
     name = episode_artifact_name("cut.json", episode)
     cut = read_artifact(prod, name)
     timeline = list(cut.get("timeline") or [])
-    if not timeline:
-        return
-    changed = False
+    found = False
     for item in timeline:
-        if item.get("shot_id") == shot_id and item.get("take_id") != take_id:
-            item["take_id"] = take_id
-            changed = True
-    if changed:
-        write_artifact(prod, name, cut)
+        if str(item.get("segment_id") or "") != str(segment_id):
+            continue
+        if role == "audio":
+            item["audio_take_id"] = take.take_id
+        else:
+            if item.get("shot_id") and take.shot_id != item.get("shot_id"):
+                raise PermissionError(f"take {take_id} belongs to {take.shot_id}, not {item.get('shot_id')}")
+            item["take_id"] = take.take_id
+        found = True
+        break
+    if not found:
+        raise PermissionError(f"segment missing: {segment_id}")
+    cut["timeline"] = timeline
+    cut["version"] = int(cut.get("version") or 1) + 1
+    cut["status"] = "draft"
+    write_artifact(prod, name, cut)
+    return cut
 
 
 def _infer_prod(dest: Path) -> Path:
@@ -345,10 +370,13 @@ def record_render_take(
 ) -> Take:
     dest = Path(dest)
     ep = episode_key(episode)
+    incoming = sha256_file(dest) if dest.is_file() else ""
     existing = None if new_attempt else find_resume_take(
         prod, shot_id=shot_id, request_hash=request_hash, task_id=task_id, episode=episode
     )
-    take_id = existing.take_id if existing else f"take-{uuid.uuid4().hex[:12]}"
+    if existing and existing.media_hash and incoming == existing.media_hash:
+        return existing
+    take_id = f"take-{uuid.uuid4().hex[:12]}"
     attempt_id = existing.attempt_id if existing else f"attempt-{uuid.uuid4().hex[:12]}"
     rel, digest = freeze_take_media(prod, dest, take_id)
     take = Take(
@@ -360,12 +388,11 @@ def record_render_take(
         task_id=task_id,
         attempt_id=attempt_id,
         qc=dict(qc or {}),
-        created_at=existing.created_at if existing else int(time.time()),
+        created_at=int(time.time()),
         episode_id=ep,
-        revision_id=str(revision_id or (existing.revision_id if existing else "")),
+        revision_id=str(revision_id or ""),
     )
     persist_take(prod, take)
-    select_take(prod, shot_id, take.take_id, episode)
     return take
 
 
@@ -394,14 +421,36 @@ def segments_from_timeline(timeline: list[dict], episode: Any = 1) -> list[EditS
     return out
 
 
+def _same_episode(stored: str, episode: Any) -> bool:
+    if not str(stored or "").strip():
+        return True
+    return episode_key(stored) == episode_key(episode)
+
+
 def resolve_segment_takes(prod: Path, segment: EditSegment, episode: Any = 1) -> tuple[Take, Take]:
-    picture = get_take(prod, segment.take_id)
-    if picture is None and segment.shot_id:
-        picture = selected_take(prod, segment.shot_id, episode)
-    if picture is None:
-        raise PermissionError(f"{segment.shot_id or segment.segment_id} 没有可剪的 Take")
-    audio_id = segment.audio_take_id or segment.take_id or picture.take_id
-    audio = get_take(prod, audio_id) if audio_id != picture.take_id else picture
-    if audio is None:
+    """Explicit ids never fall back. A blank take_id may use the selected default."""
+    explicit_picture = str(segment.take_id or "").strip()
+    if explicit_picture:
+        picture = get_take(prod, explicit_picture)
+        if picture is None:
+            raise PermissionError(f"picture take missing: {explicit_picture}")
+        if segment.shot_id and picture.shot_id != segment.shot_id:
+            raise PermissionError(f"picture take {explicit_picture} belongs to {picture.shot_id}, not {segment.shot_id}")
+        if not _same_episode(picture.episode_id, episode):
+            raise PermissionError(f"picture take {explicit_picture} belongs to episode {picture.episode_id}")
+        take_media_file(prod, picture)
+    else:
+        picture = selected_take(prod, segment.shot_id, episode) if segment.shot_id else None
+        if picture is None:
+            raise PermissionError(f"{segment.shot_id or segment.segment_id} 没有可剪的 Take")
+    explicit_audio = str(segment.audio_take_id or "").strip()
+    if explicit_audio:
+        audio = get_take(prod, explicit_audio)
+        if audio is None:
+            raise PermissionError(f"audio take missing: {explicit_audio}")
+        if not _same_episode(audio.episode_id, episode):
+            raise PermissionError(f"audio take {explicit_audio} belongs to episode {audio.episode_id}")
+        take_media_file(prod, audio)
+    else:
         audio = picture
     return picture, audio

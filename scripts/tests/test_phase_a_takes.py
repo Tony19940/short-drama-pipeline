@@ -20,6 +20,7 @@ from director.pipeline import default_cut_from_specs, write_artifact  # noqa: E4
 from director.takes import (  # noqa: E402
     episode_export_rel,
     record_render_take,
+    replace_segment_take,
     select_take,
     selected_take,
     take_media_file,
@@ -57,7 +58,8 @@ class TakeIdentity(unittest.TestCase):
             prod = Path(raw)
             first = prod / "05-shots" / "SH001.mp4"
             first.parent.mkdir(parents=True)
-            first.write_bytes(b"\x00\x00\x00\x18ftypisomtake-a")
+            original = b"\x00\x00\x00\x18ftypisomtake-a"
+            first.write_bytes(original)
             a = record_render_take(
                 prod,
                 shot_id="SH001",
@@ -67,7 +69,8 @@ class TakeIdentity(unittest.TestCase):
                 episode=1,
                 new_attempt=False,
             )
-            first.write_bytes(b"\x00\x00\x00\x18ftypisomtake-a2")
+            archived = (prod / a.dest).read_bytes()
+            first.write_bytes(original)
             resumed = record_render_take(
                 prod,
                 shot_id="SH001",
@@ -79,6 +82,19 @@ class TakeIdentity(unittest.TestCase):
             )
             self.assertEqual(resumed.take_id, a.take_id)
             self.assertEqual(resumed.attempt_id, a.attempt_id)
+            self.assertEqual((prod / a.dest).read_bytes(), archived)
+            first.write_bytes(b"\x00\x00\x00\x18ftypisomtake-a2")
+            changed = record_render_take(
+                prod,
+                shot_id="SH001",
+                dest=first,
+                request_hash="abc" * 16,
+                task_id="cgt-1",
+                episode=1,
+                new_attempt=False,
+            )
+            self.assertNotEqual(changed.take_id, a.take_id)
+            self.assertEqual((prod / a.dest).read_bytes(), archived)
             first.write_bytes(b"\x00\x00\x00\x18ftypisomtake-b")
             b = record_render_take(
                 prod,
@@ -93,9 +109,10 @@ class TakeIdentity(unittest.TestCase):
             self.assertNotEqual(b.attempt_id, a.attempt_id)
             self.assertEqual(b.request_hash, a.request_hash)
             rows = takes_for_shot(prod, "SH001", 1)
-            self.assertEqual({row.take_id for row in rows}, {a.take_id, b.take_id})
+            self.assertEqual({row.take_id for row in rows}, {a.take_id, changed.take_id, b.take_id})
             self.assertTrue((prod / a.dest).is_file())
             self.assertTrue((prod / b.dest).is_file())
+            select_take(prod, "SH001", b.take_id, 1)
             self.assertEqual(selected_take(prod, "SH001", 1).take_id, b.take_id)
 
 
@@ -125,6 +142,7 @@ class AssembleFromTakes(unittest.TestCase):
                 "cut.json",
                 {
                     "timeline": [{
+                        "segment_id": "seg-1",
                         "shot_id": "SH001",
                         "take_id": first.take_id,
                         "in_point": 0,
@@ -138,7 +156,7 @@ class AssembleFromTakes(unittest.TestCase):
             out_a = assemble_episode(prod, 1)
             hash_a = _file_hash(prod / out_a["output"])
             self.assertEqual(out_a["takes"], [first.take_id])
-            select_take(prod, "SH001", second.take_id, 1)
+            replace_segment_take(prod, "seg-1", second.take_id, 1)
             out_b = assemble_episode(prod, 1)
             hash_b = _file_hash(prod / out_b["output"])
             self.assertEqual(out_b["takes"], [second.take_id])
@@ -248,6 +266,7 @@ class DefaultCutUsesSelectedTake(unittest.TestCase):
             take = record_render_take(
                 prod, shot_id="SH001", dest=dest, request_hash="q" * 32, task_id="tq", episode=1
             )
+            select_take(prod, "SH001", take.take_id, 1)
             write_artifact(prod, "shot_specs.json", {"shot_specs": [{"shot_id": "SH001", "duration_sec": 4}]})
             cut = default_cut_from_specs(prod, ["SH001"], 1)
             self.assertEqual(cut["timeline"][0]["take_id"], take.take_id)

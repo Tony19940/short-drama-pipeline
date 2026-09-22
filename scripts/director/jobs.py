@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import sys
@@ -344,6 +345,17 @@ def _run_review(prod: Path, job_id: str) -> None:
         _update_job(prod, job_id, status="failed", error=str(exc))
 
 
+def _finite_span(start: float, end: float, label: str) -> tuple[float, float]:
+    try:
+        inn = float(start)
+        out = float(end)
+    except (TypeError, ValueError) as exc:
+        raise PermissionError(f"{label} in/out must be numbers") from exc
+    if not math.isfinite(inn) or not math.isfinite(out) or out <= inn:
+        raise PermissionError(f"{label} needs a finite range with out > in")
+    return inn, out
+
+
 def _trim_segment_av(
     *,
     video_src: Path,
@@ -353,14 +365,21 @@ def _trim_segment_av(
     audio_in: float,
     audio_out: float,
     dest: Path,
+    audio_mode: str = "source",
 ) -> None:
-    video_dur = max(0.1, float(video_out) - float(video_in))
-    audio_dur = max(0.1, float(audio_out) - float(audio_in)) if float(audio_out) > float(audio_in) else video_dur
+    video_in, video_out = _finite_span(video_in, video_out, dest.name)
+    mode = str(audio_mode or "source").strip().lower()
+    if mode not in {"source", "silent"}:
+        raise PermissionError(f"audio_mode must be source or silent, not {audio_mode}")
+    if mode == "source":
+        audio_in, audio_out = _finite_span(audio_in, audio_out, dest.name + " audio")
+    video_dur = video_out - video_in
+    audio_dur = (audio_out - audio_in) if mode == "source" else video_dur
     dest.parent.mkdir(parents=True, exist_ok=True)
     picture = dest.with_name(dest.stem + "-v.mp4")
     sound = dest.with_name(dest.stem + "-a.m4a")
     video_cmd = [
-        "ffmpeg", "-y", "-ss", f"{float(video_in):.3f}", "-i", str(video_src),
+        "ffmpeg", "-y", "-ss", f"{video_in:.3f}", "-i", str(video_src),
         "-t", f"{video_dur:.3f}", "-an",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "18",
         str(picture),
@@ -368,20 +387,20 @@ def _trim_segment_av(
     proc = subprocess.run(video_cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr or proc.stdout or f"{dest.name} 画面修剪失败")
-    audio_cmd = [
-        "ffmpeg", "-y", "-ss", f"{float(audio_in):.3f}", "-i", str(audio_src),
-        "-t", f"{audio_dur:.3f}", "-vn", "-c:a", "aac", "-b:a", "160k",
-        str(sound),
-    ]
-    audio_proc = subprocess.run(audio_cmd, capture_output=True, text=True)
-    if audio_proc.returncode != 0:
-        silent = [
-            "ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=48000:cl=stereo",
+    if mode == "silent":
+        audio_cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
             "-t", f"{video_dur:.3f}", "-c:a", "aac", "-b:a", "160k", str(sound),
         ]
-        silent_proc = subprocess.run(silent, capture_output=True, text=True)
-        if silent_proc.returncode != 0:
-            raise RuntimeError(audio_proc.stderr or audio_proc.stdout or f"{dest.name} 声音修剪失败")
+    else:
+        audio_cmd = [
+            "ffmpeg", "-y", "-ss", f"{audio_in:.3f}", "-i", str(audio_src),
+            "-t", f"{audio_dur:.3f}", "-vn", "-c:a", "aac", "-b:a", "160k",
+            str(sound),
+        ]
+    audio_proc = subprocess.run(audio_cmd, capture_output=True, text=True)
+    if audio_proc.returncode != 0:
+        raise RuntimeError(audio_proc.stderr or audio_proc.stdout or f"{dest.name} 声音修剪失败")
     mux = [
         "ffmpeg", "-y", "-i", str(picture), "-i", str(sound),
         "-filter_complex", f"[1:a]apad,atrim=0:{video_dur:.3f}[a]",
@@ -454,12 +473,13 @@ def assemble_episode(prod: Path, episode=1) -> dict:
     segments = segments_from_timeline(used, episode)
     for index, (item, segment) in enumerate(zip(used, segments)):
         sid = item.get("shot_id")
-        try:
+        explicit = str(item.get("take_id") or item.get("audio_take_id") or "").strip()
+        if explicit:
             picture, audio = resolve_segment_takes(prod, segment, episode)
             video_src = take_media_file(prod, picture)
             audio_src = take_media_file(prod, audio)
             used_takes.append(picture.take_id)
-        except PermissionError:
+        else:
             video_src = resolve_shot_media(prod, sid, episode)
             audio_src = video_src
         if ken_burns_blocked(video_src) or ken_burns_blocked(audio_src):
@@ -477,6 +497,7 @@ def assemble_episode(prod: Path, episode=1) -> dict:
             audio_in=audio_in,
             audio_out=audio_out,
             dest=clip,
+            audio_mode=str(item.get("audio_mode") or "source"),
         )
         lines.append(f"file '{clip}'")
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
