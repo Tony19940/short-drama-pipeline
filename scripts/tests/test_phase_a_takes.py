@@ -153,11 +153,11 @@ class AssembleFromTakes(unittest.TestCase):
                     "final_file": "06-export/ep01.mp4",
                 },
             )
-            out_a = assemble_episode(prod, 1)
+            out_a = assemble_episode(prod, 1, candidate=True)
             hash_a = _file_hash(prod / out_a["output"])
             self.assertEqual(out_a["takes"], [first.take_id])
             replace_segment_take(prod, "seg-1", second.take_id, 1)
-            out_b = assemble_episode(prod, 1)
+            out_b = assemble_episode(prod, 1, candidate=True)
             hash_b = _file_hash(prod / out_b["output"])
             self.assertEqual(out_b["takes"], [second.take_id])
             self.assertNotEqual(hash_a, hash_b)
@@ -194,7 +194,7 @@ class AssembleFromTakes(unittest.TestCase):
                     "final_file": "06-export/ep01.mp4",
                 },
             )
-            result = assemble_episode(prod, 1)
+            result = assemble_episode(prod, 1, candidate=True)
             self.assertTrue((prod / result["output"]).is_file())
             self.assertEqual(take_media_file(prod, pic).stat().st_mtime, (prod / pic.dest).stat().st_mtime)
 
@@ -223,9 +223,9 @@ class AssembleFromTakes(unittest.TestCase):
                     "final_file": episode_export_rel(2),
                 },
             )
-            result = assemble_episode(prod, 2)
-            self.assertEqual(result["output"], "06-export/ep02.mp4")
-            self.assertTrue((prod / "06-export/ep02.mp4").is_file())
+            result = assemble_episode(prod, 2, candidate=True)
+            self.assertEqual(result["output"], "06-export/ep02.candidate.mp4")
+            self.assertTrue((prod / "06-export/ep02.candidate.mp4").is_file())
             self.assertFalse((prod / "06-export/ep01.mp4").exists())
 
     @unittest.skipUnless(_have_ffmpeg(), "ffmpeg required")
@@ -249,9 +249,9 @@ class AssembleFromTakes(unittest.TestCase):
                     "final_file": "06-export/ep01.mp4",
                 },
             )
-            result = assemble_episode(prod, 1)
+            result = assemble_episode(prod, 1, candidate=True)
             self.assertTrue((prod / result["output"]).is_file())
-            work = list((prod / ".director" / "cut-work" / "1").glob("*.mp4"))
+            work = list((prod / ".director" / "cut-work" / "1").rglob("*.mp4"))
             named = [path for path in work if path.stem.endswith(("-v",)) is False]
             self.assertGreaterEqual(len([p for p in work if not p.name.endswith("-v.mp4")]), 2)
 

@@ -4,6 +4,10 @@
 set -euo pipefail
 
 root="${1:?usage: $0 productions/<slug> [video-dir] [outfile]}"
+if [[ -f "$root/.pipeline/revisions.json" ]]; then
+  echo "registered revision: use python3 scripts/assemble_episode.py --prod <production> [--candidate]; full-length concat cannot approve this edit" >&2
+  exit 1
+fi
 shots="$root/${2:-05-shots}"
 out="$root/${3:-06-export/ep01.mp4}"
 mkdir -p "$(dirname "$out")"

@@ -6,6 +6,8 @@ import json
 import time
 from pathlib import Path
 
+from .context import context_for
+from .paths import safe_under
 from .review_contract import evaluate_review_contract, load_contract
 from .reviewer import load_review
 from .sound_contract import build_sound_contract
@@ -17,6 +19,9 @@ BLENDER_NOTE = (
 
 
 def build_qc_report(prod: Path, *, evaluate: bool = False) -> dict:
+    ctx = context_for(prod)
+    if ctx.mode == "registered":
+        return _registered_report(ctx)
     contract = load_contract(prod) or {}
     evaluated = dict(contract)
     if evaluate:
@@ -64,6 +69,43 @@ def build_qc_report(prod: Path, *, evaluate: bool = False) -> dict:
     return report
 
 
+def _registered_report(ctx) -> dict:
+    """Summarize current evidence without adopting an old review or issuing a pass."""
+    from .narrative import inspect_narrative
+
+    prod = ctx.prod
+    cut = ctx.read_artifact("cut.json")
+    failures = [] if cut else [f"缺当前剪辑表 {ctx.cut_rel()}"]
+    export = str(cut.get("final_file") or "")
+    export_exists = False
+    if export:
+        try:
+            export_exists = safe_under(prod, export).is_file()
+        except ValueError as exc:
+            failures.append(str(exc))
+    if not export_exists:
+        failures.append("缺当前剪辑表指定的成片")
+    narrative = inspect_narrative(prod, ctx.episode_token, ctx.revision_id, cut)
+    failures.extend(narrative.get("errors") or [])
+    pending = list(narrative.get("pending") or [])
+    return {
+        "schema": "revision-qc-summary-v1", "at": int(time.time()),
+        "context": ctx.to_dict(), "source": ctx.source_report(),
+        "verdict": "fail" if failures else "inconclusive",
+        "required": "fail" if failures else narrative.get("status") or "pending",
+        "visual": "inconclusive", "s0": [], "s1": [], "s2": [],
+        "failures": failures, "pending": pending, "rework": [],
+        "export": export if export_exists else "", "export_exists": export_exists,
+        "sound_kinds": [], "narrative": narrative, "blender": BLENDER_NOTE,
+        "note": "登记版本仅汇总当前剪辑与段落证据；完整声画质量由新版段落审核及 Gate F 确认，此摘要不授予 pass。",
+    }
+
+
+def _qc_dir(prod: Path) -> Path:
+    ctx = context_for(prod)
+    return prod / "08-qc" / str(ctx.episode_token) if ctx.mode == "registered" else prod / "08-qc"
+
+
 def _report_md(report: dict) -> str:
     lines = [
         "# 审片报告",
@@ -86,7 +128,7 @@ def _report_md(report: dict) -> str:
 
 
 def write_qc_draft(prod: Path) -> dict:
-    dest = prod / "08-qc"
+    dest = _qc_dir(prod)
     dest.mkdir(parents=True, exist_ok=True)
     report = build_qc_report(prod, evaluate=True)
     (dest / "report.draft.json").write_text(
@@ -97,7 +139,7 @@ def write_qc_draft(prod: Path) -> dict:
 
 
 def promote_qc_drafts(prod: Path) -> None:
-    dest = prod / "08-qc"
+    dest = _qc_dir(prod)
     for src_name, official in (("report.draft.json", "report.json"), ("report.draft.md", "report.md")):
         src = dest / src_name
         if src.exists() and src.stat().st_size > 0:
@@ -105,7 +147,8 @@ def promote_qc_drafts(prod: Path) -> None:
 
 
 def snapshot_qc(prod: Path) -> dict:
-    dest = prod / "08-qc"
+    dest = _qc_dir(prod)
+    ctx = context_for(prod)
     live = build_qc_report(prod, evaluate=False)
     official = dest / "report.json"
     draft = dest / "report.draft.json"
@@ -114,5 +157,5 @@ def snapshot_qc(prod: Path) -> dict:
         "official": json.loads(official.read_text(encoding="utf-8")) if official.exists() else None,
         "draft": json.loads(draft.read_text(encoding="utf-8")) if draft.exists() else None,
         "blender": BLENDER_NOTE,
-        "export_exists": (prod / "06-export" / "ep01.mp4").exists(),
+        "export_exists": (prod / "06-export" / "ep01.mp4").exists() if ctx.mode == "legacy" else bool(live.get("export_exists")),
     }

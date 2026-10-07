@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import subprocess
 import sys
@@ -86,29 +87,46 @@ def enqueue_render(prod: Path, shot_ids: Optional[list[str]] = None, review_trac
     return enqueue_render_confirmed(prod, None, shot_ids, review_track)
 
 
-def enqueue_render_confirmed(
+def enqueue_render_confirmed(prod: Path, fingerprint: Optional[str] = None,
+                             shot_ids: Optional[list[str]] = None, review_track: bool = False,
+                             episode=1, revision_id: str = "") -> dict:
+    from .context import ProductionContext, using_context
+
+    ctx = ProductionContext.resolve(prod, episode, revision_id)
+    with using_context(ctx):
+        return _enqueue_render_confirmed(prod, fingerprint, shot_ids, review_track, ctx.episode_token)
+
+
+def _enqueue_render_confirmed(
     prod: Path,
     fingerprint: Optional[str] = None,
     shot_ids: Optional[list[str]] = None,
     review_track: bool = False,
     episode=1,
 ) -> dict:
+    from .context import ProductionContext
+    from .narrative import require_design_review
+
+    ctx = ProductionContext.resolve(prod, episode)
+    episode = ctx.episode_token
+    selected = select_shots(prod, shot_ids, episode)
+    selected_ids = [shot["id"] for shot in selected]
+    require_design_review(prod, episode)
     require_fresh_gate(prod, "C")
     from .pipeline import assert_clips_passed, assert_keyframes_passed, assert_packages_confirmed, uses_pipeline
     if uses_pipeline(prod):
         require_fresh_gate(prod, "C2")
-        assert_packages_confirmed(prod, episode)
-        assert_keyframes_passed(prod, episode)
+        assert_packages_confirmed(prod, episode, selected_shot_ids=selected_ids)
+        assert_keyframes_passed(prod, episode, selected_shot_ids=selected_ids)
         from .show_policy import load_show_policy
 
-        if load_show_policy(prod).animatic_required:
+        if ctx.mode == "registered" or load_show_policy(prod).animatic_required:
             from .animatic import require_animatic_approval
 
             require_animatic_approval(prod, episode)
-    check = run_check(prod)
+    check = run_check(prod, episode=episode)
     if not check["ok"]:
         raise PermissionError(check["stderr"] or check["stdout"] or "check_prod 未过，不能出视频")
-    selected = select_shots(prod, shot_ids, episode)
     from .fingerprint import confirmed_snapshot_rel, consume_render_fingerprint, require_task_inputs
 
     require_task_inputs(prod, selected, episode)
@@ -252,8 +270,10 @@ def _run_render(prod: Path, job_id: str) -> None:
         from .video_fallback import read_clip_record
 
         episode = job.get("episode") or 1
-        shot_dir = episode_shot_dir(episode)
-        frame_dir = episode_frame_dir(episode)
+        from .context import ProductionContext
+        ctx = ProductionContext.resolve(prod, episode)
+        shot_dir = ctx.shot_dir()
+        frame_dir = ctx.frame_dir()
         for shot_id in job.get("shot_ids") or []:
             video = prod / shot_dir / f"{shot_id}.mp4"
             last = prod / frame_dir / f"{shot_id}-last.jpg"
@@ -286,6 +306,9 @@ def _run_render(prod: Path, job_id: str) -> None:
             "outputs": outputs,
             "error": None,
             "backend": used_backend,
+            "review_status": "not_reviewed",
+            "approved": False,
+            "revision": ctx.to_dict(),
         }
         if fallback_from:
             fields["fallback_from"] = fallback_from
@@ -366,6 +389,9 @@ def _trim_segment_av(
     audio_out: float,
     dest: Path,
     audio_mode: str = "source",
+    speed: float = 1.0,
+    output_duration_sec: Optional[float] = None,
+    fps: int = 30,
 ) -> None:
     video_in, video_out = _finite_span(video_in, video_out, dest.name)
     mode = str(audio_mode or "source").strip().lower()
@@ -373,14 +399,25 @@ def _trim_segment_av(
         raise PermissionError(f"audio_mode must be source or silent, not {audio_mode}")
     if mode == "source":
         audio_in, audio_out = _finite_span(audio_in, audio_out, dest.name + " audio")
-    video_dur = video_out - video_in
+    speed = float(speed)
+    if not math.isfinite(speed) or speed <= 0:
+        raise PermissionError("speed must be finite and positive")
+    source_dur = video_out - video_in
+    fps = int(fps)
+    if fps < 1 or fps > 120:
+        raise PermissionError("fps must be 1..120")
+    ideal = source_dur / speed
+    frames = max(1, round(float(output_duration_sec) * fps)) if output_duration_sec is not None else max(1, math.ceil(ideal * fps - 0.00001))
+    video_dur = frames / fps
+    if video_dur > ideal + 1 / fps + 0.001:
+        raise PermissionError("output duration would add unrecorded video padding")
     audio_dur = (audio_out - audio_in) if mode == "source" else video_dur
     dest.parent.mkdir(parents=True, exist_ok=True)
     picture = dest.with_name(dest.stem + "-v.mp4")
     sound = dest.with_name(dest.stem + "-a.m4a")
     video_cmd = [
-        "ffmpeg", "-y", "-ss", f"{video_in:.3f}", "-i", str(video_src),
-        "-t", f"{video_dur:.3f}", "-an",
+        "ffmpeg", "-y", "-ss", f"{video_in:.3f}", "-t", f"{source_dur:.3f}", "-i", str(video_src),
+        "-an", "-vf", f"setpts=(PTS-STARTPTS)/{speed:.8f},fps={fps}", "-frames:v", str(frames),
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "18",
         str(picture),
     ]
@@ -393,9 +430,18 @@ def _trim_segment_av(
             "-t", f"{video_dur:.3f}", "-c:a", "aac", "-b:a", "160k", str(sound),
         ]
     else:
+        rates = []
+        remaining = speed
+        while remaining > 2:
+            rates.append("atempo=2")
+            remaining /= 2
+        while remaining < 0.5:
+            rates.append("atempo=0.5")
+            remaining *= 2
+        rates.append(f"atempo={remaining:.8f}")
         audio_cmd = [
-            "ffmpeg", "-y", "-ss", f"{audio_in:.3f}", "-i", str(audio_src),
-            "-t", f"{audio_dur:.3f}", "-vn", "-c:a", "aac", "-b:a", "160k",
+            "ffmpeg", "-y", "-ss", f"{audio_in:.3f}", "-t", f"{audio_dur:.3f}", "-i", str(audio_src),
+            "-vn", "-af", ",".join(rates), "-c:a", "aac", "-b:a", "160k",
             str(sound),
         ]
     audio_proc = subprocess.run(audio_cmd, capture_output=True, text=True)
@@ -413,115 +459,87 @@ def _trim_segment_av(
         raise RuntimeError(mux_proc.stderr or mux_proc.stdout or f"{dest.name} 音画合成失败")
 
 
-def assemble_episode(prod: Path, episode=1) -> dict:
-    from .pipeline import (
-        assert_clips_passed,
-        default_cut_from_specs,
-        duration_for_shot,
-        episode_artifact_name,
-        episode_label,
-        episode_shot_dir,
-        read_artifact,
-        uses_pipeline,
-        validate_cut,
-        write_artifact,
-    )
-    from .takes import (
-        episode_export_rel,
-        episode_key,
-        resolve_segment_takes,
-        resolve_shot_media,
-        segments_from_timeline,
-        take_media_file,
-    )
+def assemble_episode(prod: Path, episode=1, *, candidate: bool = False, revision_id: str = "") -> dict:
+    """Render a review export. Approval is a separate, source-bound action."""
+    from .context import ProductionContext
+    from .pipeline import default_cut_from_specs, uses_pipeline
+    from .narrative import (normalize_cut, require_cut_media_reviews, require_event_coverage,
+                            inspect_narrative, media_path, write_export_receipt)
+    from .takes import episode_export_rel, episode_key
 
-    if uses_pipeline(prod):
-        assert_clips_passed(prod, episode)
-    shots = _shots(prod, episode)
-    cut_name = episode_artifact_name("cut.json", episode)
-    cut = read_artifact(prod, cut_name) or (read_artifact(prod, "cut.json") if not episode_label(episode) else {})
-    timeline = list(cut.get("timeline") or [])
-    if not timeline:
-        cut = default_cut_from_specs(prod, [shot["id"] for shot in shots], episode)
-        timeline = list(cut.get("timeline") or [])
-        write_artifact(prod, cut_name, cut)
-    errors = validate_cut(cut) if cut else []
-    if errors:
-        raise PermissionError(errors[0])
-    used = [item for item in timeline if item.get("used", True)]
-    if not used:
+    ctx = ProductionContext.resolve(prod, episode, revision_id)
+    token = ctx.episode_token
+    shots = _shots(prod, token)
+    cut = ctx.read_artifact("cut.json")
+    if not cut:
+        cut = default_cut_from_specs(prod, [shot["id"] for shot in shots], token)
+    try:
+        segments = normalize_cut(prod, cut, token)
+    except (ValueError, OSError) as exc:
+        raise PermissionError("剪辑输入无效：" + str(exc)) from exc
+    if not segments:
         raise PermissionError("时间线没有采用任何镜头")
-    shot_dir = prod / episode_shot_dir(episode)
-    if shot_dir.exists():
-        for path in shot_dir.iterdir():
-            if path.is_file() and ken_burns_blocked(path):
-                raise PermissionError(f"{path.name} 是 Ken Burns 路径，不能进入成片")
-    export_rel = episode_export_rel(episode)
-    dest = prod / export_rel
+    known = {shot["id"] for shot in shots}
+    if (ctx.mode == "registered" or known) and {seg["shot_id"] for seg in segments} - known:
+        raise PermissionError("时间线有本版本分镜表以外的镜号")
+    shot_root = prod / ctx.shot_dir()
+    if shot_root.exists() and any(ken_burns_blocked(p) for p in shot_root.iterdir() if p.is_file()):
+        raise PermissionError("单镜目录仍有 Ken Burns 文件；不能当作正式视频拼接")
+    if not candidate:
+        if uses_pipeline(prod):
+            require_cut_media_reviews(prod, cut, token)
+        if ctx.mode == "registered":
+            require_event_coverage(prod, token, cut=cut)
+    export_rel = episode_export_rel(token)
+    if candidate:
+        export_rel = str(Path(export_rel).with_name(Path(export_rel).stem + ".candidate.mp4"))
+    dest = media_path(prod, export_rel)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() and ken_burns_blocked(dest):
-        dest.unlink()
-    work = prod / ".director" / "cut-work" / episode_key(episode)
-    if work.exists():
-        for stale in work.iterdir():
-            if stale.is_file():
-                stale.unlink()
+    work = prod / ".director" / "cut-work" / episode_key(token) / ("candidate" if candidate else "review")
     work.mkdir(parents=True, exist_ok=True)
     list_path = work / "concat.txt"
     lines = []
-    used_takes = []
-    segments = segments_from_timeline(used, episode)
-    for index, (item, segment) in enumerate(zip(used, segments)):
-        sid = item.get("shot_id")
-        explicit = str(item.get("take_id") or item.get("audio_take_id") or "").strip()
-        if explicit:
-            picture, audio = resolve_segment_takes(prod, segment, episode)
-            video_src = take_media_file(prod, picture)
-            audio_src = take_media_file(prod, audio)
-            used_takes.append(picture.take_id)
-        else:
-            video_src = resolve_shot_media(prod, sid, episode)
-            audio_src = video_src
+    for index, seg in enumerate(segments):
+        video_src = media_path(prod, seg["source"])
+        audio_src = media_path(prod, seg["audio_source"])
+        if not video_src.is_file() or (seg["audio_mode"] != "silent" and not audio_src.is_file()):
+            raise PermissionError(f"{seg['shot_id']} 缺实际采用素材")
         if ken_burns_blocked(video_src) or ken_burns_blocked(audio_src):
             raise PermissionError(f"{video_src.name} 是 Ken Burns 路径，不能进入成片")
-        inn = float(item.get("in_sec", item.get("in_point") or 0) or 0)
-        out = float(item.get("out_sec", item.get("out_point") or duration_for_shot(prod, sid, 4, episode)))
-        audio_in = float(item.get("audio_in_sec", inn) or 0)
-        audio_out = float(item.get("audio_out_sec", out) or out)
-        clip = work / f"{index:03d}-{segment.segment_id}.mp4"
-        _trim_segment_av(
-            video_src=video_src,
-            video_in=inn,
-            video_out=out,
-            audio_src=audio_src,
-            audio_in=audio_in,
-            audio_out=audio_out,
-            dest=clip,
-            audio_mode=str(item.get("audio_mode") or "source"),
-        )
-        lines.append(f"file '{clip}'")
+        clip = work / f"{index:03d}-{seg['shot_id']}.mp4"
+        _trim_segment_av(video_src=video_src, video_in=seg["in_sec"], video_out=seg["out_sec"],
+                         audio_src=audio_src, audio_in=seg["audio_in_sec"], audio_out=seg["audio_out_sec"],
+                         audio_mode=seg["audio_mode"], speed=seg["speed"], output_duration_sec=seg["output_duration_sec"], fps=seg["fps"], dest=clip)
+        lines.append("file '" + str(clip).replace("'", "'\\''") + "'")
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    cmd = [
+    staged = work / "export.mp4"
+    proc = subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "fast", "-crf", "18",
-        "-c:a", "aac", "-b:a", "160k",
-        str(dest),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+        "-c:a", "aac", "-b:a", "160k", str(staged),
+    ], capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr or proc.stdout or "assemble 失败")
-    if ken_burns_blocked(dest):
-        dest.unlink(missing_ok=True)
-        raise PermissionError("拼接结果不能是 Ken Burns")
-    cut["final_file"] = export_rel
-    cut["status"] = "ready"
-    cut["episode"] = episode_key(episode)
-    write_artifact(prod, cut_name, cut)
-    return {
-        "ok": True,
-        "output": export_rel,
-        "stdout": proc.stdout,
-        "used": [item.get("shot_id") for item in used],
-        "takes": used_takes,
-        "episode": episode_key(episode),
-    }
+    # Preserve the last usable export until the replacement has rendered successfully.
+    staged.replace(dest)
+    contract = ctx.read_artifact("events.json")
+    if contract:
+        write_export_receipt(prod, contract, cut, export_rel, token)
+    status = "candidate" if candidate else "pending_sequence_review"
+    result = {"ok": True, "output": export_rel, "stdout": proc.stdout,
+              "used": [seg["shot_id"] for seg in segments],
+              "takes": [row["take_id"] for row in cut.get("timeline") or [] if row.get("used", True) and row.get("take_id")],
+              "episode": episode_key(token), "revision": ctx.to_dict(), "status": status,
+              "narrative": inspect_narrative(prod, token, cut=cut), "approved": False}
+    result["not_in_edit"] = sorted(known - {seg["shot_id"] for seg in segments})
+    result["delivery_scope"] = "partial" if result["not_in_edit"] else "all_planned_shots"
+    if candidate:
+        # Candidate previews never replace the official EDL or any approval.
+        (work / "candidate-export.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    else:
+        cut = {**cut, "final_file": export_rel, "status": status, "episode": episode_key(token),
+               "delivery_scope": result["delivery_scope"], "not_in_edit": result["not_in_edit"], "approved": False}
+        path = ctx.artifact_path("cut.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cut, ensure_ascii=False, indent=2) + "\n")
+    return result

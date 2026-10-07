@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from .design_critic import (
     RUBRIC,
+    REVIEW_GUIDANCE,
     candidate_summary,
     critic_errors,
     fallback_verdict,
@@ -646,7 +647,7 @@ def _design_one_candidate(prod: Path, system: str, ctx: dict, *, sid: str, merge
                 "left_right_lock": header.get("left_right_lock"),
                 "continuity_bible": header.get("continuity_bible"),
                 "whose_pov": header.get("whose_pov"),
-                "visible_change_without_dialogue": "pass",
+                "visible_change_without_dialogue": "not_reviewed",
                 **table_extra,
             },
             writer=check["writer"],
@@ -719,8 +720,8 @@ def frame_desc_shots_ctx(scene_shots: list[dict]) -> list[dict]:
 def _run_critic(prod: Path, *, sid: str, scene: dict, card: Optional[dict], grammar: dict, candidates: list[dict], profile: dict) -> dict:
     """Score candidates against the scene card, including a single-version continuity review."""
     if not candidates:
-        return {"pick": 0, "why": "没有候选。", "merge": "", "scores": [], "source": "empty"}
-    system = _system("critic")
+        return {"decision": "reject_all", "pick": None, "why": "没有候选。", "merge": "", "scores": [], "source": "empty", "recommendation_only": True}
+    system = _system("critic") + "\n" + "\n".join(REVIEW_GUIDANCE)
     ctx = {
         "call": "critic",
         "scene": scene,
@@ -728,10 +729,12 @@ def _run_critic(prod: Path, *, sid: str, scene: dict, card: Optional[dict], gram
         "visual_grammar": grammar,
         "target_profile": profile_brief(profile),
         "rubric": RUBRIC,
+        "review_guidance": list(REVIEW_GUIDANCE),
         "candidates": [candidate_summary({**c, "index": i}, card) for i, c in enumerate(candidates)],
         "output": {
-            "scores": [{"candidate": i, "dims": {k: 0 for k in RUBRIC}, "notes": "", "fixes": []} for i in range(len(candidates))],
-            "pick": 0,
+            "scores": [{"candidate": i, "dims": {k: 0 for k in RUBRIC}, "status": "needs_rework", "notes": "", "comprehension_evidence": "", "blocking_issues": [], "fixes": []} for i in range(len(candidates))],
+            "decision": "recommend / needs_rework / reject_all",
+            "pick": "合格候选索引；reject_all必须为null，needs_rework可为null",
             "why": "",
             "merge": "",
         },
@@ -892,7 +895,7 @@ def _run_design_table_body(
     system = _system("design")
     check = table_context(prod, target_model, episode=ep)
     profile = check["profile"]
-    cache_key = _design_cache_key(prod, brief, profile["id"], system + f"|candidates={n_candidates}")
+    cache_key = _design_cache_key(prod, brief, profile["id"], system + f"|candidates={n_candidates}|critic-contract=2")
     cache = _load_design_cache(prod, cache_key) if resume else {"key": cache_key, "header": None, "scenes": {}}
     cache.setdefault("candidates", {})
     cache.setdefault("verdicts", {})
@@ -947,7 +950,8 @@ def _run_design_table_body(
         sid = str(scene.get("scene_id") or "")
         card = scene_card_for(scene_cards, sid)
         cached = cache.get("scenes", {}).get(sid)
-        if cached:
+        cached_verdict = cache.get("verdicts", {}).get(sid) or {}
+        if cached and cached_verdict.get("decision") in {"recommend", "not_reviewed"}:
             merged_shots.extend(cached)
             prev_shot = cached[-1] if cached else prev_shot
             picks[sid] = int((cache.get("verdicts", {}).get(sid) or {}).get("pick", 0) or 0)
@@ -964,10 +968,18 @@ def _run_design_table_body(
             if result:
                 accepted.append(result)
         if not accepted:
+            _save_design_candidates(prod, candidate_rows + [{"scene_id": sid, "scene_card": card, "candidates": [], "pick": None, "verdict": {"decision": "reject_all", "pick": None, "why": "全部候选未过结构校验", "source": "machine"}}], picks, header=header, scene_cards=scene_cards, grammar=grammar, target_model=profile["id"], status="needs_rework")
             raise PermissionError(f"design {sid}: {n_candidates} 版都没过机器校验，看 .pipeline/design.{sid}.*.invalid.json")
         if n_candidates >= 2 and len(accepted) >= 2 and not schemes_are_distinct(accepted[0], accepted[1]):
             accepted[0].setdefault("warnings", []).append(f"{sid} 前两版视点/节奏几乎相同，不算两个方案")
         verdict = _run_critic(prod, sid=sid, scene=scene, card=card, grammar=grammar, candidates=accepted, profile=profile)
+        if verdict.get("decision") in {"reject_all", "needs_rework"}:
+            cache["candidates"][sid] = accepted
+            cache["verdicts"][sid] = verdict
+            _save_design_cache(prod, cache)
+            row = {"scene_id": sid, "scene_card": card, "candidates": accepted, "verdict": verdict, "pick": verdict.get("pick")}
+            _save_design_candidates(prod, candidate_rows + [row], picks, header=header, scene_cards=scene_cards, grammar=grammar, target_model=profile["id"], status="needs_rework")
+            raise PermissionError(f"design {sid}: 评审要求重做，候选已保留：{verdict.get('why') or '未找到合格表达'}")
         pick = int(verdict.get("pick", 0) or 0)
         chosen = accepted[pick]["shots"]
         merged_shots.extend(chosen)
@@ -985,6 +997,7 @@ def _run_design_table_body(
             "candidates": len(accepted),
             "pick": pick,
             "critic": verdict.get("source"),
+            "review_decision": verdict.get("decision", "not_reviewed"),
         })
         candidate_rows.append({"scene_id": sid, "scene_card": card, "candidates": accepted, "verdict": verdict, "pick": pick})
 
@@ -1019,6 +1032,19 @@ def _run_design_table_body(
     }
 
 
+def _save_design_candidates(
+    prod: Path, rows: list[dict], picks: dict, *, header: dict, scene_cards: list[dict],
+    grammar: dict, target_model: str, status: str = "draft",
+) -> None:
+    """Keep rejected and unreviewed proposals inspectable without promoting a table."""
+    write_artifact(prod, candidates_name(_ep()), {
+        "schema": "design-candidates-v1", "status": status, "scenes": rows, "picks": picks,
+        "design_header": header, "scene_cards": scene_cards, "visual_grammar": grammar,
+        "target_model": target_model,
+    })
+    write_text(prod, storyboard_md_name("shot-candidates.draft.md", _ep()), render_candidates_md(rows))
+
+
 def _finalize_design(
     prod: Path,
     *,
@@ -1047,9 +1073,10 @@ def _finalize_design(
             "scene_cards": scene_cards,
             "visual_grammar": grammar,
             "candidate_picks": picks,
-            "visible_change_without_dialogue": "pass",
+            "visible_change_without_dialogue": "not_reviewed",
             "dropped_shots": header.get("dropped_shots") or [],
-            "design_steps_done": [1, 2, 3, 4, 5, 6, 7],
+            "narrative_review": {"status": "not_reviewed"},
+            "critic_reviews": {str(row.get("scene_id")): row.get("verdict") or {} for row in candidate_rows},
             "shots": merged_shots,
         },
         writer=check["writer"],
@@ -1062,7 +1089,7 @@ def _finalize_design(
     payload["scene_reports"] = scene_reports
     payload = _merge_status(payload, "design")
     written = write_artifact(prod, shot_list_artifact_name(ep), payload)
-    _dump_station(prod, "design", "candidates", {"schema": "design-candidates-v1", "scenes": candidate_rows, "picks": picks})
+    _save_design_candidates(prod, candidate_rows, picks, header=header, scene_cards=scene_cards, grammar=grammar, target_model=profile["id"])
     specs = _merge_status(compile_specs_from_shot_table(written, aspect=written.get("aspect") or "16:9"), "spec")
     specs["origin"] = "compiled-from-shot-table"
     write_artifact(prod, shot_specs_artifact_name(ep), specs)
@@ -1117,6 +1144,8 @@ def pick_candidate(prod: Path, scene_id: str, index: int, *, target_model: Optio
     verdict = dict(target.get("verdict") or {})
     verdict["pick"] = int(index)
     verdict["source"] = "human"
+    verdict["decision"] = "not_reviewed"
+    verdict["recommendation_only"] = True
     verdict["why"] = (verdict.get("why") or "") + f" 人改选第 {index + 1} 版。"
     target["verdict"] = verdict
     merged: list[dict] = []
@@ -1342,20 +1371,20 @@ def _sanitize_writer(data: dict, episode=None) -> dict:
         if not scene.get("end_state"):
             scene["end_state"] = "转下一场"
         if not scene.get("mute_test"):
-            scene["mute_test"] = "pass"
+            scene["mute_test"] = "not_reviewed"
         if not scene.get("unfilmable_check"):
-            scene["unfilmable_check"] = "pass"
+            scene["unfilmable_check"] = "not_reviewed"
         if not scene.get("preach_check"):
-            scene["preach_check"] = "pass"
+            scene["preach_check"] = "not_reviewed"
     return payload
 
 
 def _sanitize_design(data: dict) -> dict:
     payload = dict(data or {})
     if not payload.get("design_steps_done"):
-        payload["design_steps_done"] = [1, 2, 3, 4, 5, 6, 7]
+        payload.pop("design_steps_done", None)
     if not payload.get("visible_change_without_dialogue"):
-        payload["visible_change_without_dialogue"] = "pass"
+        payload["visible_change_without_dialogue"] = "not_reviewed"
     if not payload.get("dropped_shots"):
         payload["dropped_shots"] = []
     for shot in payload.get("shots") or []:

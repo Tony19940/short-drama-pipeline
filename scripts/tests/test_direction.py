@@ -24,6 +24,7 @@ from director.design_critic import (  # noqa: E402
     RUBRIC_KEYS,
     critic_errors,
     deterministic_pick,
+    fallback_verdict,
     normalize_verdict,
     render_candidates_md,
     styles_for,
@@ -323,7 +324,9 @@ class Critic(unittest.TestCase):
 
     def test_critic_errors_ranges(self) -> None:
         self.assertEqual(critic_errors("nope", 2), ["critic must return an object"])
-        verdict = {"scores": [{"candidate": 0, "dims": {k: 11 for k in RUBRIC_KEYS}, "notes": "n"}, {"candidate": 1, "dims": {k: 5 for k in RUBRIC_KEYS}, "notes": "n"}], "pick": 1, "why": "w"}
+        verdict = {"decision": "recommend", "scores": [{"candidate": 0, "dims": {k: 11 for k in RUBRIC_KEYS}, "notes": "n"}, {"candidate": 1, "dims": {k: 5 for k in RUBRIC_KEYS}, "notes": "n"}], "pick": 1, "why": "w"}
+        for entry in verdict["scores"]:
+            entry.update(status="pass", comprehension_evidence="SH003看空手，SH004人物被拦下", blocking_issues=[])
         errors = critic_errors(verdict, 2)
         self.assertTrue(any("dims.reveal_order must be 0–10" in e for e in errors), errors)
         verdict["scores"][0]["dims"] = {k: 5 for k in RUBRIC_KEYS if k != "silence"}
@@ -351,7 +354,25 @@ class Critic(unittest.TestCase):
         self.assertIn("★ 2 主观派", md)
         self.assertIn("### 第 2 版 · 主观派 ★", md)
         self.assertIn("| 警告数 | 2 | 0 |", md)
-        self.assertIn("评审选第 2 版", md)
+        self.assertIn("建议第 2 版", md)
+
+    def test_reject_all_and_rework_are_valid_decisions(self) -> None:
+        scores = [{"candidate": i, "dims": {k: 3 for k in RUBRIC_KEYS}, "status": "needs_rework", "notes": "揭示被误读", "comprehension_evidence": "SH003无法排除早已藏着道具", "blocking_issues": ["显现不清"], "fixes": []} for i in range(2)]
+        verdict = {"decision": "reject_all", "pick": None, "scores": scores, "why": "所有候选都有核心理解缺口"}
+        self.assertEqual(critic_errors(verdict, 2), [])
+        self.assertIsNone(normalize_verdict(verdict, 2)["pick"])
+        self.assertIn("本场没有通过候选", render_candidates_md([{"scene_id": "S", "candidates": self._candidates(), "verdict": verdict}]))
+        verdict["decision"] = "needs_rework"
+        self.assertEqual(critic_errors(verdict, 2), [])
+        verdict.update(decision="recommend", pick=0)
+        self.assertTrue(any("unresolved" in e for e in critic_errors(verdict, 2)))
+
+    def test_fallback_is_unreviewed_advice(self) -> None:
+        verdict = fallback_verdict(self._candidates(), cards()[1], "评审服务不可用")
+        self.assertEqual(verdict["decision"], "not_reviewed")
+        self.assertTrue(verdict["recommendation_only"])
+        self.assertEqual(verdict["scores"], [])
+        self.assertNotIn("pass", verdict.values())
 
 
 def frame_item(shot_id: str, **over) -> dict:
@@ -601,7 +622,8 @@ def fake_design_chat(calls: list[dict]):
         if call == "critic":
             count = len(ctx["candidates"])
             return {
-                "scores": [{"candidate": i, "dims": {k: (7 if i == 1 else 5) for k in RUBRIC_KEYS}, "notes": f"第 {i + 1} 版", "fixes": []} for i in range(count)],
+                "decision": "recommend",
+                "scores": [{"candidate": i, "dims": {k: (7 if i == 1 else 5) for k in RUBRIC_KEYS}, "status": "pass", "notes": f"第 {i + 1} 版", "comprehension_evidence": "SH001观察河床，后续人物被盘问；正常省略不妨碍理解", "blocking_issues": [], "fixes": []} for i in range(count)],
                 "pick": 1 if count > 1 else 0,
                 "why": "主观派守住了揭示顺序",
                 "merge": "",
@@ -614,6 +636,55 @@ def fake_design_chat(calls: list[dict]):
 
 
 class DesignRun(unittest.TestCase):
+    def test_rejected_scene_keeps_candidates_and_does_not_promote_table(self) -> None:
+        from director.pipeline import read_artifact
+        from director.station_agents import design_candidates, run_design_table
+
+        calls: list[dict] = []
+        base_chat = fake_design_chat(calls)
+
+        def chat(system, ctx, temperature=0.3):
+            payload = base_chat(system, ctx, temperature)
+            if ctx.get("call") == "critic":
+                payload.update(decision="reject_all", pick=None, why="全部候选都未能排除隐藏旧道具的解释")
+                for entry in payload["scores"]:
+                    entry.update(status="needs_rework", blocking_issues=["关键显现不清"])
+            return payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = make_prod(tmp)
+            with mock.patch("director.station_agents.text_configured", return_value=True), mock.patch("director.station_agents._design_chat", side_effect=chat):
+                with self.assertRaisesRegex(PermissionError, "评审要求重做"):
+                    run_design_table(prod, target_model="seedance_2_0", resume=False, candidates=3)
+            saved = design_candidates(prod)
+            self.assertEqual(saved["status"], "needs_rework")
+            self.assertEqual(len(saved["scenes"][0]["candidates"]), 3)
+            self.assertIsNone(saved["scenes"][0]["verdict"]["pick"])
+            self.assertEqual(read_artifact(prod, "shot_list.json"), {})
+            self.assertTrue((prod / "03-storyboard/shot-candidates.draft.md").exists())
+
+    def test_unavailable_critic_drafts_recommendation_without_pass(self) -> None:
+        from director.pipeline import read_artifact
+        from director.station_agents import run_design_table
+
+        calls: list[dict] = []
+        base_chat = fake_design_chat(calls)
+
+        def chat(system, ctx, temperature=0.3):
+            if ctx.get("call") == "critic":
+                return {"error": "unavailable"}
+            return base_chat(system, ctx, temperature)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = make_prod(tmp)
+            with mock.patch("director.station_agents.text_configured", return_value=True), mock.patch("director.station_agents._design_chat", side_effect=chat):
+                run_design_table(prod, target_model="seedance_2_0", resume=False, candidates=1)
+            written = read_artifact(prod, "shot_list.json")
+            self.assertEqual(written["visible_change_without_dialogue"], "not_reviewed")
+            self.assertEqual(written["narrative_review"]["status"], "not_reviewed")
+            self.assertNotIn("design_steps_done", written)
+            self.assertTrue(all(v["decision"] == "not_reviewed" for v in written["critic_reviews"].values()))
+
     def test_design_table_end_to_end_with_candidates_and_pick(self) -> None:
         from director.pipeline import read_artifact
         from director.station_agents import design_candidates, pick_candidate, run_design_table
@@ -708,7 +779,8 @@ class DesignRun(unittest.TestCase):
         def chat(system: str, ctx: dict, temperature: float = 0.2) -> dict:
             calls.append(ctx)
             return {
-                "scores": [{"candidate": 0, "dims": {k: 6 for k in RUBRIC_KEYS}, "notes": "连戏", "fixes": []}],
+                "decision": "recommend",
+                "scores": [{"candidate": 0, "dims": {k: 6 for k in RUBRIC_KEYS}, "status": "pass", "notes": "连戏", "comprehension_evidence": "SH001先观察河床，SH002延续探查", "blocking_issues": [], "fixes": []}],
                 "pick": 0,
                 "why": "单版也过连戏",
                 "merge": "",

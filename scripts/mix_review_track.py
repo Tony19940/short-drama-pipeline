@@ -105,6 +105,9 @@ def main() -> None:
     args = p.parse_args()
 
     prod = Path(args.prod).resolve()
+    from director.revisions import load_registry
+    if load_registry(prod) is not None:
+        raise SystemExit("registered revision：请用 assemble_episode.py 按 EDL 采用实际对白音轨，旧整段串接审剧情轨已停用")
     want = args.only or []
     selected = []
     shot_dir = "05-shots"

@@ -14,6 +14,8 @@ from typing import Any, Optional
 import requests
 
 from .paths import media_url
+from .paths import safe_under
+from .context import context_for
 from .pipeline import read_artifact, write_artifact
 
 # query: one string, or fallbacks tried in order. Optional TAG_FREESOUND_IDS pins a known file.
@@ -123,10 +125,16 @@ def episode_slug(episode: int) -> str:
 
 
 def sfx_dir(prod: Path) -> Path:
+    ctx = context_for(prod)
+    if ctx.mode == "registered":
+        return prod / "07-dubbing" / "sfx" / str(ctx.episode_token)
     return prod / "07-dubbing" / "sfx"
 
 
 def shot_list_path(prod: Path, episode: int) -> Path:
+    ctx = context_for(prod, episode)
+    if ctx.mode == "registered":
+        return ctx.artifact_path("shot_list.json")
     if int(episode) != 1:
         alt = prod / ".pipeline" / f"shot_list.ep{int(episode):02d}.json"
         if alt.exists():
@@ -135,6 +143,9 @@ def shot_list_path(prod: Path, episode: int) -> Path:
 
 
 def load_shot_table(prod: Path, episode: int = 1) -> dict:
+    ctx = context_for(prod, episode)
+    if ctx.mode == "registered":
+        return ctx.read_artifact("shot_list.json", required=True)
     path = shot_list_path(prod, episode)
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -200,8 +211,10 @@ def shot_timeline(
     shot_ids: list[str],
     *,
     fallback: Optional[dict[str, float]] = None,
+    episode: Any = None,
 ) -> tuple[list[dict], list[str]]:
-    shots_dir = prod / "05-shots"
+    ctx = context_for(prod, episode)
+    shots_dir = prod / ctx.shot_dir() if ctx.mode == "registered" else prod / "05-shots"
     items: list[dict] = []
     missing: list[str] = []
     t = 0.0
@@ -594,6 +607,7 @@ def _public_events(prod: Path, events: list[dict]) -> list[dict]:
 
 
 def build_plan(prod: Path, episode: int = 1, *, allow_table_duration: bool = False) -> dict:
+    _require_legacy_mix(prod, episode)
     table = load_shot_table(prod, episode)
     table_shots = [s for s in (table.get("shots") or []) if s.get("shot_id")]
     ids = [s["shot_id"] for s in table_shots]
@@ -635,6 +649,11 @@ def build_plan(prod: Path, episode: int = 1, *, allow_table_duration: bool = Fal
     }
 
 
+def _require_legacy_mix(prod: Path, episode: Any = None) -> None:
+    if context_for(prod, episode).mode == "registered":
+        raise PermissionError("登记版本不能按原片时长串接旧音效床；请使用当前 EDL 的剪辑时间轴与新版段落声画审核")
+
+
 def write_audio_fields(prod: Path, plan: dict) -> dict:
     audio = dict(read_artifact(prod, "audio.json") or {})
     audio["episode_no"] = plan["episode"]
@@ -650,6 +669,9 @@ def write_audio_fields(prod: Path, plan: dict) -> dict:
 
 
 def snapshot_sfx(prod: Path, episode: int = 1) -> dict:
+    ctx = context_for(prod, episode)
+    if ctx.mode == "registered":
+        return _registered_snapshot(ctx)
     slug = episode_slug(episode)
     rel_audio = f"07-dubbing/sfx/{slug}-sfx.m4a"
     rel_cues = f"07-dubbing/sfx/{slug}-sfx.cues.json"
@@ -684,6 +706,35 @@ def snapshot_sfx(prod: Path, episode: int = 1) -> dict:
     }
 
 
+def _registered_snapshot(ctx) -> dict:
+    prod = ctx.prod
+    audio = ctx.read_artifact("audio.json")
+    root = f"07-dubbing/sfx/{ctx.episode_token}"
+    rel_audio = str(audio.get("sfx_file") or f"{root}/sfx.m4a")
+    rel_cues = str(audio.get("sfx_cues") or f"{root}/sfx.cues.json")
+    rel_preview = str(audio.get("sfx_preview") or f"06-export/{ctx.episode_token}/sfx-preview.mp4")
+    audio_path, cues_path, preview_path = (safe_under(prod, p) for p in (rel_audio, rel_cues, rel_preview))
+    table = ctx.read_artifact("shot_list.json", required=True)
+    shots = [s for s in table.get("shots") or [] if s.get("shot_id")]
+    missing = [s["shot_id"] for s in shots if not (prod / ctx.shot_dir() / f"{s['shot_id']}.mp4").is_file()]
+    cues = {}
+    if cues_path.exists():
+        try:
+            cues = json.loads(cues_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cues = {}
+    return {
+        "episode": ctx.episode_no, "context": ctx.to_dict(), "source": ctx.source_report(),
+        "file": rel_audio, "exists": audio_path.is_file(), "url": media_url(prod, rel_audio),
+        "preview": rel_preview, "preview_exists": preview_path.is_file(), "preview_url": media_url(prod, rel_preview),
+        "duration_sec": cues.get("duration_sec"), "event_count": len(cues.get("events") or []),
+        "has_overrides": (prod / root / "overrides.json").is_file(), "missing_clips": missing,
+        "key_sfx": [{"shot_id": s["shot_id"], "key_sfx": s.get("key_sfx")} for s in shots if s.get("key_sfx")],
+        "clip_count": len(shots) - len(missing), "shot_count": len(shots),
+        "note": "登记版本只显示当前版本音效资产；混音需遵循当前 EDL，旧原片串接入口已停用。",
+    }
+
+
 def run_mix(
     prod: Path,
     *,
@@ -694,6 +745,7 @@ def run_mix(
 ) -> dict:
     if not prod.is_dir():
         raise ValueError(f"没有这个项目：{prod}")
+    _require_legacy_mix(prod, episode)
     plan = build_plan(prod, episode, allow_table_duration=dry_run)
     dest = prod / plan["audio"]
     if plan["missing_clips"] and not dry_run:

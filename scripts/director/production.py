@@ -278,6 +278,12 @@ def render_blocking(prod: Path) -> dict:
 
 
 def coverage(prod: Path) -> dict:
+    from .context import context_for
+
+    ctx = context_for(prod)
+    if ctx.mode == "registered":
+        return {"beats": read_text(prod, "03-storyboard/beats.md"), "coverage": read_text(prod, "03-storyboard/coverage.md"),
+                "shot_list": "", "shots": ctx.read_artifact("shot_list.json", required=True), "source": ctx.source_report()}
     return {
         "beats": read_text(prod, "03-storyboard/beats.md"),
         "coverage": read_text(prod, "03-storyboard/coverage.md"),
@@ -299,6 +305,7 @@ def save_coverage(prod: Path, field: str, content: str) -> dict:
 
 
 def save_shots(prod: Path, data: dict) -> dict:
+    _require_legacy_shot_editor(prod)
     if "shots" not in data:
         raise ValueError("shots.json 必须有 shots")
     path = safe_under(prod, "03-storyboard/shots.json")
@@ -317,6 +324,7 @@ def save_shots(prod: Path, data: dict) -> dict:
 
 
 def save_shot_draft(prod: Path, data: dict) -> dict:
+    _require_legacy_shot_editor(prod)
     if "shots" not in data:
         raise ValueError("shots.draft.json 必须有 shots")
     save_json(prod, "03-storyboard/shots.draft.json", data)
@@ -324,6 +332,7 @@ def save_shot_draft(prod: Path, data: dict) -> dict:
 
 
 def load_shot_draft(prod: Path) -> dict:
+    _require_legacy_shot_editor(prod)
     data = load_json(prod, "03-storyboard/shots.draft.json", {"shots": []})
     board = _decorate_shots(prod, data)
     origin = str(data.get("origin") or "")
@@ -346,6 +355,7 @@ def load_shot_draft(prod: Path) -> dict:
 
 
 def accept_shot_draft(prod: Path) -> dict:
+    _require_legacy_shot_editor(prod)
     draft = load_json(prod, "03-storyboard/shots.draft.json", {"shots": []})
     if not draft.get("shots"):
         raise FileNotFoundError("没有 shots.draft.json")
@@ -368,6 +378,11 @@ def accept_shot_draft(prod: Path) -> dict:
 
 
 def _decorate_shots(prod: Path, data: dict) -> dict:
+    from .context import context_for
+
+    ctx = context_for(prod)
+    if ctx.mode == "registered":
+        return _decorate_revision_shots(ctx, data)
     shots = data.get("shots") or []
     files = inspect_files(prod)
     board = []
@@ -414,11 +429,51 @@ def _decorate_shots(prod: Path, data: dict) -> dict:
 
 
 def shot_board(prod: Path) -> dict:
+    from .context import context_for
+
+    ctx = context_for(prod)
+    if ctx.mode == "registered":
+        data = ctx.read_artifact("shot_list.json", required=True)
+        board = _decorate_revision_shots(ctx, data)
+        board["draft_kind"] = "official"
+        board["draft_label"] = "登记版本分镜表"
+        return board
     data = load_json(prod, "03-storyboard/shots.json", {"shots": []})
     board = _decorate_shots(prod, data)
     board["draft_kind"] = "official"
     board["draft_label"] = "正式合同"
     return board
+
+
+def _require_legacy_shot_editor(prod: Path) -> None:
+    from .context import context_for
+
+    if context_for(prod).mode == "registered":
+        raise PermissionError("登记版本不能写旧 shots.json 草稿；请编辑绑定分镜表并完成新版创作合同审核")
+
+
+def _decorate_revision_shots(ctx, data: dict) -> dict:
+    from .shot_repo import list_shots
+
+    prod = ctx.prod
+    board = []
+    for shot in list_shots(ctx):
+        sid = shot["id"]
+        frame_rel = shot.get("frame") or f"{ctx.frame_dir()}/{sid}.jpg"
+        last_rel = f"{ctx.frame_dir()}/{sid}-last.jpg"
+        video_rel = f"{ctx.shot_dir()}/{sid}.mp4"
+        board.append({
+            **shot, "parent": {"kind": "registered_frame", "path": frame_rel, "exists": (prod / frame_rel).is_file()},
+            "frame_exists": (prod / frame_rel).is_file(), "frame_url": media_url(prod, frame_rel),
+            "source_frame_url": None, "video_exists": (prod / video_rel).is_file(), "video_url": media_url(prod, video_rel),
+            "last_exists": (prod / last_rel).is_file(), "last_url": media_url(prod, last_rel),
+            "i2v": {"kind": "designed_frame", "path": frame_rel, "exists": (prod / frame_rel).is_file(), "reason": "登记版本首帧；提交以已确认请求快照为准"},
+            "refs": [], "missing_sheets": [], "compiled_prompt": "", "compiled_h3": {}, "video_mode": "registered",
+            "end": {"kind": "designed_end", "path": last_rel, "exists": (prod / last_rel).is_file()},
+        })
+    return {"episode": ctx.episode_token, "context": ctx.to_dict(), "source": ctx.source_report(),
+            "kind": data.get("kind"), "aspect": data.get("aspect"), "origin": data.get("origin"),
+            "shots": board, "files": inspect_files(prod, ctx.episode_token), "jobs": load_jobs(prod)}
 
 
 def accept_draft(prod: Path, draft_rel: str, dest_rel: str) -> dict:

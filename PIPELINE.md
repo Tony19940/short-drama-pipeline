@@ -1,5 +1,7 @@
 # 流水线规则（模仿小云雀）
 
+2026-10-06：登记版本的正式路径以 [流水线升级协议](docs/PIPELINE-UPGRADE-2026-10-06.md) 为准，统一版本、实际媒体审核、关键事件保护和段落理解审核；下文无版本绑定的旧路径仅用于 legacy 兼容。
+
 对照：小说 → 编剧 → 资产 → 分镜设计 → 说明书(5.1) → 生成包(5.2) → 关键帧 → 视频 → 声音 → 剪辑。交接 JSON 在 `.pipeline/`。  
 细则 `XIAOYUNQUE.md`。分镜不是海报表。导演台 8 个 Agent 对应这些关；文件真相仍在 `productions/`。
 
@@ -53,7 +55,7 @@
 | C | `03-storyboard/` | `coverage.md` `beats.md` `shots.json`。`check_prod.py` 必须过 |
 | D/E | `04-frames/` `05-shots/` | 设计首帧 FL2VA；同机位续才吃 `{from}-last.jpg`；设计尾帧走 `end_frame`；Ref2VA 未安装就停 |
 | E+ | `07-dubbing/sfx/` `06-export/preview-*-vo.mp4` `07-dubbing/` | 先 `mix_episode_sfx.py` 按 `key_sfx` 混音效床，再 `mix_review_track.py` + 声音合同。中文对白是 Seedance 原声（`speech_mode=seedance_native`），声音岗只清理对齐，原声缺 / H3 镜才重录。无声切不能当审剧情 |
-| F | `06-export/ep01.mp4` `08-qc/` | 审片报告。脚本判过关；无视觉模型时 `inconclusive`。高棉语配音 / 字幕在这一关（`DUBBING.md`） |
+| F | 当前版本 EDL 的 `final_file`、`08-qc/` | 审片报告与实际声画段落审核。机械检查只证明结构/证据一致性；理解需人看片，无审阅时 `inconclusive`。高棉语配音 / 字幕在这一关（`DUBBING.md`） |
 
 未通过不进入下一关。Agent 只写 `*.draft.*`，人点「接受并锁定」才进正式文件。Gate A 讨论期间不生图。  
 硬规则 **R1–R14** 见 `QUALITY.md`。文化词典见 `CULTURE.md`。出片路由见 `VIDEO.md`。  
@@ -86,7 +88,8 @@ python3 scripts/mix_episode_sfx.py --prod productions/<slug> --dry-run
 静帧 animatic 03-storyboard/animatic/ep01.animatic.mp4（只给审）
 场次舞台      03-storyboard/sets.json（marks[] + cameras[]）
 首帧          04-frames/SH001.jpg
-上一镜末帧    04-frames/SH001-last.jpg
+设计尾帧      04-frames/SH001-end.jpg（旧04-frames/*-last为设计尾兼容）
+视频实际尾    05-shots/SH001-last.jpg（源视频+图像hash及身份核验）
 单镜视频      05-shots/SH001.mp4
 审剧情        06-export/preview-30s-vo.mp4
 音效床        07-dubbing/sfx/ep01-sfx.m4a
@@ -117,7 +120,7 @@ python3 scripts/mix_episode_sfx.py --prod productions/<slug> --dry-run
 
 1. 先有你审过的首帧，再生成该镜。
 2. 提示词：一个主体 + 一个运动。`move` 与提示词里的运镜必须一致。
-3. **主路径永远是锁定首帧 FL2VA。** `cut=continue` 且同机位、人物有交集、存在 `{from}-last.jpg` 时，才把上一镜真末帧当这一镜的第 0 秒。换机位或切人仍用本镜设计首帧。
+3. **主路径永远是锁定首帧 FL2VA。** `cut=continue` 且同机位、人物有交集、存在源视频、图像双 hash 核实且身份通过的 `{from}-last.jpg` 时，才把上一镜真末帧当这一镜的第 0 秒。换机位或切人仍用本镜设计首帧。
 4. **设计尾帧可选。** `end_frame` 指向一张人审过的静帧（`04-frames/SHxxx-end.jpg`）。生成后抽出的 `{id}-last.jpg` 只给下一镜同场续用，不能回填成这一镜的尾帧。
 5. **防换脸靠参考外挂。** `sheet.jpg` / `face.jpg` 走 Ref2VA 节点，挂在首帧外面，采样仍走 FL2VA。不许用参考图替代第 0 秒。
 6. ffmpeg concat 同分辨率同帧率。

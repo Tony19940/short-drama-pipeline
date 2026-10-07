@@ -1,0 +1,64 @@
+{
+  "date": "2026-10-06",
+  "scope": "pipeline code and local regression; no media approval",
+  "regression": {
+    "command": "python3 -m unittest discover -s scripts/tests -p 'test_*.py'",
+    "tests": 457,
+    "failures": 0,
+    "errors": 0,
+    "elapsed_sec": 20.904,
+    "network": "socket/DNS disabled; credentials removed in child test environment"
+  },
+  "compilation": "pass",
+  "git_diff_check": "pass",
+  "production_source": {
+    "production_id": "011-one-riel",
+    "episode_id": "ep01",
+    "episode_no": 1,
+    "revision_id": "rhythm-v2",
+    "binding_mode": "registered",
+    "artifact_token": "ep01-rhythm-v2",
+    "frames_dir": "04-frames/ep01-rhythm-v2",
+    "shots_dir": "05-shots/ep01-rhythm-v2/official",
+    "cut_file": ".pipeline/cut.ep01-rhythm-v2.json",
+    "artifacts": {
+      "shot_list.json": ".pipeline/shot_list.ep01-rhythm-v2.json",
+      "clips.json": ".pipeline/clips.ep01-rhythm-v2.json",
+      "events.json": ".pipeline/events.ep01-rhythm-v2.json",
+      "event_evidence.json": ".pipeline/event_evidence.ep01-rhythm-v2.json",
+      "sequence_reviews.json": ".pipeline/sequence_reviews.ep01-rhythm-v2.json",
+      "cut.json": ".pipeline/cut.ep01-rhythm-v2.json"
+    },
+    "source_file": ".pipeline/shot_list.ep01-rhythm-v2.json",
+    "source_sha256": "1064022acd041d6a5a922ccd177e86d29aea99ac35314ad48d8e655a3eadf107",
+    "shot_count": 53
+  },
+  "production_narrative": {
+    "status": "fail",
+    "errors": [
+      "first-coin-flash required observed event is omitted or too short in this cut"
+    ],
+    "pending": [
+      "first-payment actual event has not been observed and reviewed",
+      "first-money-onset actual event has not been observed and reviewed",
+      "first-dollar-reveal actual event has not been observed and reviewed",
+      "return-hypothesis actual event has not been observed and reviewed",
+      "second-payment actual event has not been observed and reviewed",
+      "second-coin-flash actual event has not been observed and reviewed",
+      "second-new-dollars actual event has not been observed and reviewed",
+      "first-return: no completed review",
+      "verify-return-rule: no completed review"
+    ]
+  },
+  "production_check": "blocked: missing .pipeline/writer.ep01-rhythm-v2.json; does not fall back to legacy",
+  "legacy_assemble_entry": "registered revision rejected before writes/FFmpeg",
+  "generated_cloud_media": 0,
+  "human_media_approvals_written": 0,
+  "preserved": [
+    "original 53-shot table",
+    "existing raw videos",
+    "previous roughcut and smoothcut",
+    "legacy asset/frame files"
+  ],
+  "implemented_boundary": "registered revisions with explicit human review; sequential revision locks; legacy full-source SFX mix disabled"
+}

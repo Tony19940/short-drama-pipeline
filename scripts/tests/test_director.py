@@ -68,11 +68,21 @@ class DirectorTests(unittest.TestCase):
             source = i2v_source(prod, sh006, shots)
             self.assertEqual(source["kind"], "designed_frame")
             self.assertTrue(source["path"].endswith("SH006.jpg"))
-            # Same setup + overlap still eats the previous last frame.
+            # Same setup + overlap needs a verified extracted video end.
             data = json.loads((prod / "03-storyboard" / "shots.json").read_text())
             data["shots"] = shots
             prev = next(s for s in data["shots"] if s["id"] == "SH005")
             sh006["setup"] = prev["setup"]
+            self.assertEqual(i2v_source(prod, sh006, data["shots"])["kind"], "designed_frame")
+            from place_codex_frame import record_generated_end
+
+            video = prod / "05-shots/SH005.mp4"
+            video.parent.mkdir(parents=True, exist_ok=True)
+            video.write_bytes(b"fixture-video")
+            actual = prod / "05-shots/SH005-last.jpg"
+            actual.write_bytes(last.read_bytes())
+            record_generated_end(prod, "SH005", frame_rel="05-shots/SH005-last.jpg",
+                                 video_rel="05-shots/SH005.mp4", extraction_method="fixture-extractor", identity_gate="pass")
             source = i2v_source(prod, sh006, data["shots"])
             self.assertEqual(source["kind"], "last_frame")
             self.assertTrue(source["path"].endswith("SH005-last.jpg"))
@@ -406,8 +416,10 @@ class DirectorTests(unittest.TestCase):
         }
         last_as_end = dict(shot, end_frame="04-frames/SH099-last.jpg")
         i2v = compile_video_prompt(last_as_end)
-        self.assertIn("at 0.00 seconds", i2v)
-        self.assertNotIn("Picture 2", i2v)
+        self.assertIn("at 0.00 seconds", i2v.lower())
+        # Prompt compilation follows an explicit end_frame declaration. The media
+        # gate separately refuses unknown/generated ends before any paid request.
+        self.assertIn("Picture 2", i2v)
         self.assertNotIn(shot["line"], i2v)
 
         flf = compile_h3_fields(shot, refs=["02-assets/characters/sophea/sheet.jpg"])
@@ -1313,7 +1325,7 @@ class DirectorTests(unittest.TestCase):
         self.assertIn("intention", contract["cues"][0])
         self.assertTrue(contract["cues"][0]["intention"])
 
-    def test_i2v_source_uses_shot_last_frame_field(self) -> None:
+    def test_i2v_source_rejects_unverified_shot_last_frame_field(self) -> None:
         shots = json.loads((PROD / "03-storyboard" / "shots.json").read_text())["shots"]
         sh006 = next(s for s in shots if s["id"] == "SH006")
         prev = next(s for s in shots if s["id"] == "SH005")
@@ -1327,8 +1339,8 @@ class DirectorTests(unittest.TestCase):
             prev["last_frame"] = "04-frames-b/SH005-last.jpg"
             sh006["setup"] = prev["setup"]
             source = i2v_source(prod, sh006, shots)
-            self.assertEqual(source["kind"], "last_frame")
-            self.assertTrue(source["path"].endswith("04-frames-b/SH005-last.jpg"))
+            self.assertEqual(source["kind"], "designed_frame")
+            self.assertTrue(source["path"].endswith("SH006.jpg"))
 
     def test_render_shots_accepts_storyboard_and_video_dir(self) -> None:
         from render_shots import last_frame_path, load_shots
@@ -1526,21 +1538,22 @@ class DirectorTests(unittest.TestCase):
 
 
     def test_grok_subscription_backend_detected(self) -> None:
-        from director.grok_text import text_backend, text_configured, chat_json, parse_json_content
+        from unittest import mock
+        from director.grok_text import text_backend, text_configured, parse_json_content
 
-        os.environ.pop("XAI_API_KEY", None)
-        os.environ.pop("DIRECTOR_DISABLE_GROK_SUBSCRIPTION", None)
-        self.assertTrue(text_configured())
-        self.assertEqual(text_backend(), "grok-subscription")
-        self.assertEqual(parse_json_content('{"ok": true}'), {"ok": True})
-        premature = '{"shots":[{"shot_id":"SH001","duration_sec":4}] ,{"shot_id":"SH002","duration_sec":5}]}'
-        recovered = parse_json_content(premature)
-        self.assertEqual([s["shot_id"] for s in recovered["shots"]], ["SH001", "SH002"])
-        os.environ["DIRECTOR_DISABLE_GROK_SUBSCRIPTION"] = "1"
-        try:
+        with mock.patch.dict(os.environ, {"XAI_API_KEY": "", "DIRECTOR_DISABLE_GROK_SUBSCRIPTION": ""}), mock.patch(
+            "director.grok_text.requests.get", return_value=mock.Mock(status_code=200),
+        ) as health:
+            self.assertTrue(text_configured())
+            self.assertEqual(text_backend(), "grok-subscription")
+            self.assertEqual(parse_json_content('{"ok": true}'), {"ok": True})
+            premature = '{"shots":[{"shot_id":"SH001","duration_sec":4}] ,{"shot_id":"SH002","duration_sec":5}]}'
+            recovered = parse_json_content(premature)
+            self.assertEqual([s["shot_id"] for s in recovered["shots"]], ["SH001", "SH002"])
+            calls = health.call_count
+            os.environ["DIRECTOR_DISABLE_GROK_SUBSCRIPTION"] = "1"
             self.assertFalse(text_configured())
-        finally:
-            os.environ.pop("DIRECTOR_DISABLE_GROK_SUBSCRIPTION", None)
+            self.assertEqual(health.call_count, calls)
 
 
 

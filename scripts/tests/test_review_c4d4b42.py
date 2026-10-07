@@ -15,6 +15,8 @@ sys.path.insert(0, str(SCRIPTS))
 from director.animatic import (  # noqa: E402
     animatic_approval_path,
     animatic_approval_status,
+    build_animatic,
+    ffmpeg_available,
     plan_animatic,
     write_animatic_approval,
 )
@@ -175,6 +177,8 @@ class BeatRefsAndRehearsal(unittest.TestCase):
     def test_beat_text_change_stales_approval_and_label_path_works(self) -> None:
         from PIL import Image
 
+        if not ffmpeg_available():
+            self.skipTest("actual animatic fixture needs ffmpeg")
         with tempfile.TemporaryDirectory() as raw:
             prod = Path(raw)
             (prod / "04-frames").mkdir(parents=True)
@@ -192,7 +196,8 @@ class BeatRefsAndRehearsal(unittest.TestCase):
                     }],
                 },
             )
-            write_animatic_approval(prod, 1, reviewer="tonyteacher")
+            build_animatic(prod, 1)
+            write_animatic_approval(prod, 1, reviewer="tonyteacher", notes="Reviewed the key handover beat.")
             self.assertTrue(animatic_approval_status(prod, 1)["ok"])
             write_artifact(
                 prod,
@@ -220,7 +225,8 @@ class BeatRefsAndRehearsal(unittest.TestCase):
             )
             (prod / "04-frames" / "ep01-v2").mkdir(parents=True)
             Image.new("RGB", (40, 20)).save(prod / "04-frames" / "ep01-v2" / "SH001.jpg")
-            body = write_animatic_approval(prod, "ep01-v2", reviewer="tonyteacher")
+            build_animatic(prod, "ep01-v2")
+            body = write_animatic_approval(prod, "ep01-v2", reviewer="tonyteacher", notes="Reviewed the labeled revision.")
             self.assertEqual(body["episode"], "ep01-v2")
             self.assertTrue(animatic_approval_status(prod, "ep01-v2")["ok"])
 

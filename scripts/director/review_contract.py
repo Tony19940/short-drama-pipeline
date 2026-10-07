@@ -14,11 +14,20 @@ from .production import load_json
 from .store import _write
 
 
+def _require_legacy_review(prod: Path) -> None:
+    from .context import context_for
+
+    if context_for(prod).mode == "registered":
+        raise PermissionError("登记版本不能使用旧 review-contract；请使用新版段落声画审核及 Gate F，旧预览和旧合同不作为本版证据")
+
+
 def contract_path(prod: Path) -> Path:
+    _require_legacy_review(prod)
     return director_dir(prod, create=True) / "review-contract.json"
 
 
 def load_contract(prod: Path) -> dict:
+    _require_legacy_review(prod)
     path = director_dir(prod) / "review-contract.json"
     if not path.exists():
         return {}
@@ -26,10 +35,12 @@ def load_contract(prod: Path) -> dict:
 
 
 def _shots(prod: Path) -> list[dict]:
+    _require_legacy_review(prod)
     return list(load_json(prod, "03-storyboard/shots.json", {"shots": []}).get("shots") or [])
 
 
 def preview_path(prod: Path, shot_ids: Optional[list[str]] = None) -> Path:
+    _require_legacy_review(prod)
     shots = _shots(prod)
     if shot_ids and len(shot_ids) != len(shots):
         return prod / "06-export" / "preview-partial-vo.mp4"
@@ -61,6 +72,7 @@ def has_audio_stream(path: Path) -> bool:
 
 
 def freeze_review_contract(prod: Path, shot_ids: Optional[list[str]] = None) -> dict:
+    _require_legacy_review(prod)
     shots = _shots(prod)
     want = set(shot_ids or [])
     selected = [shot for shot in shots if not want or shot["id"] in want]
@@ -94,6 +106,7 @@ def freeze_review_contract(prod: Path, shot_ids: Optional[list[str]] = None) -> 
 
 
 def evaluate_review_contract(prod: Path, preview: Optional[Path] = None) -> dict:
+    _require_legacy_review(prod)
     contract = load_contract(prod) or freeze_review_contract(prod)
     dest = preview or (prod / contract.get("preview", "06-export/preview-vo.mp4"))
     failures: list[str] = []

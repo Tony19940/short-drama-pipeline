@@ -211,7 +211,9 @@ def shot_seconds(shot: dict) -> float:
 
 def designed_end_rel(shot: dict) -> str:
     rel = str(shot.get("end_frame") or "").strip()
-    if rel and not Path(rel).name.lower().endswith("-last.jpg"):
+    # Pure prompt compilation does not infer media provenance from filenames.
+    # The runtime designed_end_frame gate validates the declared path and role.
+    if rel:
         return rel
     return ""
 
@@ -1208,7 +1210,7 @@ def video_mode(shot: dict, source_kind: str, refs: Optional[list[str]] = None) -
     the GPU adapter still hangs refs on FL2VA/FLF either way.
     """
     rel = str(shot.get("end_frame") or "").strip()
-    if rel and not Path(rel).name.lower().endswith("-last.jpg"):
+    if rel:
         return "flf"
     # Dedicated Ref2VA UNet is optional. Until it is installed, keep the
     # first-frame FL2VA path instead of hanging refs onto ReferenceToVideo.

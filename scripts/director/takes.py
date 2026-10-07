@@ -168,7 +168,10 @@ def get_take(prod: Path, take_id: str) -> Optional[Take]:
 
 
 def takes_for_shot(prod: Path, shot_id: str, episode: Any = 1) -> list[Take]:
-    key = episode_key(episode)
+    from .context import context_for
+
+    ctx = context_for(prod, episode)
+    key = episode_key(ctx.episode_token)
     rows = []
     for item in load_takes(prod).get("takes") or []:
         if item.get("shot_id") != shot_id:
@@ -191,12 +194,38 @@ def find_resume_take(prod: Path, *, shot_id: str, request_hash: str, task_id: st
 
 
 def selected_take_id(prod: Path, shot_id: str, episode: Any = 1) -> str:
+    from .context import context_for
+
+    ctx = context_for(prod, episode)
     data = load_takes(prod)
-    return str((data.get("selected") or {}).get(selected_key(shot_id, episode)) or "")
+    return str((data.get("selected") or {}).get(selected_key(shot_id, ctx.episode_token)) or "")
 
 
 def selected_take(prod: Path, shot_id: str, episode: Any = 1) -> Optional[Take]:
-    return get_take(prod, selected_take_id(prod, shot_id, episode))
+    from .context import context_for
+
+    ctx = context_for(prod, episode)
+    tid = selected_take_id(prod, shot_id, ctx.episode_token)
+    take = get_take(prod, tid)
+    if tid and take is None:
+        raise PermissionError(f"selected take missing: {tid}")
+    if take is not None:
+        if take.shot_id != shot_id:
+            raise PermissionError(f"selected take {tid} belongs to {take.shot_id}, not {shot_id}")
+        _require_take_context(take, ctx)
+    return take
+
+
+def _require_take_context(take: Take, ctx) -> None:
+    expected = episode_key(ctx.episode_token)
+    matches = bool(take.episode_id) and episode_key(take.episode_id) == expected
+    if ctx.mode == "registered":
+        if not matches:
+            raise PermissionError(f"take {take.take_id} belongs to {take.episode_id or 'unknown'}, not {expected}")
+        if take.revision_id and take.revision_id != ctx.revision_id:
+            raise PermissionError(f"take {take.take_id} belongs to revision {take.revision_id}, not {ctx.revision_id}")
+    elif take.episode_id and not matches:
+        raise PermissionError(f"take {take.take_id} belongs to episode {take.episode_id}, not {expected}")
 
 
 def take_media_rel(take_id: str) -> str:
@@ -219,6 +248,13 @@ def take_media_file(prod: Path, take: Take | dict) -> Path:
     row = take if isinstance(take, dict) else take.to_dict()
     rel = str(row.get("dest") or "")
     path = Path(rel) if Path(rel).is_absolute() else Path(prod) / rel
+    from .context import context_for
+
+    if context_for(prod, row.get("episode_id") or None).mode == "registered":
+        if Path(prod).resolve() not in path.resolve().parents:
+            raise PermissionError(f"take media outside production: {rel}")
+        if not row.get("media_hash"):
+            raise PermissionError(f"registered take has no media hash: {rel}")
     if not path.is_file():
         raise PermissionError(f"take media missing: {rel}")
     digest = str(row.get("media_hash") or "")
@@ -229,14 +265,14 @@ def take_media_file(prod: Path, take: Take | dict) -> Path:
 
 def resolve_shot_media(prod: Path, shot_id: str, episode: Any = 1) -> Path:
     """Default media only. Never borrow another episode's same shot id."""
-    take = selected_take(prod, shot_id, episode)
-    if take:
-        if take.episode_id and episode_key(take.episode_id) != episode_key(episode):
-            raise PermissionError(f"{shot_id} selected take belongs to {take.episode_id}, not {episode_key(episode)}")
-        return take_media_file(prod, take)
-    from .pipeline import episode_shot_dir
+    from .context import context_for
 
-    official = Path(prod) / episode_shot_dir(episode) / f"{shot_id}.mp4"
+    ctx = context_for(prod, episode)
+    take = selected_take(prod, shot_id, ctx.episode_token)
+    if take:
+        _require_take_context(take, ctx)
+        return take_media_file(prod, take)
+    official = Path(prod) / ctx.shot_dir() / f"{shot_id}.mp4"
     if official.is_file():
         return official
     raise PermissionError(f"缺单镜视频：{shot_id}")
@@ -245,10 +281,13 @@ def resolve_shot_media(prod: Path, shot_id: str, episode: Any = 1) -> Path:
 def _set_selected(prod: Path, shot_id: str, take_id: str, episode: Any = 1) -> None:
     from .store import exclusive_state_lock
 
+    from .context import context_for
+
+    ctx = context_for(prod, episode)
     with exclusive_state_lock(prod, "takes"):
         data = load_takes(prod)
         selected = dict(data.get("selected") or {})
-        selected[selected_key(shot_id, episode)] = take_id
+        selected[selected_key(shot_id, ctx.episode_token)] = take_id
         data["selected"] = selected
         _write_store(prod, data)
 
@@ -258,12 +297,12 @@ def select_take(prod: Path, shot_id: str, take_id: str, episode: Any = 1) -> Tak
     take = get_take(prod, take_id)
     if take is None or take.shot_id != shot_id:
         raise PermissionError(f"take {take_id} is not a candidate for {shot_id}")
-    if take.episode_id and episode_key(take.episode_id) != episode_key(episode):
-        raise PermissionError(f"take {take_id} belongs to episode {take.episode_id}, not {episode_key(episode)}")
-    src = take_media_file(prod, take)
-    from .pipeline import episode_shot_dir
+    from .context import context_for
 
-    official = Path(prod) / episode_shot_dir(episode) / f"{shot_id}.mp4"
+    ctx = context_for(prod, episode)
+    _require_take_context(take, ctx)
+    src = take_media_file(prod, take)
+    official = Path(prod) / ctx.shot_dir() / f"{shot_id}.mp4"
     official.parent.mkdir(parents=True, exist_ok=True)
     if official.resolve() != src.resolve():
         tmp = official.with_suffix(".mp4.part")
@@ -287,10 +326,11 @@ def replace_segment_take(
     take = get_take(prod, take_id)
     if take is None:
         raise PermissionError(f"take missing: {take_id}")
-    if take.episode_id and episode_key(take.episode_id) != episode_key(episode):
-        raise PermissionError(f"take {take_id} belongs to episode {take.episode_id}, not {episode_key(episode)}")
-    name = episode_artifact_name("cut.json", episode)
-    cut = read_artifact(prod, name)
+    from .context import context_for
+
+    ctx = context_for(prod, episode)
+    _require_take_context(take, ctx)
+    cut = ctx.read_artifact("cut.json", required=True)
     timeline = list(cut.get("timeline") or [])
     found = False
     for item in timeline:
@@ -309,7 +349,9 @@ def replace_segment_take(
     cut["timeline"] = timeline
     cut["version"] = int(cut.get("version") or 1) + 1
     cut["status"] = "draft"
-    write_artifact(prod, name, cut)
+    from .production import save_json
+
+    save_json(prod, ctx.cut_rel(), cut)
     return cut
 
 
@@ -369,7 +411,10 @@ def record_render_take(
     new_attempt: bool = False,
 ) -> Take:
     dest = Path(dest)
-    ep = episode_key(episode)
+    from .context import context_for
+
+    ctx = context_for(prod, episode, revision_id)
+    ep = episode_key(ctx.episode_token)
     incoming = sha256_file(dest) if dest.is_file() else ""
     existing = None if new_attempt else find_resume_take(
         prod, shot_id=shot_id, request_hash=request_hash, task_id=task_id, episode=episode
@@ -390,7 +435,7 @@ def record_render_take(
         qc=dict(qc or {}),
         created_at=int(time.time()),
         episode_id=ep,
-        revision_id=str(revision_id or ""),
+        revision_id=ctx.revision_id,
     )
     persist_take(prod, take)
     return take
@@ -429,6 +474,14 @@ def _same_episode(stored: str, episode: Any) -> bool:
 
 def resolve_segment_takes(prod: Path, segment: EditSegment, episode: Any = 1) -> tuple[Take, Take]:
     """Explicit ids never fall back. A blank take_id may use the selected default."""
+    from .context import context_for
+
+    ctx = context_for(prod, episode)
+    episode = ctx.episode_token
+    if segment.episode_id and not _same_episode(segment.episode_id, episode):
+        raise PermissionError(f"segment {segment.segment_id} belongs to episode {segment.episode_id}")
+    if ctx.mode == "registered" and segment.revision_id and segment.revision_id != ctx.revision_id:
+        raise PermissionError(f"segment {segment.segment_id} belongs to revision {segment.revision_id}")
     explicit_picture = str(segment.take_id or "").strip()
     if explicit_picture:
         picture = get_take(prod, explicit_picture)
@@ -436,8 +489,7 @@ def resolve_segment_takes(prod: Path, segment: EditSegment, episode: Any = 1) ->
             raise PermissionError(f"picture take missing: {explicit_picture}")
         if segment.shot_id and picture.shot_id != segment.shot_id:
             raise PermissionError(f"picture take {explicit_picture} belongs to {picture.shot_id}, not {segment.shot_id}")
-        if not _same_episode(picture.episode_id, episode):
-            raise PermissionError(f"picture take {explicit_picture} belongs to episode {picture.episode_id}")
+        _require_take_context(picture, ctx)
         take_media_file(prod, picture)
     else:
         picture = selected_take(prod, segment.shot_id, episode) if segment.shot_id else None
@@ -448,8 +500,7 @@ def resolve_segment_takes(prod: Path, segment: EditSegment, episode: Any = 1) ->
         audio = get_take(prod, explicit_audio)
         if audio is None:
             raise PermissionError(f"audio take missing: {explicit_audio}")
-        if not _same_episode(audio.episode_id, episode):
-            raise PermissionError(f"audio take {explicit_audio} belongs to episode {audio.episode_id}")
+        _require_take_context(audio, ctx)
         take_media_file(prod, audio)
     else:
         audio = picture

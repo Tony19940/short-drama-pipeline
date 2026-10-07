@@ -19,6 +19,8 @@ sys.path.insert(0, str(SCRIPTS))
 from director.animatic import (  # noqa: E402
     animatic_approval_status,
     animatic_input_fingerprint,
+    build_animatic,
+    ffmpeg_available,
     require_animatic_approval,
     write_animatic_approval,
 )
@@ -259,6 +261,8 @@ class QcLayers(unittest.TestCase):
 
 class AnimaticApproval(unittest.TestCase):
     def test_approval_binds_to_input_version(self) -> None:
+        if not ffmpeg_available():
+            self.skipTest("actual animatic fixture needs ffmpeg")
         with tempfile.TemporaryDirectory() as raw:
             prod = Path(raw)
             (prod / "03-storyboard").mkdir()
@@ -273,7 +277,8 @@ class AnimaticApproval(unittest.TestCase):
                 encoding="utf-8",
             )
             first = animatic_input_fingerprint(prod, 1)
-            write_animatic_approval(prod, 1, reviewer="tonyteacher")
+            build_animatic(prod, 1)
+            write_animatic_approval(prod, 1, reviewer="tonyteacher", notes="Reviewed the built picture and rhythm.")
             self.assertTrue(animatic_approval_status(prod, 1)["ok"])
             require_animatic_approval(prod, 1)
             _jpg(prod / "04-frames" / "SH001.jpg", color=(9, 9, 9))

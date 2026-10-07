@@ -112,6 +112,11 @@ def _glob_files(root: Path, pattern: str = "*") -> list[Path]:
 
 
 def agent_files(prod: Path, agent_id: str) -> list[Path]:
+    from .context import context_for
+
+    ctx = context_for(prod)
+    if ctx.mode == "registered":
+        return _revision_agent_files(ctx, agent_id)
     files: list[Path] = []
     if agent_id == "0":
         _add_if_file(prod, ".pipeline/novel.json", files)
@@ -206,6 +211,57 @@ def agent_files(prod: Path, agent_id: str) -> list[Path]:
     return files
 
 
+def _revision_agent_files(ctx, agent_id: str) -> list[Path]:
+    """Registered revisions fingerprint their real inputs, including tail frames."""
+    from .paths import safe_under
+    from .revisions import REGISTRY_REL
+
+    prod = ctx.prod.resolve()
+    files: list[Path] = []
+    _add_if_file(prod, REGISTRY_REL, files)
+    bases = {
+        "0": ("novel.json",), "A": ("writer.json",), "B": ("assets.json",),
+        "C": ("shot_list.json", "events.json", "narrative_reviews.json"),
+        "C1": ("shot_specs.json",), "C2": ("gen_packages.json", "frame_descriptions.json"),
+        "D": ("keyframes.json",), "E": ("clips.json", "event_evidence.json"),
+        "E+": ("audio.json",), "F": ("cut.json", "sequence_reviews.json"),
+    }
+    for base in bases.get(agent_id, ()):
+        _add_if_file(prod, ctx.artifact_rel(base), files)
+    if agent_id in {"0", "A"}:
+        root = prod / "01-bible"
+        for path in root.rglob("*") if root.exists() else []:
+            if path.is_file() and not _is_draft(path) and path.name != ".DS_Store":
+                files.append(path)
+    if agent_id in {"B", "S"}:
+        root = prod / "02-assets"
+        for path in root.rglob("*") if root.exists() else []:
+            if path.is_file() and not _is_draft(path) and path.name != ".DS_Store":
+                files.append(path)
+    if agent_id in {"S", "C"}:
+        for rel in ("03-storyboard/sets.json", "03-storyboard/coverage.md", "03-storyboard/beats.md"):
+            _add_if_file(prod, rel, files)
+    if agent_id == "D":
+        root = prod / ctx.frame_dir()
+        files.extend(path for path in root.rglob("*.jpg") if path.is_file() and not _is_draft(path))
+    if agent_id == "E":
+        root = prod / ctx.shot_dir()
+        files.extend(path for path in root.rglob("*.mp4") if path.is_file() and not _is_draft(path) and "kenburns" not in path.name.lower() and "still-pass" not in path.name.lower())
+    if agent_id in {"E+", "F"}:
+        cut = ctx.read_artifact("cut.json")
+        final = str(cut.get("final_file") or "")
+        if final:
+            path = safe_under(prod, final)
+            if _exists(path):
+                files.append(path)
+        for rel in ("08-qc/report.json", "08-qc/report.md"):
+            _add_if_file(prod, rel, files)
+    if agent_id == "P":
+        for rel in ("01-bible/producer/plan.md", "01-bible/producer/manifest.json"):
+            _add_if_file(prod, rel, files)
+    return sorted(set(files))
+
+
 def _glob_dirs(root: Path) -> list[Path]:
     if not root.exists():
         return []
@@ -213,7 +269,7 @@ def _glob_dirs(root: Path) -> list[Path]:
 
 
 def file_hashes(prod: Path, agent_id: str) -> dict[str, str]:
-    return {_rel(prod, path): hash_file(path) for path in agent_files(prod, agent_id)}
+    return {_rel(Path(prod).resolve(), path.resolve()): hash_file(path) for path in agent_files(prod, agent_id)}
 
 
 def agent_fingerprint(prod: Path, agent_id: str, files: Optional[dict[str, str]] = None) -> str:
@@ -258,6 +314,10 @@ def actually_locked(approvals: dict, agent_id: str) -> bool:
 
 
 def virtual_locked(prod: Path, agent_id: str, files: dict, approvals: dict) -> bool:
+    from .context import context_for
+
+    if context_for(prod).mode == "registered":
+        return False
     if actually_locked(approvals, agent_id):
         return False
     if agent_id == "0":
@@ -284,6 +344,10 @@ def is_locked(prod: Path, agent_id: str, files: dict, approvals: dict) -> bool:
 
 def stale_reason(prod: Path, agent_id: str, approvals: dict) -> str:
     rec = (approvals.get("gates") or {}).get(agent_id) or {}
+    from .context import context_for
+
+    if rec.get("locked") and not rec.get("fingerprint") and context_for(prod).mode == "registered":
+        return "登记版本审批缺指纹，需要重新审核"
     if not rec.get("locked") or not rec.get("fingerprint"):
         return ""
     live_files = file_hashes(prod, agent_id)
@@ -422,6 +486,10 @@ def agent_diff(prod: Path, agent_id: str) -> dict:
 
 def ensure_lock_fingerprints(prod: Path, approvals: dict) -> tuple[dict, bool]:
     """Fill missing hashes on already-locked gates. Never creates .director."""
+    from .context import context_for
+
+    if context_for(prod).mode == "registered":
+        return approvals, False
     if not approvals_path(prod).exists():
         return approvals, False
     dirty = False

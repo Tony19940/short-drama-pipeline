@@ -125,6 +125,30 @@ PROFILES: dict[str, dict[str, Any]] = {
         ],
         "verified": True,
     },
+    "google_omni": {
+        "id": "google_omni",
+        "label": "Google Omni / Veo 多模态视频生成",
+        "vendor_models": ["google_omni", "omni", "gemini-omni", "veo-2", "veo"],
+        "prompt_language": "en",
+        "min_shot_sec": 3,
+        "max_shot_sec": 15,
+        "aspects": ["16:9", "9:16", "1:1"],
+        "first_last_frame": True,
+        "max_ref_images": 10,
+        "return_last_frame": True,
+        "multi_setup_in_clip": False,
+        "max_internal_cuts": 0,
+        "native_dialogue_audio": True,
+        "lip_sync": True,
+        "allowed_moves": ["static", "push", "pull", "pan", "tilt", "track", "follow", "handheld", "crane"],
+        "forbidden_moves": ["orbit", "drone", "crash_zoom", "whip_pan"],
+        "notes": [
+            "Google Omni / Veo 原生多模态音视频联合生成，支持高棉语原声对白与唇形同步。",
+            "单镜 3–15 秒，默认一镜一机位，片内切为 0。",
+            "原生音视频联合生成，高棉语原声唇同步直接通过 prompt 与 dialogue 驱动。",
+        ],
+        "verified": True,
+    },
 }
 
 ALIASES = {
@@ -147,6 +171,12 @@ ALIASES = {
     "minimax": "minimax_h3",
     "minimax-h3": "minimax_h3",
     "minimax_h3_max": "minimax_h3",
+    "google_omni": "google_omni",
+    "omni": "google_omni",
+    "gemini_omni": "google_omni",
+    "gemini-omni": "google_omni",
+    "veo": "google_omni",
+    "google_veo": "google_omni",
 }
 
 DEFAULT_PROFILE = "seedance_2_0"
@@ -192,13 +222,28 @@ def _profile_from_text(text: str) -> str:
 
 
 def resolve_target_model(prod: Optional[Path] = None, explicit: Optional[str] = None) -> str:
-    """Order: explicit arg → env DIRECTOR_TARGET_MODEL → .pipeline/gen_packages.json → confirm.md → env ARK_SEEDANCE_MODEL / backend → default."""
+    """Explicit/env first; registered revisions require their bound package/table model.
+
+    Legacy projects then use packages, confirm.md, backend environment and default.
+    """
     if explicit and str(explicit).strip():
         return get_profile(explicit)["id"]
     env = os.environ.get("DIRECTOR_TARGET_MODEL", "").strip()
     if env:
         return get_profile(env)["id"]
     if prod is not None:
+        from .context import context_for
+
+        ctx = context_for(prod)
+        if ctx.mode == "registered":
+            packages = ctx.read_artifact("gen_packages.json")
+            model = str(packages.get("episode_target_model") or "").strip()
+            if not model:
+                table = ctx.read_artifact("shot_list.json", required=True)
+                model = str(table.get("target_model") or "").strip()
+            if not model:
+                raise UnknownProfileError("registered revision has no target_model; do not borrow old packages or confirm.md")
+            return get_profile(model)["id"]
         packages = prod / ".pipeline" / "gen_packages.json"
         if packages.exists():
             try:

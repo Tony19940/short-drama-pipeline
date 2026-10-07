@@ -73,8 +73,11 @@ def evaluate_clip_layers(
     elif next_first_diff is not None and next_first_diff > 0.35:
         layers["scene_cut"]["status"] = "warn"
         _note(layers["scene_cut"], f"last vs next-first differs {next_first_diff:.2f} (crude)")
-    else:
+    elif next_first_diff is not None:
         layers["scene_cut"]["status"] = "pass"
+    else:
+        layers["scene_cut"]["status"] = "unknown"
+        _note(layers["scene_cut"], "no adjacent-frame comparison was performed")
 
     if vlm_score is not None:
         _note(layers["visual"], f"VLM score {vlm_score} is evidence, not an automatic pass")
@@ -84,7 +87,17 @@ def evaluate_clip_layers(
     return layers
 
 
-def layers_allow_auto_pass(layers: dict[str, dict[str, Any]]) -> bool:
-    """Paid finish still needs a hash-bound visual review. Technical+text is not enough."""
-    visual = (layers.get("visual") or {}).get("status")
-    return visual == "pass"
+def layers_allow_auto_pass(
+    layers: dict[str, dict[str, Any]], *, required_layers: Optional[list[str]] = None,
+) -> bool:
+    """Required layers must pass and any explicit failed layer prevents acceptance.
+
+    Performance is required only when the clip contract marks it applicable;
+    this helper never establishes that an entire sequence tells its story.
+    """
+    if not isinstance(layers, dict):
+        return False
+    required = {"technical", "visual", *(required_layers or [])}
+    if any(not isinstance(value, dict) or value.get("status") == "fail" for value in layers.values()):
+        return False
+    return all((layers.get(name) or {}).get("status") == "pass" for name in required)

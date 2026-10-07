@@ -3,6 +3,8 @@
 拆镜 Agent 是导演层的发动机。它不写故事、不出视频。它只决定这场戏拍哪些镜头。5.1 说明书和 5.2 生成包是后面两岗，不要写进这一岗。
 人先审整场，再锁单镜。提示词是合同的译文，不是另写的作文。
 
+当前登记版审批和实片证据见 [流水线升级协议](docs/PIPELINE-UPGRADE-2026-10-06.md)。
+
 对照：Toonflow / LocalMiniDrama 的画布当视图；Jellyfish 的镜头准备态；
 shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（其 Seedance 路线实际丢尾帧，首尾帧只在 veo/vidu 成立）；drama-skills 的人确认后才投产。
 
@@ -12,7 +14,7 @@ shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（
 - 人锁关卡；草稿先于正式表
 - 舞台 / blocking.jpg / 第 0 秒 start
 - 从父图改，不准另开新脸
-- 对白不进 video_prompt
+- 台词按本集 speech_mode 写入生成包或后配音；声音要求与画面一起审，不以静音稿代替
 - H3 三字段、出片指纹、Ken Burns 禁令
 
 ## 扔掉
@@ -31,12 +33,12 @@ shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（
 
 ## 一场合同
 
-每场先定轴和 2-3 个机位（另加 insert）。镜头必须挂 rig_id。
+每场先定轴，按揭示顺序选择需要的机位，机位数量不作配额。镜头必须挂 rig_id。
 对白镜跟台词走；邻镜写成动作对；video_prompt 必须含本镜 action。
 续镜第 0 秒 start 必须已经在动作中间，不能站好再开始。
-对白/心里台词后插 1.2–2.0 秒无台词反应镜。
+对白后的注意转移和反应需要可读；可留在同镜，不强制另插固定时长反应镜。
 首帧 = 动作起点状态（动词可已起手，禁结果）；motion 从 0.0s 就在动，ACTION TIMING 按秒两拍。复杂动作开场就在进行中，走近是另一镜。
-每镜合同带 handle=2 / render_seconds=seconds+2，给以后的 EDL 留修剪余地；assemble.sh 这期仍全长拼接。纸面目标 14–18 镜/分；要上 16–18 必须按纸面秒裁。
+生成时可留修剪余地，按实际模型最短时长制定 render_seconds；纸面时长和原片时长分别记录。登记版本用 assemble_episode.py 依 EDL 剪辑，assemble.sh 全长串接入口停用。14–18 镜/分仅作节奏参考，是否清楚由实际段落审阅判断。
 写字模型只填句。没有密钥时启发式填 start/action/landing，禁止按剧情关键词写死英文。
 
 ## 电影级拆镜（shot-table-v2）
@@ -50,7 +52,7 @@ shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（
 1. **阐述**（`analysis`，一次）：每场一张场卡——戏剧问题、翻转点（逐字引剧本）、情绪曲线 0–10、那一颗（瞬间 + 景别）、揭示顺序、距离策略、光的动机、静音测试；全集一份视觉语法（母题、景别节奏、结尾钩子景别）。落 `.pipeline/scene_cards.json`、`03-storyboard/scene-cards.draft.md`。
 2. **表头**（`header`）：视点、每场左右锁、连戏圣经、每场镜数秒数节拍。已经看见卡。
 3. **每场 N 版**（`scene` × N，默认 3）：覆盖派 / 主观派 / 少切派各拆一版，各自过机器校验，不过带错误清单重来一次。风格不许破卡。
-4. **评审**（`critic`）：七维打分（揭示顺序、那一颗、节奏、静音、卡的承接、连戏、模型风险），挑一版，写为什么、写合并建议。评审不可用就机器兜底。
+4. **评审**（`critic`）：七维打分（揭示顺序、那一颗、节奏、静音、卡的承接、连戏、模型风险），挑一版，写为什么、写合并建议。评审可全否决或要求重写；不可用时机器只给待审建议，不能替人通过。
 5. **人选**：`03-storyboard/shot-candidates.draft.md` 并排看；导演台「选这版」换版不花 token。正式表只收被选的那版。
 6. **画面描述**（`frame_desc`，一场一次）：每镜一段能画的画——三层、光位、手、构图重心、机高意味、不得出现；每个在画人物一组 `acting {want, hide, business, muscle, change}`，写行为不写情绪（情绪形容词 = `acting_adjective` 警告，自检用 `07a` 的 15 条坏演技图谱）。关键帧岗照这段画，生成包 `image_prompt` 带它。
    生成包（5.2）编译时前置本场 `geo_layout`（`sets.json.geo_zh`）和每人一句 `descriptor`，对白进 `audio_block`（`speech_mode=seedance_native`），只写肯定句、中文 ≤500 字。
@@ -62,7 +64,7 @@ shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（
 
 - 那一颗：卡说的景别必须有自己的一镜，且是全场最紧（没有 = error；不是最紧 = warning）。
 - 母题：`first_shot_in_scene` / `first_appearance` / `always` 三种时机，`scale_not` / `scale_in` / `angle` 违反 = error。
-- 节奏：三镜连着同景别、四镜以上景别不跨档、峰值镜不够紧、峰值后不回中景 = warning。SPM < 12、连续两镜 ≥8s、对白后无反应 = warning（新纸面表 SPM / 无理由 >8s / 复合动词 = error；已锁成片只 warning）。
+- 节奏：镜头密度、同景别连续排列、连续长镜、无理由 >8s、复合动词或多分句，草稿和已锁表均只作 advisory warning。14–18 镜/分是参考值，不是合格门槛；长镜是否需要连续时间、观众是否来得及读取信息，由场级评审和段落看片判断。对白后换话题时检查注意转移和省略是否成立，不强制补反应镜；连续事件也不按每个动词拆镜。模型真实最长秒数、非法时间范围、缺核心事件合同仍是 error。
 - 光位：同场主光一个方向，反打可以镜像；left↔right 直跳 = error；`day_night` 和 bible 不符 = error。
 - 邻镜差：景别 / 角度 / 左右 / 运镜 / 主体最多改两件，改三件 = warning。
 - 机位：`camera_id` 不在 `sets.cameras[]` = error；设计的左右和顶视图几何不一致 = warning（`director/camera_plot.py`）。
@@ -89,4 +91,3 @@ shuohao 的「分镜只输出」和 2-5 秒对白门；BigBanana 的首尾帧（
 
 Gate C 对 directing=scene-rig-v1 的新表执行硬检查；旧正式表只警告，不挡 003/004/005 回归。
 005 已锁成片和正式分镜先不动。新草稿走新刀法。
-

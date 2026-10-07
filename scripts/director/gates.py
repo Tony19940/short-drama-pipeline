@@ -33,6 +33,13 @@ def _exists(path: Path) -> bool:
 
 
 def _shots(prod: Path) -> list[dict]:
+    from .context import context_for
+
+    ctx = context_for(prod)
+    if ctx.mode == "registered":
+        from .shot_repo import list_shots
+
+        return list_shots(ctx)
     path = prod / "03-storyboard" / "shots.json"
     if not path.exists():
         return []
@@ -70,8 +77,11 @@ def _v2_frame_rows(prod: Path, episode: int = 1) -> list[dict]:
 
     if not uses_pipeline(prod):
         return []
-    table = read_artifact(prod, episode_artifact_name("shot_list.json", episode))
-    folder = episode_frame_dir(episode)
+    from .context import context_for
+
+    ctx = context_for(prod, episode)
+    table = ctx.read_artifact("shot_list.json", required=ctx.mode == "registered")
+    folder = ctx.frame_dir()
     rows = []
     for item in table.get("shots") or []:
         sid = str(item.get("shot_id") or "").strip()
@@ -88,20 +98,25 @@ def _v2_frame_rows(prod: Path, episode: int = 1) -> list[dict]:
 
 
 def inspect_files(prod: Path, episode: int = 1) -> dict:
-    shots = _shots(prod)
-    frame_shots = shots or _v2_frame_rows(prod, episode)
+    from .context import context_for, using_context
+
+    ctx = context_for(prod, episode)
+    prod = ctx.prod.resolve()
+    with using_context(ctx):
+        shots = _shots(prod)
+        frame_shots = shots or _v2_frame_rows(prod, ctx.episode_token)
     frames = []
     for shot in frame_shots:
-        frame = prod / shot.get("frame", f"04-frames/{shot['id']}.jpg")
-        last = prod / shot.get("last_frame", f"04-frames/{shot['id']}-last.jpg")
-        video = prod / "05-shots" / f"{shot['id']}.mp4"
+        frame = prod / shot.get("frame", f"{ctx.frame_dir()}/{shot['id']}.jpg")
+        last = prod / shot.get("last_frame", f"{ctx.frame_dir()}/{shot['id']}-last.jpg")
+        video = prod / ctx.shot_dir() / f"{shot['id']}.mp4"
         frames.append(
             {
                 "id": shot["id"],
                 "frame": _exists(frame),
                 "last": _exists(last),
                 "video": _exists(video),
-                "parent": parent_still(prod, shot, shots) if shots else {"kind": "pipeline", "path": shot.get("frame", ""), "exists": _exists(frame), "reason": "shot-table-v2 首帧"},
+                "parent": parent_still(prod, shot, shots) if shots and ctx.mode != "registered" else {"kind": "pipeline", "path": str(frame.relative_to(prod)), "exists": _exists(frame), "reason": "shot-table-v2 首帧"},
             }
         )
     blocking = list((prod / "02-assets" / "scenes").glob("*/blocking.jpg")) if (prod / "02-assets" / "scenes").exists() else []
@@ -134,6 +149,13 @@ def inspect_files(prod: Path, episode: int = 1) -> dict:
                         "blocking": _exists(child / "blocking.jpg"),
                     }
                 )
+    export = ctx.read_artifact("cut.json").get("final_file") if ctx.mode == "registered" else "06-export/ep01.mp4"
+    if export:
+        from .paths import safe_under
+
+        export_path = safe_under(prod, str(export))
+    else:
+        export_path = prod / "06-export" / "missing-registered-export"
     return {
         "confirm": _exists(prod / "01-bible" / "confirm.md"),
         "blueprint": _exists(prod / "01-bible" / "blueprint.md"),
@@ -141,19 +163,20 @@ def inspect_files(prod: Path, episode: int = 1) -> dict:
         "sets": _exists(prod / "03-storyboard" / "sets.json"),
         "coverage": _exists(prod / "03-storyboard" / "coverage.md"),
         "beats": _exists(prod / "03-storyboard" / "beats.md"),
-        "shots": _exists(prod / "03-storyboard" / "shots.json"),
+        "shots": _exists(ctx.artifact_path("shot_list.json")) if ctx.mode == "registered" else _exists(prod / "03-storyboard" / "shots.json"),
         "blocking": bool(blocking),
         "characters": characters,
         "scenes": scenes,
         "frames": frames,
-        "review": any((prod / "06-export").glob("preview-*-vo.mp4")) or (prod / "06-export" / "preview-vo.mp4").exists(),
-        "episode_export": _exists(prod / "06-export" / "ep01.mp4"),
+        "review": _exists(export_path) if ctx.mode == "registered" else any((prod / "06-export").glob("preview-*-vo.mp4")) or (prod / "06-export" / "preview-vo.mp4").exists(),
+        "episode_export": _exists(export_path),
         "source": _exists(prod / "01-bible" / "source" / "source.json") and _exists(prod / "01-bible" / "source" / "original.md"),
         "producer": _exists(prod / "01-bible" / "producer" / "plan.md") and _exists(prod / "01-bible" / "producer" / "manifest.json"),
         "qc": _exists(prod / "08-qc" / "report.json") or _exists(prod / "01-bible" / "qc" / "report.md"),
         "shot_count": len(frame_shots),
         "video_count": sum(1 for item in frames if item["video"]),
         "locked_frame_count": sum(1 for item in frames if item["frame"]),
+        "context": ctx.to_dict(),
     }
 
 
@@ -193,14 +216,22 @@ def v2_storyboard_ready(prod: Path) -> tuple[bool, str]:
 
     if not uses_pipeline(prod):
         return False, ""
-    shot_list = read_artifact(prod, "shot_list.json")
+    from .context import context_for
+
+    ctx = context_for(prod)
+    shot_list = ctx.read_artifact("shot_list.json", required=ctx.mode == "registered")
     if not shot_list:
         return False, ""
     if str(shot_list.get("schema") or "") != SHOT_TABLE_SCHEMA:
         return False, ""
     from .shot_table import table_context
 
-    context = table_context(prod, shot_list.get("target_model"))
+    try:
+        context = table_context(prod, shot_list.get("target_model"), episode=ctx.episode_token)
+        if ctx.mode == "registered":
+            context["writer"] = ctx.read_artifact("writer.json", required=True)
+    except (ValueError, OSError) as exc:
+        return False, str(exc)
     errors = validate_shot_list(shot_list, **context)
     if errors:
         return False, errors[0]
@@ -229,7 +260,13 @@ def continue_last_frame_rule(shot: dict, prev: Optional[dict]) -> tuple[bool, st
 
 
 def designed_end_frame(prod: Path, shot: dict) -> dict:
-    """Optional designed last frame. Generated `{id}-last.jpg` is never this."""
+    """Optional planned end; role metadata overrides the legacy filename."""
+    from .context import context_for
+    from .paths import safe_under
+    from place_codex_frame import frame_role_info
+
+    ctx = context_for(prod)
+    prod = ctx.prod.resolve()
     rel = str(shot.get("end_frame") or "").strip()
     if not rel:
         return {
@@ -240,15 +277,24 @@ def designed_end_frame(prod: Path, shot: dict) -> dict:
             "reason": "无设计尾帧，只锁首帧出片",
         }
     name = Path(rel).name.lower()
-    frame_rel = str(shot.get("frame") or f"04-frames/{shot['id']}.jpg")
-    if name.endswith("-last.jpg"):
+    sid = str(shot.get("id") or shot.get("shot_id") or "")
+    frame_rel = str(shot.get("frame") or f"{ctx.frame_dir()}/{sid}.jpg")
+    role = frame_role_info(prod, rel)
+    if role["frame_role"] == "generated_end":
         return {
             "kind": "invalid",
             "path": rel,
             "exists": False,
             "ok": False,
-            "reason": "end_frame 不能是生成后抽出的 -last.jpg",
+            "reason": "end_frame 不能使用 generated_end 视频实际尾帧",
         }
+    if (role["frame_role"] in {"planned_start"} or role["provenance_status"] == "invalid"
+            or (name.endswith("-last.jpg") and role["frame_role"] != "planned_end")):
+        return {"kind": "invalid", "path": rel, "exists": False, "ok": False,
+                "reason": "end_frame 必须是设计尾；legacy -last.jpg 需明确 planned_end 元数据"}
+    if not rel.replace("\\", "/").startswith(ctx.frame_dir().rstrip("/") + "/"):
+        return {"kind": "invalid", "path": rel, "exists": False, "ok": False,
+                "reason": "end_frame 不在当前版本设计帧目录"}
     if Path(rel).as_posix() == Path(frame_rel).as_posix():
         return {
             "kind": "invalid",
@@ -257,7 +303,7 @@ def designed_end_frame(prod: Path, shot: dict) -> dict:
             "ok": False,
             "reason": "end_frame 不能等于本镜首帧",
         }
-    path = prod / rel
+    path = safe_under(prod, rel)
     exists = _exists(path)
     return {
         "kind": "designed_end",
@@ -265,14 +311,23 @@ def designed_end_frame(prod: Path, shot: dict) -> dict:
         "exists": exists,
         "ok": exists,
         "reason": "设计尾帧，动作用这个收住" if exists else f"缺设计尾帧 {rel}",
+        "frame_role": role["frame_role"],
+        "warnings": role["warnings"],
     }
 
 
 def i2v_source(prod: Path, shot: dict, shots: Optional[list[dict]] = None) -> dict:
+    from .context import context_for
+    from .paths import safe_under
+    from place_codex_frame import resolve_generated_end
+
+    ctx = context_for(prod)
+    prod = ctx.prod.resolve()
     shots = shots if shots is not None else _shots(prod)
-    designed = prod / shot.get("frame", f"04-frames/{shot['id']}.jpg")
+    sid = str(shot.get("id") or shot.get("shot_id") or "")
+    designed = safe_under(prod, shot.get("frame") or f"{ctx.frame_dir()}/{sid}.jpg")
     designed_rel = str(designed.relative_to(prod))
-    prev = next((item for item in shots if item.get("id") == shot.get("from")), None)
+    prev = next((item for item in shots if (item.get("id") or item.get("shot_id")) == shot.get("from")), None)
     eats, why = continue_last_frame_rule(shot, prev)
     if not eats:
         return {
@@ -282,27 +337,32 @@ def i2v_source(prod: Path, shot: dict, shots: Optional[list[dict]] = None) -> di
             "reason": why,
             "from": shot.get("from"),
         }
-    last_rel = str((prev or {}).get("last_frame") or f"04-frames/{shot['from']}-last.jpg")
-    last = prod / last_rel
-    if last.exists():
+    last_rel = resolve_generated_end(prod, str(shot["from"]), ctx.episode_token)
+    if last_rel:
         return {
             "kind": "last_frame",
-            "path": str(last.relative_to(prod)),
+            "path": last_rel,
             "exists": True,
             "reason": why,
             "from": shot.get("from"),
+            "frame_role": "generated_end",
         }
     return {
         "kind": "designed_frame",
         "path": designed_rel,
         "exists": _exists(designed),
-        "reason": why + "；上一镜末帧还没有，先用本镜设计首帧",
+        "reason": why + "；未找到通过来源和身份核验的实际视频尾帧，使用本镜设计首帧",
         "from": shot.get("from"),
     }
 
 
-def run_check(prod: Path) -> dict:
-    cmd = [sys.executable, str(ROOT / "scripts" / "check_prod.py"), "--prod", str(prod)]
+def run_check(prod: Path, episode=None, revision_id: str = "") -> dict:
+    from .context import context_for
+
+    ctx = context_for(prod, episode, revision_id)
+    cmd = [sys.executable, str(ROOT / "scripts" / "check_prod.py"), "--prod", str(ctx.prod), "--episode", str(ctx.episode_token)]
+    if ctx.mode == "registered":
+        cmd.extend(["--revision", ctx.revision_id])
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return {
         "ok": proc.returncode == 0,
@@ -327,6 +387,24 @@ def _c2_still_t0_note(prod: Path) -> str:
 
 
 def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, episode: int = 1) -> tuple[bool, str]:
+    from .context import context_for, using_context
+
+    ctx = context_for(prod, episode)
+    with using_context(ctx):
+        try:
+            if ctx.mode == "registered":
+                from .pipeline import assert_keyframes_passed, assert_clips_passed, assert_packages_confirmed
+                from .narrative import require_design_review, require_sequence_reviews
+                checks = {"C": require_design_review, "C2": assert_packages_confirmed,
+                          "D": assert_keyframes_passed, "E": assert_clips_passed, "F": require_sequence_reviews}
+                if gate_id in checks:
+                    checks[gate_id](ctx.prod, ctx.episode_token)
+            return _gate_file_ready(ctx.prod, gate_id, files, ctx.episode_token)
+        except (PermissionError, ValueError, OSError) as exc:
+            return False, str(exc)
+
+
+def _gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, episode=1) -> tuple[bool, str]:
     files = files or inspect_files(prod, episode)
     if gate_id == "0":
         if files.get("source"):
@@ -425,7 +503,9 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, epis
             shots = table.get("shots") or []
             if not shots:
                 return False, "还没有分镜"
-            folder = episode_frame_dir(episode)
+            from .context import context_for
+
+            folder = context_for(prod, episode).frame_dir()
             missing = [
                 str(item.get("shot_id") or "")
                 for item in shots
@@ -485,9 +565,9 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, epis
             from .animatic import animatic_rel
 
             frames_locked = bool(files["frames"]) and all(item.get("frame") for item in files["frames"])
-            anim = prod / animatic_rel(1)
+            anim = prod / animatic_rel(episode)
             if frames_locked and not anim.exists():
-                return False, f"缺静帧 animatic {animatic_rel(1)}；正式出片前先出 animatic（05-shots/smoke 不受此限）"
+                return False, f"缺静帧 animatic {animatic_rel(episode)}；正式出片前先出 animatic（05-shots/smoke 不受此限）"
         return True, f"{files['video_count']} 条单镜已在"
     if gate_id == "E+":
         from .pipeline import read_artifact, uses_pipeline, validate_audio
@@ -560,6 +640,16 @@ def _promote_on_lock(prod: Path, gate_id: str) -> None:
 def lock_gate(prod: Path, gate_id: str, locked: bool = True) -> dict:
     if gate_id not in LOCKABLE:
         raise ValueError(f"未知关卡 {gate_id}")
+    if locked:
+        from .context import ProductionContext, current_context
+        from .narrative import require_design_review, require_sequence_reviews
+
+        ctx = current_context() or ProductionContext.resolve(prod)
+        if ctx.mode == "registered":
+            if gate_id == "C":
+                require_design_review(prod, ctx.episode_token)
+            elif gate_id == "F":
+                require_sequence_reviews(prod, ctx.episode_token)
     files = inspect_files(prod)
     if locked:
         _promote_on_lock(prod, gate_id)

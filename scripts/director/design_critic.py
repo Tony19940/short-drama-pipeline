@@ -15,7 +15,7 @@ STYLES: list[dict[str, str]] = [
     {
         "id": "coverage",
         "label": "覆盖派",
-        "brief": "常规覆盖：先 master 交代地理，再正反打，每句对白后给反应。稳，不冒险。",
+        "brief": "常规覆盖：交代必要地理，再按戏剧行动正反打；反应和省略由观众理解需要决定，不强制每句对白后另开反应镜。",
         "temperature": "0.3",
     },
     {
@@ -34,14 +34,23 @@ STYLES: list[dict[str, str]] = [
 
 RUBRIC: dict[str, str] = {
     "reveal_order": "揭示顺序是否和场卡一致：观众先看见什么、后看见什么",
-    "the_shot": "场卡说的那一颗有没有落地，且是全场最紧、最慢、最清楚的一颗",
-    "rhythm": "景别曲线有起伏，不平线，高潮后有回落",
-    "silence": "静音看一遍，这场的变化仍在画面里",
+    "the_shot": "关键瞬间是否承载本场变化；景别与持续时间有理由，不把最紧、最慢当硬指标",
+    "rhythm": "关键新信息有辨认时间，重复说明可压缩；节奏服务戏剧重心，不按镜数判快慢",
+    "silence": "画面负责的动作和变化是否可读；对白承担的信息允许依赖声音，纸面推断不冒充实际静音审片",
     "card_fit": "距离策略、光的动机、色彩变化是否被镜头承接",
     "continuity": "左右、视线、状态机、道具跨度没有破绽",
     "model_risk": "对目标视频模型的风险：长镜多手部动作、一镜换机位/片内切（默认不允许）、运镜超能力档",
 }
 RUBRIC_KEYS = tuple(RUBRIC)
+DECISIONS = ("recommend", "needs_rework", "reject_all")
+REVIEW_GUIDANCE = (
+    "按整场判断，不因候选结构校验通过就默认可用。说明观众每步能知道什么，引用镜号与实际可见动作。",
+    "寻找合理替代解释：例如新增物是否会被读成原先藏着的物件；要指出镜头如何排除歧义，或保留了哪一种有意悬念。",
+    "检查人物注意如何被声音、视线、触感或动作引导；不要要求每一步另插反应脸，也不要维护全套人物知识数据库。",
+    "检查信息辨认与理解时间。允许正常时间省略、声音桥和连续行动；不用补全数钱等无收益过程。",
+    "同一戏剧行动可以包含必要的动作过程，不强制每个手部子动作独立成镜；模型风险与电影表达分别说明。",
+    "存在未解决的核心理解缺口时用 needs_rework 或 reject_all。最好的一版也可以不合格，不得勉强挑一版当通过。",
+)
 
 
 def _t(value: Any) -> str:
@@ -99,6 +108,9 @@ def candidate_summary(candidate: dict, card: Optional[dict]) -> dict:
                 "emotion_level": s.get("emotion_level"),
                 "evidence": s.get("evidence"),
                 "state_note": ((s.get("state") or {}).get("note") if isinstance(s.get("state"), dict) else ""),
+                "state": s.get("state"),
+                "ellipsis": s.get("ellipsis"),
+                "action_timing": s.get("action_timing"),
             }
             for s in shots
         ],
@@ -161,6 +173,9 @@ def critic_errors(verdict: Any, count: int) -> list[str]:
     errors: list[str] = []
     if not isinstance(verdict, dict):
         return ["critic must return an object"]
+    decision = _t(verdict.get("decision"))
+    if decision not in DECISIONS:
+        errors.append(f"critic decision must be one of {list(DECISIONS)}")
     scores = verdict.get("scores")
     if not isinstance(scores, list) or len(scores) != count:
         errors.append(f"critic scores must list all {count} candidates")
@@ -188,7 +203,25 @@ def critic_errors(verdict: Any, count: int) -> list[str]:
                 errors.append(f"candidate {idx} dims.{key} must be 0–10")
         if not _t(item.get("notes")):
             errors.append(f"candidate {idx} needs notes: what works, what breaks")
+        if item.get("status") not in {"pass", "needs_rework", "reject"}:
+            errors.append(f"candidate {idx} needs status pass / needs_rework / reject")
+        if not _t(item.get("comprehension_evidence")):
+            errors.append(f"candidate {idx} needs comprehension_evidence with shot references")
+        if not isinstance(item.get("blocking_issues"), list):
+            errors.append(f"candidate {idx} blocking_issues must be a list")
     pick = verdict.get("pick")
+    if decision == "reject_all":
+        if pick is not None:
+            errors.append("critic reject_all must have pick=null")
+        if any(item.get("status") == "pass" for item in scores if isinstance(item, dict)):
+            errors.append("critic reject_all cannot contain a passing candidate")
+        if not _t(verdict.get("why")):
+            errors.append("critic must say why it rejected all candidates")
+        return errors
+    if decision == "needs_rework" and pick is None:
+        if not _t(verdict.get("why")):
+            errors.append("critic must say why rework is needed")
+        return errors
     try:
         pick = int(pick)
     except (TypeError, ValueError):
@@ -196,6 +229,12 @@ def critic_errors(verdict: Any, count: int) -> list[str]:
         return errors
     if pick < 0 or pick >= count:
         errors.append("critic pick out of range")
+    elif decision == "recommend":
+        chosen = next((item for item in scores if isinstance(item, dict) and item.get("candidate") == pick), {})
+        if chosen.get("status") != "pass" or chosen.get("blocking_issues"):
+            errors.append("critic cannot recommend a candidate with unresolved content issues")
+        if any(_num((chosen.get("dims") or {}).get(key), -1) <= 0 for key in ("reveal_order", "continuity")):
+            errors.append("critic cannot recommend a candidate with zero reveal_order or continuity")
     if not _t(verdict.get("why")):
         errors.append("critic must say why it picked")
     return errors
@@ -211,39 +250,47 @@ def normalize_verdict(verdict: dict, count: int) -> dict:
             "dims": dims,
             "notes": _t(item.get("notes")),
             "fixes": [_t(f) for f in (item.get("fixes") or []) if _t(f)],
+            "status": item.get("status"),
+            "comprehension_evidence": _t(item.get("comprehension_evidence")),
+            "blocking_issues": list(item.get("blocking_issues") or []),
         })
     scores.sort(key=lambda s: s["candidate"])
     return {
-        "pick": int(verdict.get("pick")),
+        "decision": verdict.get("decision"),
+        "pick": int(verdict["pick"]) if verdict.get("pick") is not None else None,
         "why": _t(verdict.get("why")),
         "merge": _t(verdict.get("merge")),
         "scores": scores,
         "source": "critic",
+        "recommendation_only": True,
     }
 
 
 def fallback_verdict(candidates: list[dict], card: Optional[dict], reason: str) -> dict:
     pick = deterministic_pick(candidates, card)
     return {
-        "pick": pick,
-        "why": f"机器兜底：{reason}。按场戏目标（那一颗、视点），不是按警告最少或景别最花，挑了第 {pick + 1} 版。",
+        "decision": "not_reviewed",
+        "pick": pick if candidates else None,
+        "why": f"评审未完成：{reason}。机器仅建议先查看第 {pick + 1} 版，未确认内容合格。" if candidates else f"没有可推荐候选：{reason}",
         "merge": "",
         "scores": [],
         "source": "deterministic",
+        "recommendation_only": True,
     }
 
 
 def render_candidates_md(scene_rows: list[dict], title: str = "") -> str:
     """Side-by-side compare page: one block per scene, one column per candidate, critic verdict under it."""
     lines: list[str] = [f"# 拆镜候选对比 · {title or '第 01 集'}", ""]
-    lines.append("每场 N 版并排。机器校验都过；评审 Agent 打分并挑一版，人可以改选。正式表只收被选的那版。")
+    lines.append("每场 N 版并排，保留结构校验和内容评审结果。评审可全部拒绝；机器推荐与人改选都不等于人审通过。")
     lines.append("")
     for row in scene_rows:
         sid = _t(row.get("scene_id"))
         card = normalize_scene_card(row.get("scene_card")) if row.get("scene_card") else None
         candidates = list(row.get("candidates") or [])
         verdict = row.get("verdict") or {}
-        pick = int(verdict.get("pick", row.get("pick", 0)) or 0)
+        raw_pick = verdict.get("pick", row.get("pick"))
+        pick = int(raw_pick) if raw_pick is not None else None
         lines.append(f"## {sid}")
         lines.append("")
         if card:
@@ -283,7 +330,8 @@ def render_candidates_md(scene_rows: list[dict], title: str = "") -> str:
             lines.append("| 评审·总分 | " + " | ".join(str((scores.get(i) or {}).get("total", "—")) for i in range(len(candidates))) + " |")
         lines.append("")
         if verdict:
-            lines.append(f"**评审选第 {pick + 1} 版**（{_t(verdict.get('source')) or 'critic'}）：{_t(verdict.get('why'))}")
+            heading = f"建议第 {pick + 1} 版" if pick is not None else "本场没有通过候选"
+            lines.append(f"**{heading}**（{_t(verdict.get('decision')) or 'not_reviewed'} / {_t(verdict.get('source')) or 'critic'}）：{_t(verdict.get('why'))}")
             if _t(verdict.get("merge")):
                 lines.append(f"合并建议：{_t(verdict.get('merge'))}")
             lines.append("")

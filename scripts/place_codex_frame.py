@@ -6,11 +6,12 @@ Use this for 6.1 keyframes. Do not land shot frames in 02-assets.
 Every landing records where it came from: a sidecar `SH001.json` next to the
 jpg names the parent image it was edited from, the source file hash, and the
 previous version that was kept. A first frame defaults to the previous
-same-scene last frame (or that shot's first if there is no last). Parent locks
+same-setup verified video end, then a planned end/legacy still reference. Parent locks
 face and space, not a finished action: first-frame *content* follows this shot's
 `in_from` (t=0), not the parent's already-completed result. A scene
 `master.jpg` is refused when a locked previous same-scene frame exists, unless
-`--allow-master`. A last frame defaults to its own first frame.
+`--allow-master`. Both `end` and the legacy `last` slot are planned ends,
+defaulting to their own first frame. Neither slot is an extracted video end.
 """
 
 from __future__ import annotations
@@ -40,9 +41,11 @@ SHOT_ID = re.compile(r"^SH\d{3}$")
 SCENE_MASTER = re.compile(r"^02-assets/scenes/[^/]+/master\.jpg$")
 SLOTS = {
     "first": "{shot}.jpg",
+    "end": "{shot}-end.jpg",
     "last": "{shot}-last.jpg",
 }
-PARENT_ROOTS = ("02-assets/", "04-frames/")
+FRAME_ROLES = {"first": "planned_start", "end": "planned_end", "last": "planned_end"}
+PARENT_ROOTS = ("02-assets/", "04-frames/", "05-shots/")
 ASPECT_PIXELS = {
     "16:9": (1672, 941),
     "9:16": (941, 1672),
@@ -55,7 +58,11 @@ class AspectMismatchError(ValueError):
     """Source pixels are not the declared aspect and --crop was not given."""
 
 
-def episode_frame_dir(episode=1) -> str:
+def episode_frame_dir(episode=1, prod: Optional[Path] = None) -> str:
+    if prod is not None:
+        from director.context import context_for
+
+        return context_for(prod, episode).frame_dir()
     from director.pipeline import episode_frame_dir as _episode_frame_dir
 
     return _episode_frame_dir(episode)
@@ -71,13 +78,14 @@ def is_scene_master(rel: str) -> bool:
 
 
 def load_shot_table_rows(prod: Path, episode=1) -> list[dict]:
-    from director.pipeline import episode_artifact_name, episode_label, read_artifact
+    from director.context import context_for
+    from director.pipeline import episode_label
     from director.production import load_json
 
-    name = episode_artifact_name("shot_list.json", episode)
-    data = read_artifact(prod, name)
+    ctx = context_for(prod, episode)
+    data = ctx.read_artifact("shot_list.json", required=ctx.mode == "registered")
     shots = list(data.get("shots") or [])
-    if not shots:
+    if not shots and ctx.mode != "registered":
         label = episode_label(episode)
         rel = "03-storyboard/shot_list.json" if not label else f"03-storyboard/shot_list.{label}.json"
         shots = list(load_json(prod, rel, {}).get("shots") or [])
@@ -115,7 +123,7 @@ def previous_passing_first_frame(prod: Path, shot_id: str, episode=1) -> Optiona
     pid = _t(prev.get("shot_id") or prev.get("id"))
     if not SHOT_ID.match(pid):
         return None
-    first = dest_rel(pid, "first", episode)
+    first = dest_rel(pid, "first", episode, prod=prod)
     if not safe_under(prod, first).exists():
         return None
     if identity_gate_of(prod, first) == "pass":
@@ -124,12 +132,12 @@ def previous_passing_first_frame(prod: Path, shot_id: str, episode=1) -> Optiona
 
 
 def previous_same_scene_frame(prod: Path, shot_id: str, episode=1) -> Optional[str]:
-    """First-frame continuity parent: previous last if present, else passing first."""
+    """First-frame visual parent; a planned end is not actual video evidence."""
     return previous_same_scene_parent(prod, shot_id, episode)
 
 
 def previous_same_scene_parent(prod: Path, shot_id: str, episode=1) -> Optional[str]:
-    """Parent for this shot's first frame: same-setup previous `-last`, else passing first.
+    """Same-setup parent, preferring a verified generated end over planned stills.
 
     A new camera setup does not inherit the previous shot's composition.
     """
@@ -151,7 +159,7 @@ def parent_chain_errors(prod: Path, shots: Optional[list] = None, episode=1) -> 
         sid = _t(row.get("shot_id") or row.get("id"))
         if not SHOT_ID.match(sid):
             continue
-        meta = read_sidecar(prod, dest_rel(sid, "first", episode))
+        meta = read_sidecar(prod, dest_rel(sid, "first", episode, prod=prod))
         if not meta:
             continue
         parent = _t(meta.get("parent"))
@@ -161,11 +169,16 @@ def parent_chain_errors(prod: Path, shots: Optional[list] = None, episode=1) -> 
         pid = _t(prev.get("shot_id") or prev.get("id"))
         if not SHOT_ID.match(pid):
             continue
-        prev_first = dest_rel(pid, "first", episode)
+        prev_first = dest_rel(pid, "first", episode, prod=prod)
         if not safe_under(prod, prev_first).exists():
             continue
         gate = identity_gate_of(prod, prev_first)
-        parent_gate = identity_gate_of(prod, parent) if parent.startswith("04-frames/") else ""
+        parent_gate = identity_gate_of(prod, parent) if parent and not parent.startswith("02-assets/") else ""
+        if parent and not parent.startswith("02-assets/"):
+            parent_role = frame_role_info(prod, parent)
+            if parent_role["frame_role"] == "generated_end" and parent_role["provenance_status"] != "verified":
+                errors.append(f"{sid} parent {parent} generated_end provenance is stale")
+                continue
         if parent_gate in {"fail", "awaiting_user"}:
             errors.append(f"{sid} parent {parent} identity_gate={parent_gate}")
             continue
@@ -183,12 +196,12 @@ def parent_chain_errors(prod: Path, shots: Optional[list] = None, episode=1) -> 
     return errors
 
 
-def dest_rel(shot_id: str, slot: str, episode=1) -> str:
+def dest_rel(shot_id: str, slot: str, episode=1, prod: Optional[Path] = None) -> str:
     if not SHOT_ID.match(shot_id):
         raise ValueError("shot 必须是 SH001 这种编号")
     if slot not in SLOTS:
-        raise ValueError("slot 只能是 first 或 last")
-    return episode_frame_dir(episode) + "/" + SLOTS[slot].format(shot=shot_id)
+        raise ValueError("slot 只能是 first、end 或 legacy last")
+    return episode_frame_dir(episode, prod=prod) + "/" + SLOTS[slot].format(shot=shot_id)
 
 
 def frame_pixel_size(aspect: str = "16:9") -> tuple[int, int]:
@@ -236,7 +249,8 @@ def read_sidecar(prod: Path, rel: str) -> dict:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -249,6 +263,119 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def frame_role_info(prod: Path, rel: str) -> dict:
+    """Describe a frame without inferring its role from a `-last` filename.
+
+    A generated end is usable only while both the extracted image and its
+    source video match the recorded hashes. This is extraction provenance,
+    separate from the image's identity/content review.
+    """
+    meta = read_sidecar(prod, rel)
+    role = _t(meta.get("frame_role")) or "unknown"
+    info = {"frame_role": role, "provenance_status": "unknown", "legacy": not bool(meta.get("frame_role")), "warnings": []}
+    if role == "unknown":
+        info["warnings"].append(f"{rel}: frame_role=unknown (legacy); 文件名不能证明是视频实际尾帧")
+        return info
+    if role in {"planned_start", "planned_end"}:
+        info["provenance_status"] = "planned"
+        if role == "planned_end":
+            info["warnings"].append(f"{rel}: planned_end 是设计目标，只能作视觉参考，不能证明视频已到达 out_to")
+        if meta.get("legacy_slot"):
+            info["legacy"] = True
+            info["warnings"].append(f"{rel}: legacy --slot last；新设计尾帧请用 --slot end")
+        return info
+    if role != "generated_end":
+        info["provenance_status"] = "invalid"
+        info["warnings"].append(f"{rel}: 未知 frame_role={role}")
+        return info
+    extraction = meta.get("extraction") or {}
+    video_rel = _t(meta.get("source_video"))
+    try:
+        image = safe_under(prod, rel)
+        video = safe_under(prod, video_rel) if video_rel else None
+        valid = (
+            isinstance(extraction, dict)
+            and bool(_t(extraction.get("method")))
+            and extraction.get("position") == "video_end"
+            and bool(video_rel)
+            and video is not None and video.is_file()
+            and image.is_file()
+            and _t(meta.get("dest_sha256")) == _sha256(image)
+            and _t(meta.get("source_video_sha256")) == _sha256(video)
+        )
+    except (OSError, ValueError):
+        valid = False
+    info["source_video"] = video_rel
+    info["provenance_status"] = "verified" if valid else "stale"
+    if not valid:
+        info["warnings"].append(f"{rel}: generated_end 来源缺失或文件 hash 已变，不能用于实际尾帧连戏")
+    return info
+
+
+def record_generated_end(
+    prod: Path,
+    shot_id: str,
+    *,
+    frame_rel: str,
+    video_rel: str,
+    extraction_method: str,
+    offset_sec: Optional[float] = None,
+    identity_gate: Optional[str] = None,
+    episode=1,
+) -> dict:
+    """Record an end immediately after a renderer has extracted it from video.
+
+    This helper does not extract, move, or review media. Renderers must call it
+    after a successful extraction; Codex still placement cannot call this role.
+    New extracted ends live in the context's shot directory so planned stills stay intact.
+    """
+    if not SHOT_ID.match(shot_id):
+        raise ValueError("shot 必须是 SH001 这种编号")
+    frame_rel = _t(frame_rel).replace("\\", "/").lstrip("./")
+    video_rel = _t(video_rel).replace("\\", "/").lstrip("./")
+    from director.context import context_for
+
+    ctx = context_for(prod, episode)
+    if (frame_rel != f"{ctx.shot_dir()}/{shot_id}-last.jpg"
+            or video_rel != f"{ctx.shot_dir()}/{shot_id}.mp4"):
+        raise ValueError(f"实际尾帧和源视频必须放在当前版本 {ctx.shot_dir()}/；不能覆盖设计帧或其他版本")
+    frame = safe_under(prod, frame_rel)
+    video = safe_under(prod, video_rel)
+    if frame.name != f"{shot_id}-last.jpg" or video.name != f"{shot_id}.mp4" or frame.parent != video.parent:
+        raise ValueError("实际尾帧须为源视频同目录的 SHxxx-last.jpg，对应 SHxxx.mp4")
+    if not frame.is_file() or not video.is_file():
+        raise FileNotFoundError("实际尾帧或源视频不存在")
+    if not _t(extraction_method):
+        raise ValueError("必须记录实际抽帧方法 extraction_method")
+    meta = {
+        "shot": shot_id, "slot": "generated_end", "frame_role": "generated_end",
+        "dest": frame_rel, "dest_sha256": _sha256(frame),
+        "source_video": video_rel, "source_video_sha256": _sha256(video),
+        "extracted_at": int(time.time()), "tool": "video-extractor",
+        "context": ctx.to_dict(),
+        "extraction": {"method": _t(extraction_method), "position": "video_end"},
+        "identity_gate": normalize_review_state(identity_gate, default=default_place_state()),
+    }
+    if offset_sec is not None:
+        meta["extraction"]["offset_sec"] = float(offset_sec)
+    sidecar_path(frame).write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return frame_role_info(prod, frame_rel)
+
+
+def resolve_generated_end(prod: Path, shot_id: str, episode=1) -> Optional[str]:
+    """Approved, hash-bound video end only; legacy unknown is never called actual."""
+    from director.context import context_for
+
+    ctx = context_for(prod, episode)
+    expected_video = f"{ctx.shot_dir()}/{shot_id}.mp4"
+    for rel in (f"{ctx.shot_dir()}/{shot_id}-last.jpg", dest_rel(shot_id, "last", episode, prod=prod)):
+        info = frame_role_info(prod, rel)
+        if (info["frame_role"] == "generated_end" and info["provenance_status"] == "verified"
+                and info.get("source_video") == expected_video and can_use_as_parent(identity_gate_of(prod, rel))):
+            return rel
+    return None
+
+
 def resolve_parent(
     prod: Path,
     shot_id: str,
@@ -257,21 +384,30 @@ def resolve_parent(
     episode=1,
     allow_master: bool = False,
 ) -> str:
+    from director.context import context_for
+
+    ctx = context_for(prod, episode)
     rel = str(parent or "").strip().replace(chr(92), "/")
     if not rel:
-        if slot == "last":
-            rel = dest_rel(shot_id, "first", episode=episode)
+        if slot in {"end", "last"}:
+            rel = dest_rel(shot_id, "first", episode=episode, prod=prod)
         else:
             rel = previous_same_scene_parent(prod, shot_id, episode) or ""
             if not rel:
                 raise ValueError("首帧必须写 --parent：本场空镜 master.jpg 或上一镜已过闸尾帧/首帧。禁止对着空气文生")
     rel = rel.lstrip("./")
-    if not rel.startswith(PARENT_ROOTS):
-        raise ValueError("父图只能来自 02-assets/（空镜、护照）或 04-frames/（已锁帧）")
-    if rel.startswith("04-frames/"):
+    frame_prefix = ctx.frame_dir().rstrip("/") + "/"
+    shot_prefix = ctx.shot_dir().rstrip("/") + "/"
+    if not rel.startswith(("02-assets/", frame_prefix, shot_prefix)):
+        raise ValueError("父图只能来自 02-assets/、本版本设计帧目录或来源已核实的本版本视频尾帧")
+    if not rel.startswith("02-assets/"):
+        role = frame_role_info(prod, rel)
+        if rel.startswith(shot_prefix) or role["frame_role"] == "generated_end":
+            if role["frame_role"] != "generated_end" or role["provenance_status"] != "verified":
+                raise ValueError(f"父图 {rel} 不是来源已核实的 generated_end")
         gate = identity_gate_of(prod, rel) or "unknown"
-        own_first = dest_rel(shot_id, "first", episode=episode)
-        if slot == "last" and rel == own_first:
+        own_first = dest_rel(shot_id, "first", episode=episode, prod=prod)
+        if slot in {"end", "last"} and rel == own_first:
             if gate in {"fail", "awaiting_user"}:
                 raise ValueError(f"父图 {rel} identity_gate={gate}，不能续。改用本场空镜 --allow-master")
         elif not can_use_as_parent(gate):
@@ -283,7 +419,7 @@ def resolve_parent(
     path = safe_under(prod, rel)
     if not path.exists():
         raise FileNotFoundError(f"父图不存在：{rel}")
-    if path.resolve() == safe_under(prod, dest_rel(shot_id, slot, episode=episode)).resolve():
+    if path.resolve() == safe_under(prod, dest_rel(shot_id, slot, episode=episode, prod=prod)).resolve():
         raise ValueError("父图不能是自己")
     return rel
 
@@ -303,9 +439,10 @@ def place(
     aspect: Optional[str] = None,
     crop: bool = False,
 ) -> dict:
-    rel = dest_rel(shot_id, slot, episode=episode)
+    rel = dest_rel(shot_id, slot, episode=episode, prod=prod)
     prod = prod.resolve()
     parent_rel = resolve_parent(prod, shot_id, slot, parent, episode=episode, allow_master=allow_master)
+    parent_info = frame_role_info(prod, parent_rel) if not parent_rel.startswith("02-assets/") else {}
     dest = safe_under(prod, rel)
     previous = None
     if dest.exists() and not replace:
@@ -324,8 +461,13 @@ def place(
     meta = {
         "shot": shot_id,
         "slot": slot,
+        "frame_role": FRAME_ROLES[slot],
+        "legacy_slot": slot == "last",
         "dest": rel,
         "parent": parent_rel,
+        "parent_sha256": _sha256(safe_under(prod, parent_rel)),
+        "parent_frame_role": parent_info.get("frame_role", "asset"),
+        "parent_provenance_status": parent_info.get("provenance_status", "asset"),
         "src": src.name,
         "src_sha256": src_hash,
         "dest_sha256": dest_hash,
@@ -338,11 +480,18 @@ def place(
     }
     if evidence:
         meta["checks"] = evidence
+    warnings = list(parent_info.get("warnings") or [])
+    if slot == "last":
+        warnings.append("--slot last 仍是 planned_end；推荐 --slot end，不能当作 generated_end")
+    if warnings:
+        meta["warnings"] = warnings
     sidecar_path(dest).write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {
         "ok": True,
         "dest": rel,
         "parent": parent_rel,
+        "frame_role": FRAME_ROLES[slot],
+        "warnings": warnings,
         "previous": previous_rel,
         "sidecar": str(sidecar_path(dest).relative_to(prod)),
         "bytes": dest.stat().st_size,
@@ -355,7 +504,7 @@ def main() -> int:
     parser.add_argument("--shot", required=True, help="SH001")
     parser.add_argument("--slot", required=True, choices=sorted(SLOTS))
     parser.add_argument("--src", required=True)
-    parser.add_argument("--parent", default="", help="首帧默认同场上一镜 -last（没有则过闸首帧）；空镜 master 只许场第一镜或 --allow-master。尾帧默认本镜首帧")
+    parser.add_argument("--parent", default="", help="首帧优先同机位已核实实际尾，其次设计尾/过闸首帧作参考。end/legacy last 是设计尾，默认本镜首帧")
     parser.add_argument(
         "--episode",
         default="1",
@@ -400,6 +549,8 @@ def main() -> int:
     print(f"wrote {prod / result['dest']}  (parent {result['parent']})")
     if result["previous"]:
         print(f"kept {prod / result['previous']}")
+    for warning in result["warnings"]:
+        print(f"warn: {warning}")
     return 0
 
 

@@ -79,11 +79,14 @@ def shot_spec(prod: Path, shot: dict, shots: list[dict]) -> dict:
 
 
 def _pipeline_specs(prod: Path, shot_ids: Optional[list[str]], episode: Any = 1) -> list[dict]:
+    from .revisions import resolve_binding
+
+    binding = resolve_binding(prod, episode)
     selected = _selected(prod, shot_ids, episode)
-    packages = read_artifact(prod, episode_artifact_name("gen_packages.json", episode))
+    packages = binding.read_artifact("gen_packages.json")
     frames = {
         item.get("shot_id"): item
-        for item in (read_artifact(prod, episode_artifact_name("keyframes.json", episode)).get("keyframes") or [])
+        for item in (binding.read_artifact("keyframes.json").get("keyframes") or binding.read_artifact("keyframes.json").get("frames") or [])
         if item.get("shot_id")
     }
     by_id = {item.get("shot_id"): item for item in (packages.get("packages") or packages.get("gen_packages") or [])}
@@ -100,7 +103,7 @@ def _pipeline_specs(prod: Path, shot_ids: Optional[list[str]], episode: Any = 1)
             "id": sid,
             "vendor_request": request.to_dict(),
             "fingerprint": request.fingerprint(),
-            "dest": f"{episode_shot_dir(episode)}/{sid}.mp4",
+            "dest": f"{binding.shots_dir}/{sid}.mp4",
         })
     return specs
 
@@ -287,7 +290,12 @@ def snapshot_requests(data: dict) -> list[VendorRequest]:
 
 def require_task_inputs(prod: Path, selected: list[dict], episode: Any = 1) -> None:
     """Gate inputs by task_kind. Extend/edit/reference do not invent a first frame."""
-    from .pipeline import episode_artifact_name, episode_frame_dir, read_artifact, uses_pipeline
+    from .pipeline import assert_keyframes_passed, assert_packages_confirmed, episode_frame_dir, uses_pipeline
+    from .revisions import resolve_binding
+
+    binding = resolve_binding(prod, episode)
+    if not selected:
+        raise PermissionError("no selected shots")
 
     if not uses_pipeline(prod):
         shots = _shots(prod, episode)
@@ -299,23 +307,28 @@ def require_task_inputs(prod: Path, selected: list[dict], episode: Any = 1) -> N
             if not source["exists"]:
                 raise PermissionError(f"{shot['id']} 缺 I2V 源：{source['reason']}")
         return
-    pkg_data = read_artifact(prod, episode_artifact_name("gen_packages.json", episode))
+    ids = [str(shot["id"]) for shot in selected]
+    assert_packages_confirmed(prod, episode, selected_shot_ids=ids)
+    assert_keyframes_passed(prod, episode, selected_shot_ids=ids)
+    pkg_data = binding.read_artifact("gen_packages.json")
     packages = {
         item.get("shot_id"): item
         for item in (pkg_data.get("packages") or pkg_data.get("gen_packages") or [])
     }
     frames = {
         item.get("shot_id"): item
-        for item in (read_artifact(prod, episode_artifact_name("keyframes.json", episode)).get("keyframes") or [])
+        for item in (binding.read_artifact("keyframes.json").get("keyframes") or binding.read_artifact("keyframes.json").get("frames") or [])
         if item.get("shot_id")
     }
     for shot in selected:
         sid = shot["id"]
-        pkg = packages.get(sid) or {}
+        pkg = packages.get(sid)
+        if not pkg:
+            raise PermissionError(f"{sid} missing generation package")
         kf = frames.get(sid) or {}
         kind = task_kind_for_gen_mode(str(pkg.get("gen_mode") or "i2v_first"))
         if task_needs_first_frame(kind):
-            rel = str(shot.get("frame") or kf.get("first_frame_file") or pkg.get("first_frame") or f"{episode_frame_dir(episode)}/{sid}.jpg")
+            rel = str(kf.get("first_frame_file") or pkg.get("first_frame") or shot.get("frame") or f"{binding.frames_dir}/{sid}.jpg")
             if not (Path(prod) / rel).exists():
                 raise PermissionError(f"{sid} 还没有锁定首帧")
         if task_needs_last_frame(kind):
@@ -336,16 +349,30 @@ def require_task_inputs(prod: Path, selected: list[dict], episode: Any = 1) -> N
 
 
 def fingerprint_for(prod: Path, shot_ids: Optional[list[str]] = None, episode: Any = 1) -> tuple[str, list[dict]]:
-    if uses_pipeline(prod):
-        specs = _pipeline_specs(prod, shot_ids, episode)
-    else:
-        shots = _shots(prod, episode)
-        selected = _selected(prod, shot_ids, episode)
-        specs = [shot_spec(prod, shot, shots) for shot in selected]
-    return snapshot_content_fingerprint(_batch_from_specs(episode, specs)), specs
+    from .context import context_for, using_context
+
+    ctx = context_for(prod, episode)
+    episode = ctx.episode_token
+    with using_context(ctx):
+        if uses_pipeline(prod):
+            specs = _pipeline_specs(prod, shot_ids, episode)
+        else:
+            shots = _shots(prod, episode)
+            selected = _selected(prod, shot_ids, episode)
+            specs = [shot_spec(prod, shot, shots) for shot in selected]
+        return snapshot_content_fingerprint(_batch_from_specs(episode, specs)), specs
 
 
-def prepare_render(
+def prepare_render(prod: Path, shot_ids: Optional[list[str]] = None, review_track: bool = False,
+                   episode: Any = 1, revision_id: str = "") -> dict:
+    from .context import context_for, using_context
+
+    ctx = context_for(prod, episode, revision_id)
+    with using_context(ctx):
+        return _prepare_render(prod, shot_ids, review_track, ctx.episode_token)
+
+
+def _prepare_render(
     prod: Path,
     shot_ids: Optional[list[str]] = None,
     review_track: bool = False,
@@ -353,14 +380,15 @@ def prepare_render(
 ) -> dict:
     require_fresh_gate(prod, "C")
     from .pipeline import assert_keyframes_passed, assert_packages_confirmed, uses_pipeline
+    selected = _selected(prod, shot_ids, episode)
+    ids = [shot["id"] for shot in selected]
     if uses_pipeline(prod):
         require_fresh_gate(prod, "C2")
-        assert_packages_confirmed(prod, episode)
-        assert_keyframes_passed(prod, episode)
-    check = run_check(prod)
+        assert_packages_confirmed(prod, episode, selected_shot_ids=ids)
+        assert_keyframes_passed(prod, episode, selected_shot_ids=ids)
+    check = run_check(prod, episode=episode)
     if not check["ok"]:
         raise PermissionError(check["stderr"] or check["stdout"] or "check_prod 未过，不能出视频")
-    selected = _selected(prod, shot_ids, episode)
     require_task_inputs(prod, selected, episode)
     fingerprint, specs = fingerprint_for(prod, [shot["id"] for shot in selected], episode)
     batch = _batch_from_specs(episode, specs)
@@ -395,7 +423,16 @@ def prepare_render(
     }
 
 
-def consume_render_fingerprint(
+def consume_render_fingerprint(prod: Path, fingerprint: Optional[str], shot_ids: Optional[list[str]] = None,
+                               review_track: bool = False, episode: Any = 1) -> dict:
+    from .context import context_for, using_context
+
+    ctx = context_for(prod, episode)
+    with using_context(ctx):
+        return _consume_render_fingerprint(prod, fingerprint, shot_ids, review_track, ctx.episode_token)
+
+
+def _consume_render_fingerprint(
     prod: Path,
     fingerprint: Optional[str],
     shot_ids: Optional[list[str]] = None,
@@ -404,6 +441,9 @@ def consume_render_fingerprint(
 ) -> dict:
     if not fingerprint:
         raise PermissionError("出片需要先 prepare 并确认指纹")
+    selected = _selected(prod, shot_ids, episode)
+    # Review records can change without changing the vendor request fingerprint.
+    require_task_inputs(prod, selected, episode)
     with exclusive_state_lock(prod, "approvals"):
         live, _specs = fingerprint_for(prod, shot_ids, episode)
         if live != fingerprint:
@@ -414,7 +454,9 @@ def consume_render_fingerprint(
             raise PermissionError("没有这份出片确认，请先 prepare")
         if rec.get("consumed"):
             raise PermissionError("这份确认已用过，失败重试必须重新 prepare")
-        want = [shot["id"] for shot in _selected(prod, shot_ids, episode)]
+        if bool(rec.get("review_track")) != bool(review_track):
+            raise PermissionError("确认的审片/正式任务范围和这次派出的不一致")
+        want = [shot["id"] for shot in selected]
         if rec.get("shot_ids") != want:
             raise PermissionError("确认的镜头和这次派出的不一致")
         rec["consumed"] = True

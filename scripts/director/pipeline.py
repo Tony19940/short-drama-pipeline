@@ -55,9 +55,13 @@ def pipeline_dir(prod: Path, create: bool = False) -> Path:
     return path
 
 def artifact_path(prod: Path, name: str) -> Path:
-    if "/" in name or "\\" in name or ".." in name:
+    if Path(name).is_absolute() or "\\" in name or ".." in Path(name).parts:
         raise ValueError("bad pipeline file: " + name)
-    return pipeline_dir(prod) / name
+    from .paths import safe_under
+    from .revisions import routed_artifact_path
+
+    routed = routed_artifact_path(prod, name) if "/" not in name else None
+    return routed.resolve() if routed is not None else safe_under(prod, f"{PIPELINE}/{name}")
 
 def uses_pipeline(prod: Path) -> bool:
     folder = pipeline_dir(prod)
@@ -79,7 +83,7 @@ def write_artifact(prod: Path, name: str, data: dict) -> dict:
     payload.setdefault("agent", Path(name).stem)
     payload.setdefault("version", payload.get("version") or 1)
     payload.setdefault("status", payload.get("status") or "draft")
-    save_json(prod, f"{PIPELINE}/{name}", payload)
+    save_json(prod, artifact_path(prod, name).relative_to(Path(prod).resolve()).as_posix(), payload)
     return payload
 
 def _text(value: Any) -> str:
@@ -140,7 +144,7 @@ def validate_writer(data: dict) -> list[str]:
             errors.append(f"{sid} action has camera language")
         if scene.get("unfilmable_check") == "fail":
             errors.append(f"{sid} unfilmable_check=fail")
-        if scene.get("mute_test") != "pass":
+        if scene.get("mute_test") == "fail" or (data.get("status") == "locked" and scene.get("mute_test") != "pass"):
             errors.append(f"{sid} mute_test not pass")
         if scene.get("preach_check") == "fail":
             errors.append(f"{sid} preach_check=fail")
@@ -257,11 +261,83 @@ def validate_shot_specs(data: dict, writer: Optional[dict] = None) -> list[str]:
             errors.append(f"{sid} duration_sec invalid")
     return errors
 
-def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional[dict] = None, prod: Optional[Path] = None) -> list[str]:
+def _shot_coverage_errors(rows: list[dict], expected: Optional[list[str]], label: str) -> list[str]:
+    """Reject duplicate/unknown rows and prove coverage of the requested shot set."""
+    errors: list[str] = []
+    ids = [_text(row.get("shot_id") or row.get("id")) for row in rows]
+    seen: set[str] = set()
+    for sid in ids:
+        if not sid:
+            errors.append(f"{label} row missing shot_id")
+        elif sid in seen:
+            errors.append(f"{label} duplicate shot_id: {sid}")
+        seen.add(sid)
+    if expected is not None:
+        want = set(expected)
+        missing = sorted(want - set(ids))
+        extra = sorted(set(ids) - want - {""})
+        if missing:
+            errors.append(f"{label} missing shots: " + ", ".join(missing))
+        if extra:
+            errors.append(f"{label} unknown shots: " + ", ".join(extra))
+    return errors
+
+
+def _review_media_errors(
+    prod: Optional[Path], item: dict, files: dict[str, str], *, required: bool = False,
+    reviewer: str = "",
+) -> list[str]:
+    """A review applies to these exact bytes; old unbound reviews are legacy only."""
+    from .vendor_request import sha256_file
+
+    errors: list[str] = []
+    sid = _text(item.get("shot_id") or item.get("id")) or "?"
+    review = item.get("review") if isinstance(item.get("review"), dict) else {}
+    qc = item.get("qc") if isinstance(item.get("qc"), dict) else {}
+    if required and item.get("review") and not isinstance(item.get("review"), dict):
+        errors.append(f"{sid} media review pending/invalid: structured review evidence required")
+    signer = _text(review.get("reviewed_by") or review.get("reviewer") or qc.get("reviewed_by") or reviewer)
+    if required and not signer:
+        errors.append(f"{sid} media review needs reviewed_by")
+    maps = [obj.get("media_hashes") for obj in (review, qc, item) if isinstance(obj.get("media_hashes"), dict)]
+    for slot, rel in files.items():
+        if not rel:
+            continue
+        digest = next((_text(hashes.get(rel) or hashes.get(slot)) for hashes in maps if hashes.get(rel) or hashes.get(slot)), "")
+        keys = (f"{slot}_sha256",)
+        if slot == "video":
+            keys += ("media_hash",)
+        elif slot == "first_frame":
+            keys += ("image_sha256",)
+        if not digest:
+            digest = next((_text(obj.get(key)) for obj in (review, qc, item) for key in keys if obj.get(key)), "")
+        if required and not digest:
+            errors.append(f"{sid} {slot} review is not bound to current media hash")
+        if prod is None:
+            continue
+        root = Path(prod).resolve()
+        path = (root / rel).resolve()
+        if Path(rel).is_absolute() or not path.is_relative_to(root):
+            errors.append(f"{sid} {slot} file must be inside production: {rel}")
+        elif not path.is_file():
+            errors.append(f"{sid} frame file missing on disk: {rel}" if slot != "video" else f"{sid} video file missing on disk: {rel}")
+        elif digest and digest != sha256_file(path):
+            errors.append(f"{sid} {slot} review media hash is stale: {rel}")
+    return errors
+
+
+def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional[dict] = None, prod: Optional[Path] = None, *, expected_shot_ids: Optional[list[str]] = None) -> list[str]:
     errors = []
+    if not isinstance(data, dict):
+        return ["packages artifact must be an object"]
     packages = data.get("packages") or data.get("gen_packages") or []
+    if not isinstance(packages, list) or any(not isinstance(row, dict) for row in packages):
+        return ["packages must contain shot objects"]
     if not packages:
         errors.append("packages empty")
+    if expected_shot_ids is None and specs:
+        expected_shot_ids = [_text(row.get("shot_id") or row.get("id")) for row in (specs.get("shot_specs") or specs.get("specs") or [])]
+    errors.extend(_shot_coverage_errors(packages, expected_shot_ids, "packages"))
     known = {_text(item.get("asset_id")) for item in (assets or {}).get("assets") or [] if item.get("asset_id")}
     spec_lines = {_text(item.get("shot_id") or item.get("id")): _text(item.get("dialogue_line")) for item in (specs or {}).get("shot_specs") or (specs or {}).get("specs") or []}
     episode_model = _text(data.get("episode_target_model") or (packages[0].get("episode_target_model") if packages else ""))
@@ -283,7 +359,7 @@ def validate_packages(data: dict, assets: Optional[dict] = None, specs: Optional
             errors.append(f"{sid} missing image_prompt")
         if not _text(pkg.get("motion_prompt")):
             errors.append(f"{sid} missing motion_prompt")
-        if pkg.get("confirmed") not in {True, False}:
+        if not isinstance(pkg.get("confirmed"), bool):
             errors.append(f"{sid} missing confirmed")
         model = _text(pkg.get("target_model"))
         lang = _text(pkg.get("prompt_language"))
@@ -317,12 +393,12 @@ def packages_confirmed(data: dict) -> bool:
     packages = data.get("packages") or data.get("gen_packages") or []
     if not packages:
         return False
-    return all(bool(item.get("confirmed")) for item in packages)
+    return all(item.get("confirmed") is True for item in packages)
 
 KEYFRAME_QC_KEYS = ("status", "face", "costume", "location", "left_right", "composition", "aspect_ratio", "light_matches_spec", "state_match")
 KEYFRAME_TIGHT_QC_KEYS = ("plastic_face", "anatomy")
 KEYFRAME_QC_VALUES = {"pass", "fail", "n/a"}
-KEYFRAME_QC_TEXT_KEYS = {"status", "notes", "waived_by"}
+KEYFRAME_QC_TEXT_KEYS = {"status", "notes", "waived_by", "reviewed_by", "reviewer", "media_hashes", "image_sha256", "first_frame_sha256", "last_frame_sha256", "media_hash", "layers", "required_layers"}
 
 
 def keyframe_context(prod: Path, episode: int = 1) -> dict:
@@ -342,21 +418,32 @@ def validate_keyframes(
     specs: Optional[dict] = None,
     table: Optional[dict] = None,
     prod: Optional[Path] = None,
+    expected_shot_ids: Optional[list[str]] = None,
+    require_media_binding: bool = False,
 ) -> list[str]:
     """6.1 gate. A nit is a fail unless a named human waives it; a first_last plan needs its last frame;
     tight shots need plastic_face and anatomy; every frame must match the shot state; a human signs the file."""
     from .shot_table import TIGHT_SCALES
 
     errors = []
+    if not isinstance(data, dict):
+        return ["keyframes artifact must be an object"]
     frames = data.get("keyframes") or data.get("frames") or []
+    if not isinstance(frames, list) or any(not isinstance(row, dict) for row in frames):
+        return ["keyframes must contain shot objects"]
     if not frames:
         errors.append("keyframes empty")
         return errors
+    if expected_shot_ids is None:
+        source = (table or {}).get("shots") or (packages or {}).get("packages") or (packages or {}).get("gen_packages") or []
+        expected_shot_ids = [_text(row.get("shot_id") or row.get("id")) for row in source] if source else None
+    errors.extend(_shot_coverage_errors(frames, expected_shot_ids, "keyframes"))
     if not _text(data.get("reviewed_by")):
         errors.append("keyframes need reviewed_by: a human name, not an agent")
     pkg_rows = (packages or {}).get("packages") or (packages or {}).get("gen_packages") or []
     plans = {_text(p.get("shot_id")): _text(p.get("keyframe_plan")) for p in pkg_rows}
     gen_modes = {_text(p.get("shot_id")): _text(p.get("gen_mode")) for p in pkg_rows}
+    pkg_by_id = {_text(p.get("shot_id")): p for p in pkg_rows}
     tight: set[str] = set()
     for shot in (table or {}).get("shots") or []:
         sid = _text(shot.get("shot_id"))
@@ -367,7 +454,9 @@ def validate_keyframes(
             tight.add(_text(spec.get("shot_id")))
     for item in frames:
         sid = _text(item.get("shot_id")) or "?"
-        qc = item.get("qc") or {}
+        qc = item.get("qc") if isinstance(item.get("qc"), dict) else {}
+        if item.get("qc") and not isinstance(item.get("qc"), dict):
+            errors.append(f"{sid} keyframe qc must be an object")
         first = _text(item.get("first_frame_file"))
         last = _text(item.get("last_frame_file"))
         needs_first = gen_modes.get(sid, "i2v_first") not in {"r2v", "video_extend", "edit"}
@@ -395,28 +484,54 @@ def validate_keyframes(
             errors.append(f"{sid} has fail items ({', '.join(failed_items)}) but status pass")
         if _text(qc.get("notes")) and qc.get("status") == "pass" and not _text(qc.get("waived_by")):
             errors.append(f"{sid} passes with notes but no waived_by; a nit is a fail unless a human waives it")
-        if prod is not None:
-            for rel in (first, last):
-                if rel and not (Path(prod) / rel).exists():
-                    errors.append(f"{sid} frame file missing on disk: {rel}")
+        media_files = {"first_frame": first, "last_frame": last}
+        pkg = pkg_by_id.get(sid) or {}
+        if gen_modes.get(sid) == "r2v":
+            media_files.update({f"reference_{idx}": _text(rel) for idx, rel in enumerate(pkg.get("refs") or [])})
+        if gen_modes.get(sid) in {"video_extend", "edit"}:
+            media_files["source_video"] = _text(pkg.get("source_video") or pkg.get("reference_video") or item.get("source_video"))
+        errors.extend(_review_media_errors(prod, item, media_files, required=require_media_binding, reviewer=_text(data.get("reviewed_by"))))
         if qc.get("status") != "pass":
             errors.append(f"{sid} keyframe not passed")
     return errors
 
-def validate_clips(data: dict) -> list[str]:
+def validate_clips(data: dict, *, prod: Optional[Path] = None, expected_shot_ids: Optional[list[str]] = None, require_media_binding: bool = False) -> list[str]:
     errors = []
+    if not isinstance(data, dict):
+        return ["clips artifact must be an object"]
     clips = data.get("clips") or []
+    if not isinstance(clips, list) or any(not isinstance(row, dict) for row in clips):
+        return ["clips must contain shot objects"]
     if not clips:
         errors.append("clips empty")
+    errors.extend(_shot_coverage_errors(clips, expected_shot_ids, "clips"))
     for item in clips:
         sid = item.get("shot_id") or "?"
-        qc = item.get("qc") or {}
+        qc = item.get("qc") if isinstance(item.get("qc"), dict) else {}
+        if item.get("qc") and not isinstance(item.get("qc"), dict):
+            errors.append(f"{sid} clip qc must be an object")
         if not _text(item.get("video_file")):
             errors.append(f"{sid} missing video_file")
         if qc.get("status") != "pass":
             errors.append(f"{sid} clip not passed")
-        attempts = int(item.get("attempt_no") or 0)
-        budget = int((item.get("generation_budget") or {}).get("max_attempts") or 8)
+        errors.extend(_review_media_errors(prod, item, {"video": _text(item.get("video_file"))}, required=require_media_binding, reviewer=_text(data.get("reviewed_by"))))
+        layers = item.get("layers") or qc.get("layers") or {}
+        if layers or require_media_binding:
+            from .qc_layers import layers_allow_auto_pass
+
+            required_layers = item.get("required_layers") or qc.get("required_layers") or ["technical", "visual"]
+            if not isinstance(required_layers, list) or any(not isinstance(layer, str) for layer in required_layers) or not layers_allow_auto_pass(layers, required_layers=required_layers):
+                errors.append(f"{sid} clip required QC layers not passed")
+        generation_budget = item.get("generation_budget") or {}
+        if not isinstance(generation_budget, dict):
+            errors.append(f"{sid} generation_budget must be an object")
+            generation_budget = {}
+        try:
+            attempts = int(item.get("attempt_no") or 0)
+            budget = int(generation_budget.get("max_attempts") or 8)
+        except (TypeError, ValueError):
+            errors.append(f"{sid} invalid attempt budget")
+            continue
         if attempts >= budget and qc.get("status") != "pass":
             errors.append(f"{sid} hit max_attempts; send back to design")
     return errors
@@ -437,7 +552,7 @@ def validate_audio(data: dict, writer: Optional[dict] = None, prod: Optional[Pat
 
 def validate_cut(data: dict) -> list[str]:
     errors = []
-    if not (data.get("timeline") or []):
+    if not (data.get("timeline") or data.get("cuts") or []):
         errors.append("cut missing timeline")
     if "dropped_shot_ids" not in data:
         errors.append("cut missing dropped_shot_ids")
@@ -500,9 +615,9 @@ def compile_shot_list_from_legacy(prod: Path) -> dict:
         "left_right_lock": "inherit blocking",
         "whose_pov": "",
         "continuity_bible": {"source": "legacy-shots.json"},
-        "visible_change_without_dialogue": "pass",
+        "visible_change_without_dialogue": "not_reviewed",
         "dropped_shots": [],
-        "design_steps_done": [1, 2, 3, 4, 5, 6, 7],
+        "design_steps_done": [],
         "status": "draft",
         "origin": "legacy-shots",
     }
@@ -1421,30 +1536,88 @@ def confirm_packages(prod: Path, confirmed: bool = True) -> dict:
     data["status"] = "ready" if confirmed else "draft"
     return write_artifact(prod, "gen_packages.json", data)
 
-def assert_packages_confirmed(prod: Path, episode: Any = 1) -> None:
-    if not uses_pipeline(prod):
-        return
-    data = read_artifact(prod, episode_artifact_name("gen_packages.json", episode))
+def _quality_scope(prod: Path, episode: Any, selected_shot_ids: Optional[list[str]]):
+    """Resolve the revision and scope before looking at any approval records."""
+    from .revisions import resolve_binding
+
+    binding = resolve_binding(prod, episode)
+    table = binding.read_artifact("shot_list.json")
+    known = [_text(row.get("shot_id") or row.get("id")) for row in (table.get("shots") or [])]
+    if binding.mode == "registered" and not known:
+        raise PermissionError("registered revision missing shot_list.json")
+    if known:
+        raise_if(_shot_coverage_errors(table.get("shots") or [], None, "shot_list"))
+    if selected_shot_ids is not None:
+        wanted = [_text(sid) for sid in selected_shot_ids]
+        if not wanted or any(not sid for sid in wanted) or len(wanted) != len(set(wanted)):
+            raise PermissionError("selected_shot_ids must be a nonempty unique shot set")
+        if known and set(wanted) - set(known):
+            raise PermissionError("selected shots are not in the current shot_list: " + ", ".join(sorted(set(wanted) - set(known))))
+    else:
+        wanted = known or None
+    return binding, table, wanted
+
+
+def _quality_rows(data: dict, keys: tuple[str, ...], wanted: Optional[list[str]]) -> dict:
+    rows = next((data.get(key) for key in keys if data.get(key)), [])
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise PermissionError(f"{keys[0]} must contain shot objects")
+    if wanted is not None:
+        rows = [row for row in rows if _text(row.get("shot_id") or row.get("id")) in set(wanted)]
+    return {**data, **{key: rows for key in keys}}
+
+
+def _quality_known_rows(data: dict, keys: tuple[str, ...], table: dict) -> None:
+    """Rows outside this revision are invalid, even when only one shot is dispatched."""
+    rows = next((data.get(key) for key in keys if data.get(key)), [])
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise PermissionError(f"{keys[0]} must contain shot objects")
+    raise_if(_shot_coverage_errors(rows, None, keys[0]))
+    known = {_text(row.get("shot_id") or row.get("id")) for row in table.get("shots") or []}
+    extra = {_text(row.get("shot_id") or row.get("id")) for row in rows} - known if known else set()
+    if extra:
+        raise PermissionError(f"{keys[0]} unknown shots: " + ", ".join(sorted(extra)))
+
+
+def assert_packages_confirmed(prod: Path, episode: Any = 1, selected_shot_ids: Optional[list[str]] = None) -> None:
+    """Formal generation requires present, valid, confirmed packages covering its shots."""
+    binding, table, wanted = _quality_scope(prod, episode, selected_shot_ids)
+    data = binding.read_artifact("gen_packages.json")
     if not data:
-        return
+        raise PermissionError("missing gen_packages.json; formal generation needs confirmed packages")
+    _quality_known_rows(data, ("packages", "gen_packages"), table)
+    data = _quality_rows(data, ("packages", "gen_packages"), wanted)
+    specs = binding.read_artifact("shot_specs.json")
+    if wanted is not None:
+        specs = _quality_rows(specs, ("shot_specs", "specs"), wanted)
+    raise_if(validate_packages(data, read_artifact(prod, "assets.json"), specs, prod=prod, expected_shot_ids=wanted))
     if not packages_confirmed(data):
         raise PermissionError("packages not confirmed")
 
-def assert_keyframes_passed(prod: Path, episode: Any = 1) -> None:
-    if not uses_pipeline(prod):
-        return
-    data = read_artifact(prod, episode_artifact_name("keyframes.json", episode))
-    if not data:
-        return
-    raise_if(validate_keyframes(data, **keyframe_context(prod, episode)))
 
-def assert_clips_passed(prod: Path, episode: Any = 1) -> None:
-    if not uses_pipeline(prod):
-        return
-    data = read_artifact(prod, episode_artifact_name("clips.json", episode))
+def assert_keyframes_passed(prod: Path, episode: Any = 1, selected_shot_ids: Optional[list[str]] = None) -> None:
+    """Formal generation requires scoped QC; registered revisions bind reviewed bytes."""
+    binding, table, wanted = _quality_scope(prod, episode, selected_shot_ids)
+    data = binding.read_artifact("keyframes.json")
     if not data:
-        return
-    raise_if(validate_clips(data))
+        raise PermissionError("missing keyframes.json; formal generation needs reviewed inputs")
+    _quality_known_rows(data, ("keyframes", "frames"), table)
+    data = _quality_rows(data, ("keyframes", "frames"), wanted)
+    raise_if(validate_keyframes(
+        data, packages=binding.read_artifact("gen_packages.json"), specs=binding.read_artifact("shot_specs.json"),
+        table=table, prod=prod, expected_shot_ids=wanted, require_media_binding=binding.mode == "registered",
+    ))
+
+
+def assert_clips_passed(prod: Path, episode: Any = 1, selected_shot_ids: Optional[list[str]] = None) -> None:
+    """Formal editing requires present scoped clips and reviews of the current media."""
+    binding, table, wanted = _quality_scope(prod, episode, selected_shot_ids)
+    data = binding.read_artifact("clips.json")
+    if not data:
+        raise PermissionError("missing clips.json; formal editing needs clip reviews")
+    _quality_known_rows(data, ("clips",), table)
+    data = _quality_rows(data, ("clips",), wanted)
+    raise_if(validate_clips(data, prod=prod, expected_shot_ids=wanted, require_media_binding=binding.mode == "registered"))
 
 def record_ticket(prod: Path, ticket: dict) -> dict:
     data = read_artifact(prod, "tickets.json", {"tickets": []})
@@ -1520,8 +1693,8 @@ def default_cut_from_specs(prod: Path, shot_ids: list[str], episode: Any = 1) ->
         "timeline": timeline,
         "dropped_shot_ids": [],
         "final_file": episode_export_rel(episode),
-        "hook_landed": True,
-        "cliffhanger_landed": True,
+        "hook_landed": "not_reviewed",
+        "cliffhanger_landed": "not_reviewed",
         "status": "draft",
     }
 

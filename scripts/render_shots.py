@@ -97,6 +97,9 @@ def main() -> None:
     args = p.parse_args()
 
     prod = Path(args.prod).resolve()
+    from director.revisions import load_registry
+    if load_registry(prod) is not None:
+        raise SystemExit("registered revision：请用 render_seedance_packages.py 的审核/确认快照入口，旧 shots.json 渲染入口已停用")
     if args.assemble_only:
         assemble(prod)
         return

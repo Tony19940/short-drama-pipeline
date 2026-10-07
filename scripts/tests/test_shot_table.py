@@ -145,7 +145,8 @@ class ShotTableRules(unittest.TestCase):
     def test_good_table_passes(self) -> None:
         errors, warnings = self.check(table(good_shots()))
         self.assertEqual(errors, [], errors)
-        self.assertEqual([w for w in warnings if "no per-shot state" not in w], [])
+        self.assertEqual([w for w in warnings if "no per-shot state" not in w and "legacy pass" not in w], [])
+        self.assertTrue(any("legacy pass" in w for w in warnings))
 
     def test_sanitize_keeps_camera_id(self) -> None:
         shots = good_shots()
@@ -429,7 +430,7 @@ class ShotTableRules(unittest.TestCase):
         self.assertFalse(any("needs about" in e and "SH001" in e for e in errors), errors)
         self.assertTrue(any("below model min" in w and "SH001" in w for w in warnings), warnings)
 
-    def test_compound_action_must_split_except_must_hold(self) -> None:
+    def test_compound_action_is_advisory_except_must_hold(self) -> None:
         self.assertTrue(has_compound_action({"one_action": "琳捡起钥匙再推车走向尽头"}))
         self.assertFalse(has_compound_action({"one_action": "女工肩穿进白衬衫再穿出"}))
         self.assertFalse(has_compound_action({"one_action": "琳把清洁车卡住旧门槛再推进去"}))
@@ -437,8 +438,9 @@ class ShotTableRules(unittest.TestCase):
         shots[0]["one_action"] = "春安扔钥匙并且转身走"
         data = table(shots)
         data["status"] = "draft"
-        errors, _ = self.check(data)
-        self.assertTrue(any("two verbs" in e for e in errors), errors)
+        errors, warnings = self.check(data)
+        self.assertFalse(any("two verbs" in e for e in errors), errors)
+        self.assertTrue(any("two verbs" in w for w in warnings), warnings)
         data["locked_picture"] = True
         errors, warnings = self.check(data)
         self.assertFalse(any("two verbs" in e for e in errors), errors)
@@ -450,8 +452,9 @@ class ShotTableRules(unittest.TestCase):
         shots[0]["shot_job"] = "建立旧河道与石槽"
         data = table(shots)
         data["status"] = "draft"
-        errors, _ = self.check(data)
-        self.assertTrue(any("信息在连续时间里" in e and "SH001" in e for e in errors), errors)
+        errors, warnings = self.check(data)
+        self.assertFalse(any("信息在连续时间里" in e and "SH001" in e for e in errors), errors)
+        self.assertTrue(any("信息在连续时间里" in w and "SH001" in w for w in warnings), warnings)
         shots[0]["shot_job"] = "信息在连续时间里：脚印要扫够才读得清"
         data = table(shots)
         data["status"] = "draft"
@@ -500,19 +503,20 @@ class ShotTableRules(unittest.TestCase):
             writer=writer,
         )
         errors, warnings = validate_shot_table(slow, writer=writer, sets=SETS, profile=self.profile, look_text=LOOK)
-        self.assertTrue(any("SPM" in e for e in errors), errors)
+        self.assertFalse(any("SPM" in e for e in errors), errors)
+        self.assertTrue(any("SPM" in w for w in warnings), warnings)
         self.assertTrue(any("consecutive long takes" in w for w in warnings), warnings)
         slow["locked_picture"] = True
         errors, warnings = validate_shot_table(slow, writer=writer, sets=SETS, profile=self.profile, look_text=LOOK)
         self.assertFalse(any("SPM" in e for e in errors), errors)
         self.assertTrue(any("SPM" in w for w in warnings), warnings)
 
-    def test_picture_lock_and_ready_tables_stay_warning(self) -> None:
+    def test_pace_is_advisory_for_drafts_candidates_and_picture_lock(self) -> None:
         data = table(good_shots())
         data["status"] = "ready"
         self.assertEqual(pace_enforcement(data), "warning")
         data["status"] = "candidate"
-        self.assertEqual(pace_enforcement(data), "error")
+        self.assertEqual(pace_enforcement(data), "warning")
         data["status"] = "draft"
         data["locked_picture"] = True
         self.assertTrue(picture_is_locked(data))
@@ -520,6 +524,24 @@ class ShotTableRules(unittest.TestCase):
         metrics = pace_metrics(good_shots())
         self.assertEqual(metrics["shots"], 4)
         self.assertEqual(metrics["total_sec"], 27)
+
+    def test_many_clauses_are_advisory_but_event_and_model_limits_are_hard(self) -> None:
+        shots = good_shots()
+        shots[0]["one_action"] = "琳伸手，扶住车把，向前推，车轮越过石缝，脚步跟进，衣摆掠过门框"
+        shots[0]["duration_sec"] = 15
+        data = table(shots)
+        errors, warnings = self.check(data)
+        self.assertFalse(any("clauses" in e or "two verbs" in e for e in errors), errors)
+        self.assertTrue(any("clauses" in w for w in warnings), warnings)
+        shots[0]["one_action"] = ""
+        shots[0]["duration_sec"] = 0
+        errors, _ = self.check(table(shots))
+        self.assertTrue(any("missing one_action" in e for e in errors), errors)
+        self.assertTrue(any("positive number" in e for e in errors), errors)
+        shots[0]["one_action"] = "琳抬眼"
+        shots[0]["duration_sec"] = int(self.profile.get("max_shot_sec") or 60) + 1
+        errors, _ = self.check(table(shots))
+        self.assertTrue(any("exceeds model max" in e for e in errors), errors)
 
     def test_legacy_validate_shot_list_dispatches_to_v2(self) -> None:
         from director.pipeline import validate_shot_list

@@ -178,8 +178,10 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
     sid = _text(pkg.get("shot_id"))
     kf = frames.get(sid) or {}
     qc = kf.get("qc") or {}
-    frame_prefix = episode_frame_dir(episode)
-    shot_prefix = episode_shot_dir(episode)
+    from director.context import context_for
+    ctx = context_for(prod, episode)
+    frame_prefix = ctx.frame_dir()
+    shot_prefix = ctx.shot_dir()
     gen_mode = _text(pkg.get("gen_mode"))
     plan = _text(pkg.get("keyframe_plan"))
     try:
@@ -307,6 +309,9 @@ def plan_shot(prod: Path, pkg: dict, frames: dict[str, dict], assets: dict[str, 
 
 
 def build_plan(prod: Path, only: Optional[list[str]] = None, episode=1) -> dict:
+    from director.context import context_for
+
+    episode = context_for(prod, episode).episode_token
     if not uses_pipeline(prod):
         raise SystemExit("这个项目不是 pipeline 岗，不要走 render_seedance_packages.py")
     packages = _packages(prod, episode)
@@ -317,17 +322,29 @@ def build_plan(prod: Path, only: Optional[list[str]] = None, episode=1) -> dict:
     spec_name = episode_artifact_name("shot_specs.json", episode)
     kf_name = episode_artifact_name("keyframes.json", episode)
     table = read_artifact(prod, table_name)
-    pkg_errors = validate_packages(read_artifact(prod, pkg_name), read_artifact(prod, "assets.json"), read_artifact(prod, spec_name))
+    pkg_data = read_artifact(prod, pkg_name)
+    spec_data = read_artifact(prod, spec_name)
+    frame_data = read_artifact(prod, kf_name)
+    review_table = table
+    if only:
+        wanted = set(only)
+        def scoped(data, keys):
+            return {**data, **{key: [row for row in data.get(key) or [] if row.get("shot_id") in wanted] for key in keys}}
+        pkg_data = scoped(pkg_data, ("packages", "gen_packages"))
+        spec_data = scoped(spec_data, ("shot_specs", "specs"))
+        frame_data = scoped(frame_data, ("keyframes", "frames"))
+        review_table = scoped(table, ("shots",))
+    pkg_errors = validate_packages(pkg_data, read_artifact(prod, "assets.json"), spec_data)
     if pkg_errors:
         raise SystemExit("生成包未过校验：" + pkg_errors[0])
-    if not packages_confirmed(read_artifact(prod, pkg_name)):
+    if not packages_confirmed(pkg_data):
         raise SystemExit("生成包还没 confirmed=true")
     raise_if(
         validate_keyframes(
-            read_artifact(prod, kf_name),
-            packages=read_artifact(prod, pkg_name),
-            specs=read_artifact(prod, spec_name),
-            table=table,
+            frame_data,
+            packages=pkg_data,
+            specs=spec_data,
+            table=review_table,
             prod=prod,
         )
     )
@@ -349,7 +366,8 @@ def build_plan(prod: Path, only: Optional[list[str]] = None, episode=1) -> dict:
     missing = sorted(want - {item["shot_id"] for item in shots}) if want else []
     if missing:
         raise SystemExit("没有这些镜头：" + ", ".join(missing))
-    dest_dir = episode_shot_dir(episode)
+    from director.context import context_for
+    dest_dir = context_for(prod, episode).shot_dir()
     return {
         "prod": str(prod.relative_to(ROOT)) if ROOT in prod.parents or prod == ROOT else str(prod),
         "episode": episode_label(episode) or episode_number(episode),
@@ -371,20 +389,32 @@ def build_plan(prod: Path, only: Optional[list[str]] = None, episode=1) -> dict:
     }
 
 
-def _extract_last(video: Path, dest: Path) -> None:
+def _extract_last(video: Path, dest: Path) -> Optional[float]:
     import subprocess
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     # -0.05 can miss the last packet on short H3-scaled clips (ffmpeg 234).
     for seek in ("-0.05", "-0.5", "-1"):
+        dest.unlink(missing_ok=True)
         rc = subprocess.call(
             ["ffmpeg", "-y", "-sseof", seek, "-i", str(video), "-frames:v", "1", str(dest)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         if rc == 0 and dest.exists() and dest.stat().st_size > 0:
-            return
+            return float(seek)
     print(f"  warn: could not extract last frame from {video.name}; official clip kept", flush=True)
+    return None
+
+
+def _record_extracted_end(prod: Path, item: dict, video: Path, episode=1) -> None:
+    from place_codex_frame import record_generated_end
+
+    extracted = prod / item["extracted_last"]
+    offset = _extract_last(video, extracted)
+    if offset is not None:
+        record_generated_end(prod, item["shot_id"], frame_rel=item["extracted_last"],
+            video_rel=video.relative_to(prod).as_posix(), extraction_method="ffmpeg -sseof", offset_sec=offset, episode=episode)
 
 
 def plan_from_snapshot(
@@ -407,7 +437,8 @@ def plan_from_snapshot(
         expected_shot_ids=expected_shot_ids,
     )
     episode = snap.get("episode") or 1
-    dest_dir = episode_shot_dir(episode)
+    from director.context import context_for
+    dest_dir = context_for(prod, episode).shot_dir()
     want = set(only or [])
     shots = []
     for request in snapshot_requests(snap):
@@ -517,7 +548,44 @@ def _record_plan_take(prod: Path, plan: dict, item: dict, dest: Path, request, r
         raise SystemExit(f"{item.get('shot_id')} 已生成但素材登记失败：{exc}") from exc
 
 
+def require_render_plan_review(prod: Path, plan: dict) -> None:
+    # A saved request is reproducible; it still needs current review before spending.
+    from director.context import ProductionContext, using_context
+    from director.pipeline import assert_packages_confirmed, assert_keyframes_passed
+    from director.narrative import require_design_review, file_hash
+    from director.animatic import require_animatic_approval
+    from director.gates import require_fresh_gate
+    from director.show_policy import load_show_policy
+
+    ctx = ProductionContext.resolve(prod, plan.get("episode") or 1)
+    ids = [item["shot_id"] for item in plan.get("shots") or []]
+    with using_context(ctx):
+        require_fresh_gate(prod, "C")
+        require_fresh_gate(prod, "C2")
+        assert_packages_confirmed(prod, ctx.episode_token, selected_shot_ids=ids)
+        assert_keyframes_passed(prod, ctx.episode_token, selected_shot_ids=ids)
+        require_design_review(prod, ctx.episode_token)
+        if ctx.mode == "registered" or load_show_policy(prod).animatic_required:
+            require_animatic_approval(prod, ctx.episode_token)
+        current_requests = {}
+        if plan.get("from_snapshot"):
+            from director.fingerprint import fingerprint_for
+            _, current_specs = fingerprint_for(prod, ids, ctx.episode_token)
+            current_requests = {s["id"]: VendorRequest.from_dict(s["vendor_request"]).fingerprint() for s in current_specs if s.get("vendor_request")}
+        for item in plan.get("shots") or []:
+            if item.get("dest") != f"{ctx.shot_dir()}/{item['shot_id']}.mp4":
+                raise PermissionError(f"{item['shot_id']} render destination is outside this revision")
+            request = VendorRequest.from_dict(item["vendor_request"]) if item.get("vendor_request") else None
+            if request:
+                if plan.get("from_snapshot") and current_requests.get(item["shot_id"]) != request.fingerprint():
+                    raise PermissionError(f"{item['shot_id']} 生成包已不同于确认快照；重新确认后才可收费提交")
+                for rel, expected in request.media_hash_map().items():
+                    if file_hash(safe_under(prod, rel)) != expected:
+                        raise PermissionError(f"{item['shot_id']} confirmed request media changed after review: {rel}")
+
+
 def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
+    require_render_plan_review(prod, plan)
     load_dotenv()
     out_dir = prod / (plan.get("dest_dir") or episode_shot_dir(plan.get("episode") or 1))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -531,6 +599,7 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
         if skip_existing and request is not None and SeedanceArk.clip_matches_request(dest, request.fingerprint()):
             print(f"  {sid} reusable {item['dest']}, skip")
             _record_plan_take(prod, plan, item, dest, request, record={"backend": "reuse"}, new_attempt=False)
+            _record_extracted_end(prod, item, dest, plan.get("episode") or 1)
             continue
         if skip_existing and item.get("exists") and request is None:
             raise SystemExit(f"{sid} existing clip has no confirmed request; refuse to skip")
@@ -586,9 +655,8 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
             )
         item["clip"] = record
         _record_plan_take(prod, plan, item, dest, request, record, new_attempt=not skip_existing)
-        extracted = prod / item["extracted_last"]
-        _extract_last(dest, extracted)
-        print(f"  extracted last {extracted.relative_to(prod)} (designed still untouched)")
+        _record_extracted_end(prod, item, dest, plan.get("episode") or 1)
+        print(f"  extracted last {item['extracted_last']} (identity review pending)")
 
 
 def write_manifest(prod: Path, plan: dict, *, force: bool = False) -> Path:

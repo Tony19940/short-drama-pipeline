@@ -165,7 +165,10 @@ def api_lock(slug: str, payload: Optional[dict] = Body(None)):
     prod = get_prod(slug)
     gate_id = str(payload.get("gateId") or payload.get("id") or "")
     try:
-        return lock_gate(prod, gate_id, bool(payload.get("locked", True)))
+        from director.context import ProductionContext, using_context
+        ctx = ProductionContext.resolve(prod, payload.get("episode") or 1, str(payload.get("revision") or ""))
+        with using_context(ctx):
+            return lock_gate(prod, gate_id, bool(payload.get("locked", True)))
     except PermissionError as exc:
         return fail(exc, 409)
     except ValueError as exc:
@@ -867,6 +870,7 @@ def api_render_prepare(slug: str, payload: Optional[dict] = Body(None)):
             payload.get("shotIds"),
             bool(payload.get("reviewTrack")),
             payload.get("episode") or 1,
+            str(payload.get("revision") or ""),
         )
     except (PermissionError, ValueError) as exc:
         return fail(exc, 409 if isinstance(exc, PermissionError) else 400)
@@ -882,6 +886,7 @@ def api_render(slug: str, payload: Optional[dict] = Body(None)):
             payload.get("shotIds"),
             bool(payload.get("reviewTrack")),
             payload.get("episode") or 1,
+            str(payload.get("revision") or ""),
         )
     except (PermissionError, ValueError) as exc:
         return fail(exc, 409 if isinstance(exc, PermissionError) else 400)
@@ -918,9 +923,44 @@ def api_review(slug: str, payload: Optional[dict] = Body(None)):
 def api_assemble(slug: str, payload: Optional[dict] = Body(None)):
     try:
         episode = (payload or {}).get("episode") or 1
-        return assemble_episode(get_prod(slug), episode)
-    except (PermissionError, RuntimeError) as exc:
+        from director.context import ProductionContext, using_context
+        prod = get_prod(slug)
+        ctx = ProductionContext.resolve(prod, episode, str((payload or {}).get("revision") or ""))
+        with using_context(ctx):
+            return assemble_episode(prod, ctx.episode_token, candidate=(payload or {}).get("candidate") is True)
+    except (PermissionError, RuntimeError, ValueError) as exc:
         return fail(exc, 409 if isinstance(exc, PermissionError) else 500)
+
+
+@app.get("/api/productions/{slug}/narrative-review")
+def api_narrative_review(slug: str, episode: str = "1", revision: str = ""):
+    from director.context import ProductionContext, using_context
+    from director.narrative import inspect_narrative, digest
+    from director.shot_table import design_review_digest
+    try:
+        ctx = ProductionContext.resolve(get_prod(slug), episode, revision)
+        with using_context(ctx):
+            return {"source": ctx.source_report(), "design_input_sha256": design_review_digest(ctx.read_artifact("shot_list.json")),
+                    "contract_sha256": digest(ctx.read_artifact("events.json")),
+                    "contract": ctx.read_artifact("events.json"), "report": inspect_narrative(ctx.prod, ctx.episode_token)}
+    except (ValueError, OSError) as exc:
+        return fail(exc, 400)
+
+
+@app.post("/api/productions/{slug}/narrative-review/{action}")
+def api_record_narrative_review(slug: str, action: str, payload: Optional[dict] = Body(None)):
+    from director.context import ProductionContext, using_context
+    from director.review_actions import record_design, record_observation, record_sequence
+    payload = payload_dict(payload)
+    commands = {"design": record_design, "observe": record_observation, "sequence": record_sequence}
+    if action not in commands:
+        return fail(ValueError("action must be design, observe or sequence"), 400)
+    try:
+        ctx = ProductionContext.resolve(get_prod(slug), payload.get("episode") or 1, str(payload.get("revision") or ""))
+        with using_context(ctx):
+            return commands[action](ctx, payload)
+    except (PermissionError, ValueError, OSError) as exc:
+        return fail(exc, 409 if isinstance(exc, PermissionError) else 400)
 
 
 @app.get("/api/productions/{slug}/reverse")

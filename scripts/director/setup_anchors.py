@@ -2,7 +2,8 @@
 
 A setup is a camera placement (coverage + side + scale), not a scene.
 Reverse / OTC / insert get their own anchors. Same-setup action may
-continue from the previous approved last frame. A new setup does not
+continue from a verified generated video end. Planned ends and legacy
+stills are visual references only. A new setup does not
 inherit the previous shot's left/right composition.
 """
 
@@ -80,25 +81,48 @@ def previous_same_setup_shot(prod: Path, shot_id: str, episode=1) -> Optional[di
 
 
 def resolve_continuity_parent(prod: Path, shot_id: str, episode=1) -> Optional[str]:
-    """Same-setup previous last (or passing first). None when this is a new setup."""
+    """Compatibility path API; use the info API to display role/provenance warnings."""
+    return resolve_continuity_parent_info(prod, shot_id, episode).get("path")
+
+
+def resolve_continuity_parent_info(prod: Path, shot_id: str, episode=1) -> dict:
+    """Prefer actual video evidence, then planned still references in the same setup.
+
+    This selects an edit canvas, not proof that the next shot's in_from agrees
+    with the preceding video. Legacy filenames retain compatibility and are
+    explicitly unknown rather than being relabeled as actual ends.
+    """
     from director.review_state import can_use_as_parent
-    from place_codex_frame import dest_rel, identity_gate_of
+    from place_codex_frame import dest_rel, frame_role_info, identity_gate_of, resolve_generated_end
+    from director.paths import safe_under
+    from director.context import context_for
 
     prev = previous_same_setup_shot(prod, shot_id, episode)
     if not prev:
-        return None
+        return {"path": None, "frame_role": "unknown", "provenance_status": "unknown", "warnings": []}
     pid = _t(prev.get("shot_id") or prev.get("id"))
     if not pid:
-        return None
-    last = dest_rel(pid, "last", episode)
-    from director.paths import safe_under
-
-    if safe_under(prod, last).exists() and can_use_as_parent(identity_gate_of(prod, last)):
-        return last
-    first = dest_rel(pid, "first", episode)
-    if safe_under(prod, first).exists() and can_use_as_parent(identity_gate_of(prod, first)):
-        return first
-    return None
+        return {"path": None, "frame_role": "unknown", "provenance_status": "unknown", "warnings": []}
+    actual = resolve_generated_end(prod, pid, episode)
+    if actual:
+        return {"path": actual, **frame_role_info(prod, actual)}
+    warnings = []
+    extracted = f"{context_for(prod, episode).shot_dir()}/{pid}-last.jpg"
+    if safe_under(prod, extracted).exists():
+        warnings.extend(frame_role_info(prod, extracted)["warnings"])
+    for slot in ("end", "last", "first"):
+        rel = dest_rel(pid, slot, episode, prod=prod)
+        if not safe_under(prod, rel).exists() or not can_use_as_parent(identity_gate_of(prod, rel)):
+            continue
+        info = frame_role_info(prod, rel)
+        # A stale actual frame must not silently become a planned reference.
+        if info["frame_role"] == "generated_end" or info["provenance_status"] == "invalid":
+            warnings.extend(info["warnings"])
+            continue
+        info["warnings"] = warnings + info["warnings"]
+        info["warnings"].append(f"{pid}: 未采用已核实视频实际尾；此父图仅锁人物和空间，本镜仍按 in_from 设计")
+        return {"path": rel, **info}
+    return {"path": None, "frame_role": "unknown", "provenance_status": "unknown", "warnings": warnings}
 
 
 def resolve_first_parent(prod: Path, shot_id: str, episode=1, location_id: str = "") -> tuple[str, bool]:

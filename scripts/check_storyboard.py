@@ -235,16 +235,11 @@ def check_end_frame(prod: Path, shot: dict) -> None:
     rel = str(shot.get("end_frame") or "").strip()
     if not rel:
         return
-    sid = shot.get("id", "?")
-    name = Path(rel).name.lower()
-    frame_rel = str(shot.get("frame") or f"04-frames/{sid}.jpg")
-    if name.endswith("-last.jpg"):
-        fail(f"{sid} end_frame cannot be a generated last.jpg; design a still such as 04-frames/{sid}-end.jpg")
-    if Path(rel).as_posix() == Path(frame_rel).as_posix():
-        fail(f"{sid} end_frame cannot equal this shot's first frame")
-    path = prod / rel
-    if not path.exists() or path.stat().st_size <= 0:
-        fail(f"{sid} end_frame missing: {rel}")
+    from director.gates import designed_end_frame
+
+    result = designed_end_frame(prod, shot)
+    if not result["ok"]:
+        fail(f"{shot.get('id', '?')} {result['reason']}")
 
 
 def check_start_sequence(shot: dict, prev: dict | None, hard: bool = False) -> None:
@@ -349,12 +344,134 @@ def load_sets(prod: Path) -> dict[str, dict]:
     return {s["id"]: s for s in (data.get("sets") or []) if s.get("id")}
 
 
-def main() -> None:
+def _legacy_shots_are_stub(prod: Path) -> bool:
+    """The template ships one empty SH001. A shot-table-v2 show must not be graded against it."""
+    path = prod / "03-storyboard" / "shots.json"
+    if not path.exists():
+        return True
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return False
+    shots = data.get("shots") or []
+    if len(shots) != 1:
+        return False
+    shot = shots[0]
+    scene = str(shot.get("scene") or "").strip()
+    derived = str(shot.get("derived_from") or "")
+    return (not scene) or derived == "<scene>.blocking"
+
+
+def _load_v2_table(prod: Path, context=None) -> dict | None:
+    path = context.artifact_path("shot_list.json") if context is not None else prod / ".pipeline" / "shot_list.json"
+    if not path.exists():
+        if context is not None and context.mode == "registered":
+            fail(f"registered revision missing {context.artifact_rel('shot_list.json')}")
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        if context is not None and context.mode == "registered":
+            fail(f"registered revision has invalid JSON: {context.artifact_rel('shot_list.json')}")
+        return None
+    if not isinstance(data, dict):
+        if context is not None and context.mode == "registered":
+            fail("registered revision shot table must be an object")
+        return None
+    if str(data.get("schema") or "") != "shot-table-v2":
+        if context is not None and context.mode == "registered":
+            fail("registered revision requires a shot-table-v2 table")
+        return None
+    if not (data.get("shots") or []):
+        if context is not None and context.mode == "registered":
+            fail("registered revision shot table is empty")
+        return None
+    return data
+
+
+def check_scene_plates(prod: Path, sets: dict[str, dict]) -> None:
+    if not sets:
+        fail("missing 03-storyboard/sets.json (Gate S). Stage before shots.")
+    for sid, st in sets.items():
+        master = prod / st.get("master", f"02-assets/scenes/{sid}/master.jpg")
+        if not master.exists():
+            fail(f"set {sid}: missing scene master {master}")
+        if st.get("blocking"):
+            blocking = prod / st["blocking"]
+            if not blocking.exists():
+                fail(f"set {sid}: missing blocking.jpg — run scripts/render_blocking.py")
+        if not st.get("marks"):
+            fail(f"set {sid}: marks empty")
+
+
+def check_v2(prod: Path, table: dict, context=None) -> None:
+    """shot-table-v2 is the contract. Legacy shots.json `start` is not this table's field."""
+    scripts = Path(__file__).resolve().parent
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from director.shot_table import table_context, validate_shot_table
+
+    for rel in (
+        "03-storyboard/beats.md",
+        "01-bible/blueprint.md",
+        "01-bible/confirm.md",
+        "03-storyboard/coverage.md",
+    ):
+        if not (prod / rel).exists():
+            fail(f"missing {rel}")
+    sets = load_sets(prod)
+    if (prod / "03-storyboard" / "sets.json").exists():
+        check_scene_plates(prod, sets)
+    token = context.episode_token if context is not None else 1
+    ctx = table_context(prod, str(table.get("target_model") or "") or None, episode=token)
+    if context is not None and context.mode == "registered":
+        # A revision may explicitly share a writer artifact in its registry. A
+        # missing revision writer must not silently borrow an old episode.
+        ctx["writer"] = context.read_artifact("writer.json", required=True)
+    errors, warnings = validate_shot_table(table, **ctx)
+    if errors:
+        fail(errors[0])
+    for warning in warnings:
+        print(f"Gate C2 warning: {warning}", file=sys.stderr)
+    total = table.get("total_sec")
+    if total in (None, ""):
+        total = sum(float(s.get("duration_sec") or 0) for s in table.get("shots") or [])
+    print(
+        f"Gate C2 ok: {len(table.get('shots') or [])} shots, {total}s, "
+        f"kind=shot-table-v2, sets={len(sets)}"
+    )
+
+
+def main(argv=None) -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--prod", required=True)
-    args = p.parse_args()
+    p.add_argument("--episode", default="1")
+    p.add_argument("--revision", default="")
+    args = p.parse_args(argv)
     prod = Path(args.prod).resolve()
+    from director.context import ProductionContext
+    from director.revisions import RevisionError
+
+    try:
+        context = ProductionContext.resolve(prod, args.episode, args.revision)
+        table = _load_v2_table(prod, context)
+        selected = context.mode == "registered" or bool(args.revision) or context.episode_token not in (1, "1", "ep01")
+        if table is not None and (selected or _legacy_shots_are_stub(prod)):
+            print("CHECK_SOURCE " + json.dumps(context.source_report(), ensure_ascii=False, sort_keys=True))
+            check_v2(prod, table, context)
+            return
+        if selected:
+            fail(f"selected revision has no valid table: {context.artifact_rel('shot_list.json')}")
+    except RevisionError as exc:
+        fail(str(exc))
     path = prod / "03-storyboard" / "shots.json"
+    if path.is_file():
+        import hashlib
+
+        source = context.to_dict()
+        legacy_data = json.loads(path.read_text(encoding="utf-8"))
+        source.update(source_file="03-storyboard/shots.json", source_sha256=hashlib.sha256(path.read_bytes()).hexdigest(), shot_count=len(legacy_data.get("shots") or []))
+        print("CHECK_SOURCE " + json.dumps(source, ensure_ascii=False, sort_keys=True))
     beats = prod / "03-storyboard" / "beats.md"
     blueprint = prod / "01-bible" / "blueprint.md"
     confirm = prod / "01-bible" / "confirm.md"

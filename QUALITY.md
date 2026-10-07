@@ -1,5 +1,7 @@
 # 出片质量与本地观众
 
+登记版本还须通过 [流水线升级协议](docs/PIPELINE-UPGRADE-2026-10-06.md) 的实际事件保留和声画段落审核；技术通过不等于理解通过。审美节奏规则作提醒，不要求补齐每个省略动作。
+
 在 `CULTURE.md` 之外的硬规则。违反即重做，不「先过再改」。  
 操作勾选见各集 `01-bible/CULTURE-CHECK.md`。
 
@@ -34,7 +36,7 @@
 
 **R9 双人必须先有身高图**（`scale.jpg`）再拆单人主图。脚同一地平线。禁止一集里男主突然变矮。详见 `productions/khmer-stories/CONSISTENCY.md`。
 
-**R10 邻镜先对机位。** 同场必须 `cut=continue`。硬切只换场。先有该场 `blocking.jpg`。出视频前跑 `scripts/check_prod.py`。主路径永远是锁定首帧 FL2VA。同机位且人物有交集才吃 `{from}-last.jpg`；换机位用这一镜锁定首帧。动作要收住写设计 `end_frame`，禁止拿抽出的 `-last.jpg` 当尾帧。身份参考挂在首帧外面。
+**R10 邻镜先对机位。** 同场允许按覆盖与揭示顺序剪切；只有确实延续动作、同机位且人物有交集时才使用 `cut=continue` 的实际尾帧续接。先有该场 `blocking.jpg`。出视频前跑 `scripts/check_prod.py`。主路径永远是锁定首帧 FL2VA。同机位且人物有交集才吃 `{from}-last.jpg`；换机位用这一镜锁定首帧。动作要收住写设计 `end_frame`，禁止拿抽出的 `-last.jpg` 当尾帧。身份参考挂在首帧外面。
 
 **R11 成片抽 3 个近景对 `face.jpg`。** 发际线、耳环、sbai 织纹对不上，只重跑那一镜。禁止为了救一镜新开一张脸。
 
@@ -93,7 +95,7 @@
 
 - [ ] `characters` 参考图齐全，并作为 Ref2VA 外挂，不替代首帧
 - [ ] 开场/硬切/换机位用锁定首帧；同机位续才吃 `{from}-last.jpg`
-- [ ] 若填了 `end_frame`，文件存在且不是 `-last.jpg`
+- [ ] 若填了 `end_frame`，文件存在并属于设计尾；明确标 planned_end 的旧 -last 兼容，generated_end 不能冒充设计尾
 - [ ] `tier=h3` ≤ 3
 - [ ] 无声 Fast 为默认；H3 只打近景脸 / 仪式 / 必须卡环境声的动作
 - [ ] 都市短剧：无声切只审脸。审剧情必须再跑 `mix_review_track.py`（工作旁白 + 字幕）

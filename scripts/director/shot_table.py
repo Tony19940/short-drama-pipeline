@@ -8,7 +8,10 @@ hardest shot, dropped shots). Everything below is deterministic: no model call.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import time
 from typing import Any, Optional
 
 from .defaults import (
@@ -86,6 +89,71 @@ def _t(value: Any) -> str:
     return str(value or "").strip()
 
 
+def design_review_digest(data: dict) -> str:
+    """Fingerprint the creative contract, excluding reviews and delivery bookkeeping."""
+    fields = (
+        "schema", "episode_no", "episode_label", "target_model", "aspect", "whose_pov",
+        "left_right_lock", "continuity_bible", "scene_cards", "visual_grammar", "scene_plan",
+        "continuity_rules", "candidate_picks", "speech_mode", "dialogue_language",
+    )
+    runtime = {
+        "asset_status", "video_status", "video_file", "available_frame_slots",
+        "planned_frame_dir", "planned_first_parent", "planned_last_parent", "allow_master",
+    }
+    contract = {key: data.get(key) for key in fields if key in data}
+    contract["shots"] = [
+        {key: value for key, value in shot.items() if key not in runtime}
+        for shot in data.get("shots") or [] if isinstance(shot, dict)
+    ]
+    encoded = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def design_review_errors(data: dict, *, require_review: bool = True) -> list[str]:
+    """A human content review is distinct from a candidate choice or a model score."""
+    review = data.get("narrative_review")
+    if not isinstance(review, dict) or _t(review.get("status")) != "pass":
+        return ["narrative_review needs a human pass for this contract"] if require_review else []
+    errors = []
+    if review.get("source") != "human":
+        errors.append("narrative_review source must be human; critic/fallback is only advice")
+    for key in ("reviewer", "notes"):
+        if not _t(review.get(key)):
+            errors.append(f"narrative_review missing {key}")
+    try:
+        reviewed_at = float(review.get("reviewed_at") or 0)
+    except (TypeError, ValueError):
+        reviewed_at = 0
+    if reviewed_at <= 0:
+        errors.append("narrative_review missing reviewed_at")
+    if review.get("input_sha256") != design_review_digest(data):
+        errors.append("narrative_review is stale: input_sha256 differs from the creative contract")
+    findings = review.get("scene_findings")
+    if findings is not None and not isinstance(findings, list):
+        errors.append("narrative_review scene_findings must be a list")
+    return errors
+
+
+def record_human_design_review(
+    data: dict, *, reviewer: str, notes: str, reviewed_at: Optional[float] = None,
+    scene_findings: Optional[list[dict]] = None,
+) -> dict:
+    """Record an explicit human review. Call only from the human review action, not generation."""
+    if not _t(reviewer) or not _t(notes):
+        raise ValueError("human design review needs reviewer and substantive notes")
+    payload = dict(data)
+    payload["narrative_review"] = {
+        "status": "pass", "source": "human", "reviewer": _t(reviewer), "notes": _t(notes),
+        "reviewed_at": reviewed_at if reviewed_at is not None else time.time(),
+        "input_sha256": design_review_digest(data),
+        "scene_findings": list(scene_findings or []),
+    }
+    errors = design_review_errors(payload)
+    if errors:
+        raise ValueError(" / ".join(errors))
+    return payload
+
+
 def _int(value: Any, default: int = 0) -> int:
     try:
         return int(round(float(value)))
@@ -154,13 +222,21 @@ def lock_display(value: Any) -> str:
     return _t(value)
 
 
+KHMER_RE = re.compile(r"[\u1780-\u17ff]")
+KHMER_CONSONANT = re.compile(r"[\u1780-\u17b3]")
+
+
 def dialogue_seconds(lines: list[str]) -> float:
     total = 0.0
     for line in lines:
-        text = re.sub(r"[\s，。！？；：、“”…—（）()!?,.]", "", _t(line))
+        text = re.sub(r"[\s，。！？；：、“”…—（）()!?.,\u17d4\u17d5\u17d6\u17d7\u17d8\u17d9\u17da]", "", _t(line))
         if not text:
             continue
-        total += len(text) / CHARS_PER_SEC + LINE_PAUSE_SEC
+        if KHMER_RE.search(text):
+            consonants = len(KHMER_CONSONANT.findall(text))
+            total += (consonants / 5.2) + 0.5
+        else:
+            total += len(text) / CHARS_PER_SEC + LINE_PAUSE_SEC
     return round(total, 1)
 
 
@@ -401,17 +477,16 @@ def picture_is_locked(data: dict, prod: Any = None) -> bool:
 
 
 def pace_enforcement(data: dict, prod: Any = None) -> str:
-    """error for new paper / candidate; warning for locked picture or ready episode tables."""
-    if picture_is_locked(data, prod):
-        return "warning"
-    status = _t(data.get("status"))
-    if status == "ready":
-        return "warning"
-    return "error"
+    """Pace metrics are advisory in drafts and locked pictures alike.
+
+    Shot density, long takes and connective verbs cannot prove how an audience
+    reads a scene. Model limits and missing event contracts are checked elsewhere.
+    """
+    return "warning"
 
 
-def _emit_pace(errors: list[str], warnings: list[str], message: str, *, hard: bool) -> None:
-    (errors if hard else warnings).append(message)
+def _emit_pace(errors: list[str], warnings: list[str], message: str) -> None:
+    warnings.append(message)
 
 
 def _check_shot_pace(
@@ -420,11 +495,10 @@ def _check_shot_pace(
     errors: list[str],
     warnings: list[str],
     *,
-    pace_hard: bool,
     partial: bool,
     scene_scope: Optional[list[str]],
 ) -> None:
-    """SPM / consecutive longs / dialogue-without-reaction. Locked picture stays warning."""
+    """Advisory density / long takes / attention transition; no reaction quota."""
     prev: Optional[dict] = None
     for shot in shots:
         duration = _sec(shot.get("duration_sec"))
@@ -442,7 +516,8 @@ def _check_shot_pace(
             nxt_dlg = bool(shot.get("dialogue_ref"))
             if not nxt_dlg and nxt_cov not in ("reaction", "close", "insert") and _t(shot.get("beat")) != _t(prev.get("beat")):
                 warnings.append(
-                    f"{_t(prev.get('shot_id'))} has dialogue but {_t(shot.get('shot_id'))} changes topic with no reaction"
+                    f"{_t(prev.get('shot_id'))} has dialogue and {_t(shot.get('shot_id'))} changes topic; "
+                    "review attention transfer or ellipsis, a separate reaction shot is optional"
                 )
         prev = shot
 
@@ -454,9 +529,8 @@ def _check_shot_pace(
             _emit_pace(
                 errors,
                 warnings,
-                f"{label} SPM {metrics['spm']} < {PACE_SPM_WARN_BELOW} (target 14–18); "
+                f"{label} SPM {metrics['spm']} < {PACE_SPM_WARN_BELOW} (14–18 is a reference, not a quota); "
                 f"{metrics['shots']} shots / {metrics['total_sec']}s",
-                hard=pace_hard,
             )
 
     if not partial and len(shots) >= 8:
@@ -823,6 +897,7 @@ def validate_shot_table(
     scene_scope: Optional[list[str]] = None,
     partial: bool = False,
     prod: Any = None,
+    require_review: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Return (errors, warnings).
 
@@ -833,7 +908,6 @@ def validate_shot_table(
     warnings: list[str] = []
     shots = list(data.get("shots") or [])
     profile = profile or {}
-    pace_hard = pace_enforcement(data, prod) == "error"
     min_sec = int(profile.get("min_shot_sec") or 1)
     max_sec = int(profile.get("max_shot_sec") or 60)
     allowed_moves = set(profile.get("allowed_moves") or MOVE_INTENSITY)
@@ -847,8 +921,20 @@ def validate_shot_table(
     if not shots:
         errors.append("shot table empty")
         return errors, warnings
-    if data.get("visible_change_without_dialogue") != "pass":
-        errors.append("visible_change_without_dialogue must be pass")
+    visible = _t(data.get("visible_change_without_dialogue")) or "not_reviewed"
+    if visible == "fail":
+        errors.append("visible_change_without_dialogue failed")
+    elif visible not in {"pass", "not_reviewed", "unknown", "inconclusive"}:
+        errors.append("visible_change_without_dialogue has an unknown review status")
+    if visible != "pass":
+        warnings.append("visible change without dialogue is not reviewed; structure checks do not prove comprehension")
+    reviewed = design_review_errors(data, require_review=require_review or _t(data.get("status")) == "locked")
+    if require_review or _t(data.get("status")) == "locked":
+        errors.extend(reviewed)
+    elif reviewed:
+        warnings.extend(reviewed)
+    elif not isinstance(data.get("narrative_review"), dict) or (data.get("narrative_review") or {}).get("status") != "pass":
+        warnings.append("narrative_review not recorded; any legacy pass is a declaration, not review evidence")
 
     lock = data.get("left_right_lock")
     scene_ids = _scene_ids_in_order(shots)
@@ -933,19 +1019,18 @@ def validate_shot_table(
                     _emit_pace(
                         errors,
                         warnings,
-                        f"{sid} duration {duration}s > {PAPER_LONG_CAP:g}s without 「{LONG_TAKE_REASON}」 in shot_job",
-                        hard=pace_hard and duration >= PAPER_HARD_FAIL_SEC,
+                        f"{sid} duration {duration}s > {PAPER_LONG_CAP:g}s; review whether 「{LONG_TAKE_REASON}」 "
+                        "or performance needs this time; long_take_reason is optional",
                     )
 
         clauses = clauses_of(shot.get("one_action") or "")
         if len(clauses) > 5:
-            errors.append(f"{sid} one_action has {len(clauses)} clauses; one shot, one beat")
+            warnings.append(f"{sid} one_action has {len(clauses)} clauses; review information burden, a continuous event may remain one shot")
         if has_compound_action(shot):
             _emit_pace(
                 errors,
                 warnings,
-                f"{sid} one_action has two verbs (和/再/然后/并); split",
-                hard=pace_hard,
+                f"{sid} one_action has two verbs (和/再/然后/并); review continuity and information, splitting is optional",
             )
 
         move = _t(shot.get("move_type") or ("static" if _t(shot.get("move_needed")) in ("", "static") else ""))
@@ -1101,7 +1186,7 @@ def validate_shot_table(
     if declared not in (None, "") and abs(_sec(declared) - actual) > 0.05:
         errors.append(f"total_sec {declared} != sum of shots {actual:g}")
 
-    _check_shot_pace(data, shots, errors, warnings, pace_hard=pace_hard, partial=partial, scene_scope=scene_scope)
+    _check_shot_pace(data, shots, errors, warnings, partial=partial, scene_scope=scene_scope)
 
     state_errors, state_warnings = validate_state_chain(data, writer=writer)
     errors.extend(state_errors)
@@ -1252,8 +1337,7 @@ def sanitize_shot_table(data: dict, *, writer: Optional[dict] = None) -> dict:
     payload["shots"] = shots
     payload["total_sec"] = store_duration(sum(_sec(s.get("duration_sec")) for s in shots))
     payload.setdefault("dropped_shots", [])
-    payload.setdefault("design_steps_done", [1, 2, 3, 4, 5, 6, 7])
-    payload.setdefault("visible_change_without_dialogue", "pass")
+    payload.setdefault("visible_change_without_dialogue", "not_reviewed")
     bible = payload.get("continuity_bible") if isinstance(payload.get("continuity_bible"), dict) else {}
     for key in ("eyeline", "wardrobe", "day_night"):
         bible.setdefault(key, "")

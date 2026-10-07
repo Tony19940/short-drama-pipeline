@@ -72,13 +72,17 @@ def episode_frames_dir(episode: Any = 1) -> str:
     return episode_frame_dir(episode)
 
 
-def animatic_rel(episode: Any = 1) -> str:
+def animatic_rel(episode: Any = 1, *, prod: Optional[Path] = None) -> str:
+    if prod is not None:
+        from .revisions import resolve_binding
+
+        episode = resolve_binding(prod, episode).episode_token
     return f"{ANIMATIC_DIR}/{_animatic_stem(episode)}.animatic.mp4"
 
 
 def animatic_output_path(prod: Path, episode: int = 1, out: Optional[str] = None) -> Path:
     """Only `03-storyboard/animatic/*.mp4`. Anything under 05-shots / 06-export is refused."""
-    rel = _t(out) or animatic_rel(episode)
+    rel = _t(out) or animatic_rel(episode, prod=prod)
     rel_path = Path(rel)
     if rel_path.is_absolute() or ".." in rel_path.parts:
         raise PermissionError(f"animatic 输出路径非法：{rel}")
@@ -90,14 +94,17 @@ def animatic_output_path(prod: Path, episode: int = 1, out: Optional[str] = None
         raise PermissionError(f"animatic 只能写到 {ANIMATIC_DIR}/，不是 {rel}")
     if rel_path.suffix.lower() != ".mp4":
         raise PermissionError("animatic 输出必须是 .mp4")
+    if not (Path(prod) / rel_path).resolve().is_relative_to(Path(prod).resolve()):
+        raise PermissionError("animatic 输出必须在项目内")
     return prod / rel_path
 
 
 def load_shots(prod: Path, episode: int = 1) -> list[dict]:
     """Shot rows with id and seconds: v2 table first, legacy shots.json second."""
-    from .pipeline import read_artifact
+    from .revisions import resolve_binding
 
-    table = read_artifact(prod, episode_shot_list_name(episode))
+    binding = resolve_binding(prod, episode)
+    table = binding.read_artifact("shot_list.json")
 
     def rows_from(shots: list[dict], *, v2: bool) -> list[dict]:
         rows: list[dict] = []
@@ -116,13 +123,16 @@ def load_shots(prod: Path, episode: int = 1) -> list[dict]:
                 "out_to": _t(shot.get("out_to")),
                 "action_timing": list(shot.get("action_timing") or shot.get("performance_beats") or []),
                 "stimulus": _t(shot.get("stimulus") or shot.get("stimulus_line")),
+                "dialogue": shot.get("dialogue") or shot.get("dialogue_ref") or shot.get("line") or "",
             })
         return rows
 
-    if _t(table.get("schema")) == SHOT_TABLE_SCHEMA:
+    if _t(table.get("schema")) == SHOT_TABLE_SCHEMA or binding.mode == "registered":
         rows = rows_from(list(table.get("shots") or []), v2=True)
         if rows:
             return rows
+        if binding.mode == "registered":
+            return []
     from .pipeline import episode_label
 
     label = episode_label(episode)
@@ -194,15 +204,27 @@ def plan_animatic(prod: Path, episode: Any = 1) -> list[dict]:
     Written beats keep their absolute times. Gaps are explicit holds.
     Without beats, a locked last frame still splits first half / second half.
     """
-    frames = episode_frames_dir(episode)
+    from .revisions import resolve_binding
+    from place_codex_frame import frame_role_info
+
+    binding = resolve_binding(prod, episode)
+    frames = binding.frames_dir
+    keyframes = binding.read_artifact("keyframes.json")
+    by_id = {item.get("shot_id"): item for item in (keyframes.get("keyframes") or keyframes.get("frames") or []) if isinstance(item, dict)}
+    packages = binding.read_artifact("gen_packages.json")
+    package_by_id = {item.get("shot_id"): item for item in (packages.get("packages") or packages.get("gen_packages") or []) if isinstance(item, dict)}
     plan: list[dict] = []
     for row in load_shots(prod, episode):
         sid = row["shot_id"]
         seconds = float(row["seconds"])
-        first_rel = f"{frames}/{sid}.jpg"
-        last_rel = f"{frames}/{sid}-last.jpg"
+        frame = by_id.get(sid) or {}
+        first_rel = _t(frame.get("first_frame_file")) or f"{frames}/{sid}.jpg"
+        declared_end = _t(frame.get("planned_end_file") or frame.get("end_frame_file") or frame.get("last_frame_file"))
+        last_rel = declared_end or (f"{frames}/{sid}-end.jpg" if (prod / frames / f"{sid}-end.jpg").is_file() else f"{frames}/{sid}-last.jpg")
         first_ok = (prod / first_rel).exists()
-        last_ok = first_ok and (prod / last_rel).exists()
+        generated_end = frame_role_info(prod, last_rel)["frame_role"] == "generated_end" or last_rel.startswith("05-shots/")
+        last_ok = first_ok and (prod / last_rel).is_file() and not generated_end
+        needs_end = bool(declared_end) or generated_end or (package_by_id.get(sid) or {}).get("keyframe_plan") == "first_last"
         beats = _absolute_beats(row, seconds)
         if beats:
             cursor = 0.0
@@ -238,10 +260,10 @@ def plan_animatic(prod: Path, episode: Any = 1) -> list[dict]:
                     "one_action": row.get("one_action") or "",
                 })
             continue
-        if last_ok:
+        if last_ok or needs_end:
             half = round(seconds / 2, 3)
-            plan.append({"shot_id": sid, "image": first_rel, "seconds": half, "from_sec": 0, "to_sec": half, "label": _label(row, seconds, "首"), "missing": False, "part": "first", "beat": "", "stimulus": row.get("stimulus") or "", "one_action": row.get("one_action") or ""})
-            plan.append({"shot_id": sid, "image": last_rel, "seconds": round(seconds - half, 3), "from_sec": half, "to_sec": round(seconds, 3), "label": _label(row, seconds, "尾"), "missing": False, "part": "last", "beat": "", "stimulus": row.get("stimulus") or "", "one_action": row.get("one_action") or ""})
+            plan.append({"shot_id": sid, "image": first_rel if first_ok else None, "seconds": half, "from_sec": 0, "to_sec": half, "label": _label(row, seconds, "首"), "missing": not first_ok, "part": "first", "beat": "", "stimulus": row.get("stimulus") or "", "one_action": row.get("one_action") or ""})
+            plan.append({"shot_id": sid, "image": last_rel if last_ok else None, "seconds": round(seconds - half, 3), "from_sec": half, "to_sec": round(seconds, 3), "label": _label(row, seconds, "尾") + ("" if last_ok else " · 缺设计尾"), "missing": not last_ok, "part": "last", "beat": "", "stimulus": row.get("stimulus") or "", "one_action": row.get("one_action") or ""})
         else:
             plan.append({
                 "shot_id": sid,
@@ -256,6 +278,11 @@ def plan_animatic(prod: Path, episode: Any = 1) -> list[dict]:
                 "stimulus": row.get("stimulus") or "",
                 "one_action": row.get("one_action") or "",
             })
+    for item in plan:
+        if item.get("image"):
+            role = frame_role_info(prod, item["image"])
+            item["frame_role"] = role["frame_role"]
+            item["role_warnings"] = role["warnings"]
     return plan
 
 
@@ -308,19 +335,26 @@ def ffmpeg_available() -> bool:
 
 def build_animatic(
     prod: Path,
-    episode: int = 1,
+    episode: Any = 1,
     *,
     audio: Optional[str] = None,
+    audio_file: Optional[str] = None,
     fps: int = 24,
     out: Optional[str] = None,
 ) -> dict:
     """Cards → concat demuxer → mp4 under 03-storyboard/animatic/. Returns the plan and the file."""
+    from .revisions import resolve_binding
+
+    episode_key = _episode_token(resolve_binding(prod, episode).episode_token)
     dest = animatic_output_path(prod, episode, out)
     plan = plan_animatic(prod, episode)
     if not plan:
         raise PermissionError("没有镜头表，先拆镜再出 animatic")
     if not ffmpeg_available():
         raise RuntimeError("找不到 ffmpeg")
+    if audio and audio_file and _t(audio) != _t(audio_file):
+        raise ValueError("audio 与 audio_file 不能指向不同音轨")
+    audio = audio_file or audio
     audio_path: Optional[Path] = None
     if _t(audio):
         audio_path = Path(audio) if Path(audio).is_absolute() else prod / audio
@@ -328,6 +362,7 @@ def build_animatic(
             raise ValueError(f"音轨不存在：{audio}")
     fps = max(1, int(fps or 24))
     total = round(sum(float(item["seconds"]) for item in plan), 3)
+    input_fingerprint = animatic_input_fingerprint(prod, episode, audio_file=audio)
     with tempfile.TemporaryDirectory(prefix="animatic-") as tmp:
         work = Path(tmp)
         lines: list[str] = []
@@ -360,14 +395,19 @@ def build_animatic(
             raise RuntimeError((proc.stderr or proc.stdout or "ffmpeg 失败")[-1200:])
     sidecar = dest.with_suffix(".json")
     sidecar.write_text(
-        json.dumps({"episode": _episode_token(episode), "fps": fps, "total_sec": total, "audio": _t(audio) or None, "plan": plan}, ensure_ascii=False, indent=2) + "\n",
+        json.dumps({
+            "schema": "animatic-build-v3", "episode": episode_key, "fps": fps,
+            "total_sec": total, "audio": _t(audio) or None, "audio_file": _t(audio) or None,
+            "audio_sha256": _audio_digest(prod, _t(audio)), "plan": plan,
+            "input_fingerprint": input_fingerprint, "media_sha256": _digest(dest),
+        }, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     return {
         "ok": True,
         "file": str(dest.relative_to(prod)),
         "sidecar": str(sidecar.relative_to(prod)),
-        "episode": _episode_token(episode),
+        "episode": episode_key,
         "fps": fps,
         "total_sec": total,
         "cards": len(plan),
@@ -377,16 +417,83 @@ def build_animatic(
     }
 
 
-def animatic_input_fingerprint(prod: Path, episode: Any = 1) -> str:
-    """Bind approval to picture bytes and the performance plan, not duration alone."""
+def _digest(path: Path) -> str:
+    from .vendor_request import sha256_file
+
+    return sha256_file(path) if path.is_file() else ""
+
+
+def _audio_digest(prod: Path, audio_file: str) -> str:
+    if not audio_file:
+        return ""
+    path = Path(audio_file)
+    return _digest(path if path.is_absolute() else Path(prod) / path)
+
+
+def _audio_required(prod: Path, episode: Any) -> bool:
+    """An audio stream is necessary evidence when this table assigns audible story."""
+    from .revisions import resolve_binding
+
+    binding = resolve_binding(prod, episode)
+    table = binding.read_artifact("shot_list.json")
+    if binding.mode == "legacy" and not table.get("shots"):
+        from .pipeline import episode_label
+
+        label = episode_label(binding.episode_token)
+        table = load_json(prod, f"03-storyboard/shots.{label}.json" if label else "03-storyboard/shots.json", {})
+    if table.get("audio_required") or table.get("sound_required"):
+        return True
+    for shot in table.get("shots") or []:
+        dialogue = shot.get("dialogue") or shot.get("dialogue_ref")
+        if isinstance(dialogue, dict):
+            dialogue = dialogue.get("line_work_zh") or dialogue.get("line") or dialogue.get("text")
+        if dialogue or (shot.get("line") and shot.get("line_kind") not in {"reaction", "sms"}):
+            return True
+        if shot.get("audio_required") or shot.get("sound_required") or shot.get("sound_events") or shot.get("sound_ref") or shot.get("sfx"):
+            return True
+    return False
+
+
+def _probe_animatic(path: Path) -> dict:
+    """Inspect the actual review movie, not a sidecar claim about its streams."""
+    if not path.is_file():
+        return {"video": False, "audio": False}
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        data = json.loads(proc.stdout)
+        streams = data.get("streams") or []
+        duration = float((data.get("format") or {}).get("duration") or 0)
+        return {"video": duration > 0 and any(row.get("codec_type") == "video" for row in streams),
+                "audio": any(row.get("codec_type") == "audio" for row in streams)}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return {"video": False, "audio": False}
+
+
+def animatic_input_fingerprint(prod: Path, episode: Any = 1, *, audio_file: Optional[str] = None) -> str:
+    """Bind pictures, the complete shot contract and the optional source sound."""
     import hashlib
 
     from .vendor_request import media_hash
+    from .revisions import resolve_binding
 
+    binding = resolve_binding(prod, episode)
     plan = plan_animatic(prod, episode)
+    source = binding.artifact_path("shot_list.json")
+    if binding.mode == "legacy" and not source.is_file():
+        from .pipeline import episode_label
+
+        label = episode_label(binding.episode_token)
+        source = prod / (f"03-storyboard/shots.{label}.json" if label else "03-storyboard/shots.json")
     payload = {
-        "version": "rehearsal-v2",
-        "episode": _episode_token(episode),
+        "version": "rehearsal-v3",
+        "episode": _episode_token(binding.episode_token),
+        "binding": binding.to_dict(),
+        "shot_list_sha256": _digest(source),
+        "audio_file": _t(audio_file),
+        "audio_sha256": _audio_digest(prod, _t(audio_file)),
         "cards": [
             {
                 "shot_id": item.get("shot_id"),
@@ -399,6 +506,7 @@ def animatic_input_fingerprint(prod: Path, episode: Any = 1) -> str:
                 "one_action": item.get("one_action") or "",
                 "image": item.get("image") or "",
                 "image_hash": media_hash(prod, _t(item.get("image"))) if item.get("image") else "missing",
+                "frame_role": item.get("frame_role") or "unknown",
             }
             for item in plan
         ],
@@ -408,19 +516,64 @@ def animatic_input_fingerprint(prod: Path, episode: Any = 1) -> str:
 
 
 def animatic_approval_path(prod: Path, episode: Any = 1) -> Path:
-    return Path(prod) / ANIMATIC_DIR / f"{_animatic_stem(episode)}.approval.json"
+    from .revisions import resolve_binding
+
+    return Path(prod) / ANIMATIC_DIR / f"{_animatic_stem(resolve_binding(prod, episode).episode_token)}.approval.json"
 
 
-def write_animatic_approval(prod: Path, episode: Any = 1, reviewer: str = "") -> dict:
+def write_animatic_approval(
+    prod: Path, episode: Any = 1, reviewer: str = "", *, notes: str = "",
+    file: Optional[str] = None, input_only: bool = False,
+) -> dict:
+    """Sign a built movie; an explicit input-only note cannot authorize paid output."""
+    from .revisions import resolve_binding
+
+    if not _t(reviewer) or _t(reviewer).lower() == "unknown":
+        raise PermissionError("animatic 审批需要实名 reviewer")
+    movie = animatic_output_path(prod, episode, file)
+    rel = movie.relative_to(prod).as_posix()
+    metadata: dict = {}
+    if not input_only:
+        if not _t(notes):
+            raise PermissionError("animatic 审批需要看片结论 notes")
+        if not movie.is_file() or not movie.with_suffix(".json").is_file():
+            raise PermissionError("animatic 未构建；必须先审实际 MP4，不能只批准输入")
+        try:
+            metadata = json.loads(movie.with_suffix(".json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise PermissionError("animatic 构建记录不可读") from exc
+        if not isinstance(metadata, dict):
+            raise PermissionError("animatic 构建记录必须是对象")
+        audio = _t(metadata.get("audio_file") or metadata.get("audio"))
+        current = animatic_input_fingerprint(prod, episode, audio_file=audio)
+        if metadata.get("schema") != "animatic-build-v3" or metadata.get("input_fingerprint") != current or metadata.get("media_sha256") != _digest(movie):
+            raise PermissionError("animatic 构建证据已过期；重新构建后审片")
+        plan = plan_animatic(prod, episode)
+        if not plan or any(item.get("missing") for item in plan):
+            raise PermissionError("animatic 有缺图/缺状态，不能批准收费出片")
+        probe = _probe_animatic(movie)
+        if not probe["video"]:
+            raise PermissionError("animatic MP4 不可读")
+        if audio and not _audio_digest(prod, audio):
+            raise PermissionError("animatic 源音轨缺失")
+        if _audio_required(prod, episode) and (not audio or not probe["audio"]):
+            raise PermissionError("对白/声音需要声画预演，静音稿不能批准收费出片")
+    else:
+        audio = ""
+        current = animatic_input_fingerprint(prod, episode)
     dest = animatic_approval_path(prod, episode)
     dest.parent.mkdir(parents=True, exist_ok=True)
     body = {
-        "episode": _episode_token(episode),
-        "fingerprint": animatic_input_fingerprint(prod, episode),
-        "reviewer": _t(reviewer) or "unknown",
+        "schema": "animatic-approval-v3",
+        "episode": _episode_token(resolve_binding(prod, episode).episode_token),
+        "fingerprint": current,
+        "reviewer": _t(reviewer), "notes": _t(notes),
         "approved_at": __import__("time").time(),
-        "file": animatic_rel(episode),
-        "kind": "rehearsal",
+        "file": rel,
+        "kind": "input_only" if input_only else "rehearsal",
+        "input_only": bool(input_only),
+        "media_sha256": "" if input_only else _digest(movie),
+        "audio_file": audio, "audio_sha256": _audio_digest(prod, audio),
     }
     dest.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return body
@@ -435,15 +588,42 @@ def animatic_approval_status(prod: Path, episode: Any = 1) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"exists": True, "ok": False, "stale": True, "fingerprint": "", "current": current}
+    if not isinstance(data, dict):
+        return {"exists": True, "ok": False, "stale": True, "fingerprint": "", "current": current}
     stored = _t(data.get("fingerprint"))
-    stale = stored != current
+    audio = _t(data.get("audio_file"))
+    current = animatic_input_fingerprint(prod, episode, audio_file=audio)
+    input_only = data.get("input_only") is True or data.get("schema") != "animatic-approval-v3" or not data.get("media_sha256")
+    reasons: list[str] = []
+    if input_only:
+        reasons.append("input_only 审批不能用于收费出片")
+    if not _t(data.get("reviewer")) or _t(data.get("reviewer")).lower() == "unknown" or not _t(data.get("notes")):
+        reasons.append("缺审核者或看片结论")
+    try:
+        movie = animatic_output_path(prod, episode, _t(data.get("file")) or None)
+    except PermissionError:
+        movie = None
+        reasons.append("审批媒体路径非法")
+    media_digest = _digest(movie) if movie is not None else ""
+    stale = stored != current or (not input_only and media_digest != _t(data.get("media_sha256")))
+    probe = _probe_animatic(movie) if movie is not None and not input_only else {"video": False, "audio": False}
+    if not input_only and not probe["video"]:
+        reasons.append("缺可播放预演 MP4")
+    plan = plan_animatic(prod, episode)
+    if not plan or any(item.get("missing") for item in plan):
+        reasons.append("预演缺图/缺状态")
+    if audio and (not _audio_digest(prod, audio) or _audio_digest(prod, audio) != _t(data.get("audio_sha256"))):
+        stale = True
+    if _audio_required(prod, episode) and (not audio or not probe["audio"]):
+        reasons.append("对白/声音未以声画预演审阅")
     return {
         "exists": True,
-        "ok": bool(stored) and not stale,
+        "ok": bool(stored) and not stale and not reasons,
         "stale": stale,
         "fingerprint": stored,
         "current": current,
         "reviewer": _t(data.get("reviewer")),
+        "input_only": input_only, "reasons": reasons, "file": _t(data.get("file")),
     }
 
 
@@ -453,14 +633,17 @@ def require_animatic_approval(prod: Path, episode: Any = 1) -> dict:
         raise PermissionError("animatic 未审批，不能收费出片")
     if status["stale"]:
         raise PermissionError("animatic 审批已过期（镜头表或首帧已变），重新审预演")
+    if not status["ok"]:
+        raise PermissionError("animatic 审批证据不完整：" + "；".join(status.get("reasons") or []))
     return status
 
 
 def snapshot_animatic(prod: Path, episode: Any = 1) -> dict:
     """What the studio shows before/after building: the plan, the file if it exists."""
     from .paths import media_url
+    from .revisions import resolve_binding
 
-    rel = animatic_rel(episode)
+    rel = animatic_rel(episode, prod=prod)
     path = prod / rel
     plan = plan_animatic(prod, episode)
     frames: dict[str, str] = {}
@@ -475,7 +658,7 @@ def snapshot_animatic(prod: Path, episode: Any = 1) -> dict:
             elif item.get("part") == "first":
                 frames[item["shot_id"]] = url
     return {
-        "episode": _episode_token(episode),
+        "episode": _episode_token(resolve_binding(prod, episode).episode_token),
         "exists": path.exists(),
         "file": rel if path.exists() else None,
         "url": media_url(prod, rel),
