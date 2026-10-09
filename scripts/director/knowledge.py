@@ -16,6 +16,7 @@ KNOWLEDGE = ROOT / "knowledge"
 LAYERS = ("rules", "writer", "director", "art", "camera", "sound", "cases")
 AGENT_LAYERS = {
     "writer": ("rules", "writer"),
+    "lines": ("rules", "writer", "sound"),
     "director": ("rules", "director", "cases"),
     "design": ("rules", "director", "cases"),
     "analysis": ("rules", "director", "cases"),
@@ -67,16 +68,32 @@ def budget_for(agent: str) -> int:
 
 
 def load_for(agent: str, max_chars: int | None = None) -> dict[str, str]:
+    """Split the budget across layers; small layers hand their unused share to truncated ones.
+
+    The case library stays at its equal share: per-scene case cards travel separately,
+    and an alphabetical dump of more cards is not worth cutting craft rules for.
+    """
     layers = AGENT_LAYERS.get(agent, ("rules",))
     total = max_chars if max_chars is not None else budget_for(agent)
-    per = max(800, total // max(len(layers), 1))
-    return {name: _read_layer(name, per) for name in layers}
+    equal = max(800, total // max(len(layers), 1))
+    full = {name: _read_layer(name, total) for name in layers}
+    order = sorted(layers, key=lambda name: (name == "cases", len(full[name])))
+    out: dict[str, str] = {}
+    remaining = total
+    for index, name in enumerate(order):
+        share = max(800, remaining // (len(order) - index))
+        if name == "cases":
+            share = min(share, equal)
+        out[name] = full[name] if len(full[name]) <= share else _read_layer(name, share)
+        remaining -= len(out[name])
+    return {name: out[name] for name in layers}
 
 
 PACK = KNOWLEDGE / "pipeline-pack" / "prompts"
 PACK_PROMPTS = {
     "novel": "01_小说.md",
     "writer": "02_编剧.md",
+    "lines": "02a_台词.md",
     "art": "03_视觉资产.md",
     "director": "04_分镜设计.md",
     "design": "04_分镜设计.md",

@@ -20,7 +20,10 @@ from director.shot_table import (  # noqa: E402
     SCHEMA,
     compile_specs_from_shot_table,
     dialogue_seconds,
+    finding_group,
+    findings_report,
     fit_writer_dialogue,
+    framing_subjects,
     has_compound_action,
     lock_axis_text,
     lock_display,
@@ -34,6 +37,7 @@ from director.shot_table import (  # noqa: E402
     picture_is_locked,
     render_shot_table_md,
     sanitize_shot_table,
+    triage_findings,
     validate_shot_table,
 )
 from director.video_profiles import get_profile, profile_brief, resolve_target_model  # noqa: E402
@@ -121,7 +125,8 @@ def good_shots() -> list[dict]:
         shot(shot_id="SH002", coverage_type="single", scale="medium", lens="50mm", beat="识水", shot_job="手指伸进凹痕自语",
              one_action="速卡蹲下把手指伸进凹痕低头看水", duration_sec=6,
              dialogue_ref=[{"character": "速卡", "line": "水往哪走，河床都替你记着。"}], dialogue_delivery="post",
-             in_from="承接站姿", out_to="雷更近"),
+             in_from="承接站姿", out_to="雷更近",
+             transition_out={"type": "black", "sec": 1.0, "sound": "雷声闷下去，接古岸的水声"}),
         shot(shot_id="SH003", scene_id="EP01_SC02", location_id="ancient-shoal", coverage_type="master", scale="full", lens="35mm",
              beat="冲上古岸", shot_job="空手与断槽同框", one_action="速卡爬到跪姿摊开空手看断槽", duration_sec=7,
              left="速卡", right="对岸", eyeline="看手", evidence=["空手+断槽"], in_from="古岸", out_to="抬头看火",
@@ -356,9 +361,24 @@ class ShotTableRules(unittest.TestCase):
         shots = good_shots()
         shots[3]["dialogue_delivery"] = "on_camera"
         errors, _ = self.check(table(shots))
+        # a native table may not leave a line silent: legacy post now errors, every line is voiced
+        self.assertTrue(any("dialogue_delivery=post leaves the line silent" in e for e in errors), errors)
+        for item in shots:
+            if item.get("dialogue_delivery") == "post":
+                item["dialogue_delivery"] = "off_camera"
+        errors, _ = self.check(table(shots))
         self.assertEqual(errors, [], errors)
         errors, _ = validate_shot_table(table(shots), writer=WRITER, sets=SETS, profile=get_profile("minimax_h3"), look_text=LOOK)
         self.assertTrue(any("on_camera dialogue not supported" in e for e in errors), errors)
+
+    def test_one_voice_per_shot(self) -> None:
+        shots = good_shots()
+        for item in shots:
+            if item.get("dialogue_delivery") == "post":
+                item["dialogue_delivery"] = "off_camera"
+        shots[1]["key_sfx"] = ["远处有人尖叫"]
+        errors, _ = self.check(table(shots))
+        self.assertTrue(any("puts a second voice under the line" in e for e in errors), errors)
 
     def test_one_shot_one_set_and_no_repeat_setup(self) -> None:
         shots = good_shots()
@@ -370,6 +390,79 @@ class ShotTableRules(unittest.TestCase):
         shots[3]["dialogue_ref"] = [{"character": "云朗", "line": "什么人？"}, {"character": "速卡", "line": "我是高棉人，大湖边来的！我不是细作——"}]
         errors, _ = self.check(table(shots))
         self.assertTrue(any("repeats SH001" in e for e in errors), errors)
+
+    def _close_pair(self, first: dict, second: dict) -> list[dict]:
+        shots = good_shots()
+        base = dict(coverage_type="single", scale="close", lens="50mm", left="", right="", angle="eye")
+        shots[2].update(base, **first)
+        shots[3].update(base, **second)
+        return shots
+
+    def test_repeat_check_knows_who_is_in_frame(self) -> None:
+        # 011 SH020→SH021 were two different people in close-ups; only SH022→SH023 was a real jump cut.
+        yun = {"dialogue_ref": [{"character": "云朗", "line": "什么人？"}], "dialogue_delivery": "on_camera"}
+        su = {"dialogue_ref": [{"character": "速卡", "line": "我是高棉人，大湖边来的！我不是细作——"}], "dialogue_delivery": "on_camera"}
+        errors, warnings = self.check(table(self._close_pair(yun, su)))
+        self.assertFalse(any("repeat" in m for m in errors + warnings), errors + warnings)
+        errors, _ = self.check(table(self._close_pair(su, su)))
+        self.assertTrue(any("repeats SH003" in e and "jump cut" in e for e in errors), errors)
+        errors, warnings = self.check(table(self._close_pair({**su, "angle": "low"}, su)))
+        self.assertFalse(any("repeat" in m for m in errors + warnings), errors + warnings)
+
+    def test_repeat_check_without_subject_only_warns(self) -> None:
+        mute_a = {"dialogue_ref": [], "dialogue_delivery": "none", "one_action": "火光在水面晃"}
+        mute_b = {"dialogue_ref": [], "dialogue_delivery": "none", "one_action": "火光渐暗"}
+        errors, warnings = self.check(table(self._close_pair(mute_a, mute_b)))
+        self.assertFalse(any("repeats" in e for e in errors), errors)
+        self.assertTrue(any("may repeat SH003" in w for w in warnings), warnings)
+
+    def test_framing_subjects_sources(self) -> None:
+        names = {"sokha": "速卡", "yunlang": "云朗"}
+        state = {"characters": {"sokha": {"in_frame": True}, "yunlang": {"in_frame": False}}}
+        self.assertEqual(framing_subjects({"state": state}, names), ("sokha",))
+        self.assertEqual(framing_subjects({"state": {"characters": {"sokha": {"in_frame": False}}}}, names), ())
+        self.assertEqual(framing_subjects({"left": "速卡", "right": "—"}, names), ("sokha",))
+        on_camera = {"dialogue_delivery": "on_camera", "dialogue_ref": [{"character": "云朗", "line": "什么人？"}]}
+        self.assertEqual(framing_subjects(on_camera, names), ("yunlang",))
+        offscreen = {"dialogue_delivery": "offscreen", "dialogue_ref": [{"character": "云朗"}], "one_action": "火光渐暗"}
+        self.assertIsNone(framing_subjects(offscreen, names))
+        self.assertEqual(framing_subjects({"one_action": "云朗按刀俯视速卡"}, names), ("yunlang",))
+
+    def test_findings_are_grouped_by_audience_cost(self) -> None:
+        messages = [
+            "SH001 body_facing must be one of ['朝镜头']",
+            "missing left_right_lock",
+            "continuity_bible missing props",
+            "SH002 needs about 2.9s for its action and lines but has 2.0s; split the shot or add seconds",
+            "SH004 repeats SH003: same subject, scale, angle and coverage in a row reads as a jump cut",
+            "SH005 line is not a writer line: 你敢碰她！",
+            "SH006 duration 1.0s below model min 4s; render at 4s and trim in cut",
+            "SH007 facing flips front→back from SH006 with no 转身/回头 in in_from/out_to/one_action",
+            "narrative_review not recorded; any legacy pass is a declaration, not review evidence",
+            "scene card EP01_SC01 missing dramatic_question",
+            "SH008 missing one_action",
+            "evidence not claimed by any shot: 空手+断槽",
+        ]
+        groups = triage_findings(messages)
+        self.assertEqual([key for key, _label, _items in groups],
+                         ["audience", "continuity", "model", "script", "director", "review", "format"])
+        by_key = {key: items for key, _label, items in groups}
+        self.assertEqual(len(by_key["audience"]), 3)
+        self.assertEqual(len(by_key["format"]), 4)
+        self.assertEqual(finding_group("SH001 text contains LOOK.md forbidden item 字幕"), "other")
+        noisy = messages + [f"SH{i:03d} lens must look like 35mm" for i in range(20)]
+        report = findings_report(noisy, title="Gate C2 errors", per_group=3)
+        self.assertTrue(report[0].startswith("Gate C2 errors 32"), report[0])
+        self.assertEqual(report[1], "[影响看懂] 3")
+        self.assertTrue(any("另有 21 条" in line for line in report), report)
+
+    def test_review_page_groups_warnings(self) -> None:
+        md = render_shot_table_md(table(good_shots()), warnings=[
+            "SH002 lens must look like 35mm",
+            "SH004 may repeat SH003: same scale, angle and coverage; add state.characters or left/right so the check can tell who is in frame",
+        ])
+        self.assertIn("- **警告**：影响看懂 1 · 格式 1", md)
+        self.assertLess(md.index("  - 影响看懂："), md.index("  - 格式："))
 
     def test_design_cannot_carry_prompts_and_total_sec_is_sum(self) -> None:
         shots = good_shots()
@@ -639,6 +732,18 @@ class ShotState(unittest.TestCase):
         _, warnings = validate_shot_table(plain, writer=WRITER, sets=SETS, profile=self.profile, look_text=LOOK)
         self.assertTrue(any("no per-shot state" in w for w in warnings), warnings)
 
+    def test_held_by_a_person_needs_no_prop(self) -> None:
+        writer = dict(WRITER, series_bible={"characters": [{"id": "sokha", "name": "速卡"}, {"id": "yunlong", "name": "云朗"}]})
+        shots = self._stateful_shots()
+        shots[3]["state"]["characters"]["sokha"].update(binding="held", bound_with="yunlong")
+        errors, warnings = validate_shot_table(table(shots, continuity_bible=self._stateful_bible()), writer=writer, sets=SETS, profile=self.profile, look_text=LOOK)
+        self.assertFalse(any("binding prop yunlong" in w for w in warnings), warnings)
+        self.assertFalse(any("held by" in w for w in warnings), warnings)
+        self.assertFalse(any("needs bound_with" in e for e in errors), errors)
+        del shots[3]["state"]["characters"]["yunlong"]
+        _, warnings = validate_shot_table(table(shots, continuity_bible=self._stateful_bible()), writer=writer, sets=SETS, profile=self.profile, look_text=LOOK)
+        self.assertTrue(any("SH004 sokha is held by yunlong, who is not in state.characters" in w for w in warnings), warnings)
+
     def test_state_props_outside_bible_span_fail(self) -> None:
         shots = self._stateful_shots()
         shots[2]["state"]["characters"]["sokha"]["carrying"] = ["survey-pole"]
@@ -826,6 +931,15 @@ class SpecProjectionAndRender(unittest.TestCase):
         self.assertEqual(len(fourth["dialogue_lines"]), 2)
         self.assertEqual(fourth["axis_side"], "高棉左暹罗右")
         self.assertEqual(validate_shot_specs(specs, WRITER), [])
+
+    def test_specs_accept_whole_sentences_of_a_writer_line(self) -> None:
+        from director.pipeline import validate_shot_specs
+
+        specs = compile_specs_from_shot_table(table(good_shots()))
+        specs["shot_specs"][3]["dialogue_line"] = "我是高棉人，大湖边来的！"
+        self.assertEqual(validate_shot_specs(specs, WRITER), [])
+        specs["shot_specs"][3]["dialogue_line"] = "我是高棉人"
+        self.assertIn("SH004 dialogue is not the writer line", validate_shot_specs(specs, WRITER))
 
     def test_insert_and_pov_specs_need_no_sides(self) -> None:
         from director.pipeline import validate_shot_specs

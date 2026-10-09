@@ -10,11 +10,12 @@ Artifact: `.pipeline/frame_descriptions.json` (schema `frame-desc-v1`).
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .acting import normalize_acting, text_acting_warnings
 from .shot_table import OTC_COVERAGE, _t as _shot_t, facing_class, turn_is_written
 from .still_t0 import normalize_still, still_t0_errors
+from .setup_anchors import camera_projection_changed
 
 SCHEMA = "frame-desc-v1"
 GENERIC_WORDS = ("电影感", "氛围拉满", "高级感", "大片感", "质感拉满", "史诗", "震撼", "cinematic vibe", "epic")
@@ -106,7 +107,9 @@ def validate_frame_descriptions(
     shots: Optional[list[dict]] = None,
     *,
     still_t0: str = "error",
+    names: Optional[Iterable[str]] = None,
 ) -> list[str]:
+    """`names` (cast display names) keep a verb from being read across a name, e.g. 达拉+开口 as 拉开."""
     errors: list[str] = []
     if _t(data.get("schema")) != SCHEMA:
         errors.append(f"schema must be {SCHEMA}")
@@ -161,8 +164,17 @@ def validate_frame_descriptions(
             if facing_class({"body_facing": facing, "left": item["layers"]["foreground"]}) == "back" or "背对镜头" in facing or "后脑" in facing:
                 errors.append(f"{sid} otc frame_desc facing is 背对镜头/后脑; over-shoulder is not a back view")
         if shot and still_t0 == "error":
-            errors.extend(still_t0_errors(shot, item))
-        if prev_item and shot and prev_shot and _shot_t(prev_shot.get("scene_id")) == _shot_t(shot.get("scene_id")):
+            errors.extend(still_t0_errors(shot, item, names))
+        if shot and item.get("acting"):
+            # Acting is compiled into the video prompt: it may not finish a held action (喉结一动 on 012 SH022)
+            # or add a pose the static frame cannot hold (说完站起 on 012 SH005).
+            from .action_lint import acting_findings
+
+            acting_errors, _acting_warnings = acting_findings(shot, item["acting"], sid)
+            errors.extend(acting_errors)
+        same_setup = prev_shot is not None and shot is not None and not camera_projection_changed(prev_shot, shot)
+        if prev_item and same_setup:
+            # A reverse / new camera setup may show the other side of the same body, as orientation_errors allows.
             prev_face = facing_class({"body_facing": prev_item["subject"]["facing"]})
             this_face = facing_class({"body_facing": facing})
             if prev_face and this_face and prev_face != this_face:

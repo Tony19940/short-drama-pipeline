@@ -49,6 +49,11 @@ FALLBACK_SOUND_BED = "本场环境底噪"
 
 _HEADER = re.compile(r"^#{2,3}\s+\*\*([\w-]+)\*\*\s*·\s*([^\s/]+)")
 _VOICE = re.compile(r"^\s*-\s+\*\*声音卡\*\*\s*[:：]\s*(.+?)\s*$")
+# Dialogue gate: how the person talks (address terms, register, habits) and the Khmer spelling of the name.
+_SPEECH_STYLE = re.compile(r"^\s*-\s+\*\*说话方式\*\*\s*[:：]\s*(.+?)\s*$")
+_KM_NAME = re.compile(r"^\s*-\s+\*\*高棉名\*\*\s*[:：]\s*(.+?)\s*$")
+_IDENTITY = re.compile(r"^\s*-\s+\*\*身份\*\*\s*[:：]\s*(.+?)\s*$")
+_CARD_EXTRAS = (("speech_style", _SPEECH_STYLE), ("km_name", _KM_NAME), ("identity", _IDENTITY))
 _DESCRIPTOR = re.compile(
     r"^\s*-\s+\*\*外形卡(?:[·（(]\s*([\w-]+)\s*[)）]?)?\*\*(?:[（(][^（）()]*[）)])?\s*[:：]\s*(.*?)\s*$"
 )
@@ -101,7 +106,11 @@ def check_dialogue_language(
 
 
 def parse_character_cards(text: str) -> dict[str, dict]:
-    """cast id -> {name, voice_card, descriptor, descriptor_by_costume} from CHARACTERS.md."""
+    """cast id -> {name, voice_card, descriptor, descriptor_by_costume} from CHARACTERS.md.
+
+    `speech_style` (说话方式), `km_name` (高棉名) and `identity` (身份) ride along when written;
+    the dialogue gate hands them to the Khmer writer.
+    """
     out: dict[str, dict] = {}
     current: Optional[dict] = None
     in_descriptor = False
@@ -117,6 +126,11 @@ def parse_character_cards(text: str) -> dict[str, dict]:
         voice = _VOICE.match(raw)
         if voice:
             current["voice_card"] = voice.group(1)
+            in_descriptor = False
+            continue
+        extra = next(((key, rx.match(raw)) for key, rx in _CARD_EXTRAS if rx.match(raw)), None)
+        if extra:
+            current[extra[0]] = extra[1].group(1)
             in_descriptor = False
             continue
         desc = _DESCRIPTOR.match(raw)
@@ -194,6 +208,21 @@ def cards_by_name(cards: dict[str, dict], cast: Optional[dict[str, str]] = None)
     return out
 
 
+# A voice card is timbre and delivery. Sentence length belongs to the lines, and 「短句」 in a card went
+# straight into every prompt and every line (012 EP01: 6 of 16 lines were five characters or fewer).
+VOICE_CARD_LENGTH_RE = re.compile(r"短句|句子短|几个字|字一句|不说完整|话少|惜字")
+
+
+def voice_card_warnings(cards: dict[str, dict]) -> list[str]:
+    out = []
+    for name, item in (cards or {}).items():
+        card = _t((item or {}).get("voice_card"))
+        hit = VOICE_CARD_LENGTH_RE.search(card)
+        if hit:
+            out.append(f"{name} 的声音卡写了「{hit.group(0)}」：声音卡只写音色和语气，句子长短由台词决定")
+    return out
+
+
 def voice_card_for(name: str, cards: dict[str, dict]) -> str:
     item = (cards or {}).get(_t(name)) or {}
     return _t(item.get("voice_card"))
@@ -240,6 +269,28 @@ def _joined(names: list[str]) -> str:
     return "、".join(dict.fromkeys(n for n in names if n))
 
 
+def name_speakers(lines: list[dict], cast: Optional[dict[str, str]] = None) -> list[dict]:
+    """Speaker ids -> display names, so they match `in_frame` (a table may write `kosal` for 果萨)."""
+    cast = cast or {}
+    out = []
+    for item in lines or []:
+        who = _t((item or {}).get("character") or (item or {}).get("speaker"))
+        out.append(dict(item, character=cast.get(who, who)) if who else dict(item))
+    return out
+
+
+# How a line is heard. Every line is voiced in the generation: the Khmer dub clones each speaker from
+# the Chinese voice in the clip, so a line with no Chinese voice has nothing to clone (012 EP01 draft).
+# `post` survives only for legacy post-dub tables.
+VOICED_DELIVERY = ("on_camera", "off_camera", "phone", "inner", "narration")
+OFF_SCREEN_DELIVERY = ("off_camera", "phone", "inner", "narration")
+
+
+def _delivery_of(item: dict, fallback: str) -> str:
+    value = _t(item.get("delivery")) or _t(fallback)
+    return value if value in VOICED_DELIVERY else "on_camera"
+
+
 def compile_audio_block(
     lines: list[dict],
     *,
@@ -248,11 +299,14 @@ def compile_audio_block(
     key_sfx: Optional[list[str]] = None,
     sound_bed: str = "",
     language: str = DEFAULT_DIALOGUE_LANGUAGE,
+    delivery: str = "on_camera",
 ) -> str:
     """The only place speech lives. Hell Grind order: voice → quoted line → who stays silent → ambience.
 
-    lines: [{character, line, manner?, track?}] (max two, spoken in order).
-    in_frame: display names visible in this shot.
+    lines: [{character, line, manner?, track?, delivery?}] (max two, spoken in order).
+    in_frame: display names visible in this shot. `delivery` is the shot's default; an item may override it.
+    A phone voice, a voice off screen, an inner monologue or narration is still spoken by the model; the
+    people in frame keep their mouths closed (012 probe: SH006 phone and SH031 inner voiced, mouths shut).
     """
     lang = language_label(language)
     people = [_t(n) for n in (in_frame or []) if _t(n)]
@@ -264,28 +318,42 @@ def compile_audio_block(
         if people:
             return f"画中所有人不说话，嘴闭着。只有环境声：{ambience}。无音乐，无字幕。"
         return f"画中无人开口。只有环境声：{ambience}。无音乐，无字幕。"
-    speakers: list[str] = []
+    talkers: list[str] = []
+    voices_off: list[str] = []
     bits: list[str] = []
     for index, item in enumerate(spoken[:2]):
         who = _t(item.get("character") or item.get("speaker")) or "画外音"
-        speakers.append(who)
-        card = voice_card_for(who, cards or {})
+        how = _delivery_of(item, delivery)
+        card = voice_card_for(who, cards or {}).rstrip("。")
         manner = manner_for(item)
         line = _t(item.get("line")).strip("“”\"")
-        offscreen = people and who not in people
-        subject = f"{who}画外音" if offscreen else who
-        card_bit = f"（{card.rstrip('。')}）" if card else ""
         order = ""
         if len(spoken) > 1:
             order = "先，" if index == 0 else "接着，"
-        bits.append(f"{order}{subject}{card_bit}用{lang}{manner}说：“{line}”。")
-    if len(spoken) > 1:
-        bits.append("两人各只说自己这一句。")
-    else:
-        bits.append("只说这一句。")
-    silent = [n for n in people if n not in speakers]
-    if silent:
-        bits.append(f"{_joined(silent)}不说话，嘴闭着。")
+        if how == "phone":
+            voice = f"电话里传来{who}的声音（{card + '；' if card else ''}隔着手机听筒，声音发闷、有点失真）"
+            voices_off.append(who)
+        elif how == "inner":
+            voice = f"{who}的内心独白（画外音，{who}自己的声音{'：' + card if card else ''}；压低、平静，像在心里对自己说）"
+            voices_off.append(who)
+        elif how == "narration":
+            voice = f"旁白，{who}的声音（画外音{'，' + card if card else ''}）"
+            voices_off.append(who)
+        elif how == "off_camera" or (people and who not in people):
+            voice = f"画外传来{who}的声音" + (f"（{card}）" if card else "")
+            voices_off.append(who)
+        else:
+            voice = who + (f"（{card}）" if card else "")
+            talkers.append(who)
+        bits.append(f"{order}{voice}用{lang}{manner}说：“{line}”。")
+    bits.append("两人各只说自己这一句。" if len(spoken) > 1 else "只说这一句。")
+    silent = [n for n in people if n not in talkers]
+    inner_self = [n for n in silent if n in voices_off]
+    others = [n for n in silent if n not in inner_self]
+    if inner_self:
+        bits.append(f"画中{_joined(inner_self)}嘴唇一直闭着，不开口。")
+    if others:
+        bits.append(f"{_joined(others)}不说话，嘴闭着" + ("，在听。" if voices_off else "。"))
     elif not people:
         bits.append("画中其他人不说话，嘴闭着。")
     bits.append(f"环境声只保留{ambience}，无音乐，无字幕。")

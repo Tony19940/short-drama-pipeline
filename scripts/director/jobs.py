@@ -464,7 +464,7 @@ def assemble_episode(prod: Path, episode=1, *, candidate: bool = False, revision
     from .context import ProductionContext
     from .pipeline import default_cut_from_specs, uses_pipeline
     from .narrative import (normalize_cut, require_cut_media_reviews, require_event_coverage,
-                            inspect_narrative, media_path, write_export_receipt)
+                            inspect_narrative, media_path, speed_findings, write_export_receipt)
     from .takes import episode_export_rel, episode_key
 
     ctx = ProductionContext.resolve(prod, episode, revision_id)
@@ -485,6 +485,9 @@ def assemble_episode(prod: Path, episode=1, *, candidate: bool = False, revision
     shot_root = prod / ctx.shot_dir()
     if shot_root.exists() and any(ken_burns_blocked(p) for p in shot_root.iterdir() if p.is_file()):
         raise PermissionError("单镜目录仍有 Ken Burns 文件；不能当作正式视频拼接")
+    speed_notes = speed_findings(cut)
+    if not candidate and speed_notes:
+        raise PermissionError("剪辑变速超出范围且没写理由：" + "; ".join(speed_notes[:3]))
     if not candidate:
         if uses_pipeline(prod):
             require_cut_media_reviews(prod, cut, token)
@@ -530,7 +533,8 @@ def assemble_episode(prod: Path, episode=1, *, candidate: bool = False, revision
               "used": [seg["shot_id"] for seg in segments],
               "takes": [row["take_id"] for row in cut.get("timeline") or [] if row.get("used", True) and row.get("take_id")],
               "episode": episode_key(token), "revision": ctx.to_dict(), "status": status,
-              "narrative": inspect_narrative(prod, token, cut=cut), "approved": False}
+              "narrative": inspect_narrative(prod, token, cut=cut), "approved": False,
+              "speed_warnings": speed_notes}
     result["not_in_edit"] = sorted(known - {seg["shot_id"] for seg in segments})
     result["delivery_scope"] = "partial" if result["not_in_edit"] else "all_planned_shots"
     if candidate:

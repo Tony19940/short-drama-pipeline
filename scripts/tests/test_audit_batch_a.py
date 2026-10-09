@@ -68,6 +68,15 @@ class ProfilesAndRequest(unittest.TestCase):
         self.assertEqual(req.model, "doubao-seedance-2-5-260628")
         self.assertEqual(req.profile_id, "seedance_2_5")
 
+    def test_half_seconds_round_up_never_down(self) -> None:
+        from director.pipeline import whole_seconds_up
+
+        self.assertEqual(whole_seconds_up(6.5), 7)
+        self.assertEqual(whole_seconds_up(4.5), 5)
+        self.assertEqual(whole_seconds_up(4.0), 4)
+        self.assertEqual(whole_seconds_up(4.0000001), 4)
+        self.assertEqual(resolve_render_seconds({"duration_sec": 6.5, "target_model": "seedance_2_0"}), 7)
+
     def test_over_max_does_not_clamp(self) -> None:
         with self.assertRaises(DurationOutOfRange):
             resolve_render_seconds({"duration_sec": 20, "target_model": "seedance_2_0"})

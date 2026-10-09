@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
-from .shot_table import SCALES, cast_names, normalize_state
+from .shot_table import EMPTY_SIDES, SCALES, cast_names, framing_subjects, normalize_state
 
 SCENE_CARD_SCHEMA = "scene-cards-v1"
 
@@ -362,6 +362,48 @@ def _by_scene(shots: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
+MID_BAND = (2.0, 5.0)  # most shots landing here reads as one even pace
+CLOSE_SILENT_MAX = 3.0  # a close / insert with no line usually reads in 2–3s
+WIDE_MIN = 4.0  # a wide needs time to be read
+
+
+def _float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def duration_rhythm_checks(table: dict) -> tuple[list[str], list[str]]:
+    """Warnings only: even durations, long silent closes, short wides.
+
+    Rules of thumb (远长近短, 别时长一致), not laws: dialogue closes may hold, a written
+    move_reason or long_take_reason explains a long hold.
+    """
+    warnings: list[str] = []
+    shots = list(table.get("shots") or [])
+    secs = [(s, _float(s.get("duration_sec"))) for s in shots]
+    secs = [(s, d) for s, d in secs if d]
+    if len(secs) >= 8:
+        mid = sum(1 for _, d in secs if MID_BAND[0] < d < MID_BAND[1])
+        if mid / len(secs) > 0.6:
+            short = sum(1 for _, d in secs if d <= MID_BAND[0])
+            long = sum(1 for _, d in secs if d >= MID_BAND[1])
+            warnings.append(
+                f"durations bunch between {MID_BAND[0]:g} and {MID_BAND[1]:g}s ({mid} of {len(secs)}; "
+                f"{short} at or under {MID_BAND[0]:g}s, {long} at or over {MID_BAND[1]:g}s); contrast long and short"
+            )
+    for shot, d in secs:
+        sid = _t(shot.get("shot_id"))
+        scale = _t(shot.get("scale"))
+        explained = bool(_t(shot.get("move_reason")) or _t(shot.get("long_take_reason")))
+        if scale in ("close", "insert") and not shot.get("dialogue_ref") and d > CLOSE_SILENT_MAX and not explained:
+            warnings.append(f"{sid} {scale} with no line holds {d:g}s; a silent close usually reads in {CLOSE_SILENT_MAX:g}s or less")
+        if scale == "wide" and d < WIDE_MIN:
+            warnings.append(f"{sid} wide holds only {d:g}s; give the audience time to read it ({WIDE_MIN:g}s+)")
+    return [], warnings
+
+
 def rhythm_checks(table: dict, cards: Any = None) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -495,28 +537,76 @@ def _primary_subject(shot: dict) -> str:
     return ""
 
 
-def neighbor_changes(prev: dict, shot: dict) -> list[str]:
+def _placement(shot: dict, names: dict[str, str]) -> dict[str, str]:
+    """cast id -> the side whose free text names it ("维波的手" on the left -> vibol: left)."""
+    out: dict[str, str] = {}
+    for side in ("left", "right"):
+        text = _t(shot.get(side))
+        if not text or text in EMPTY_SIDES:
+            continue
+        for cid, name in names.items():
+            if any(word and word in text for word in (name, cid)):
+                out.setdefault(cid, side)
+    return out
+
+
+def _sides_changed(prev: dict, shot: dict, names: dict[str, str]) -> bool:
+    """A side change is a person who is in both shots crossing to the other side.
+
+    Rewording a side ("维波" / "维波的手") or adding someone is not one. Without cast names
+    the raw left/right text is compared, as before.
+    """
+    if names:
+        before, after = _placement(prev, names), _placement(shot, names)
+        if before or after:
+            return any(before[cid] != after[cid] for cid in before.keys() & after.keys())
+    return (_t(prev.get("left")), _t(prev.get("right"))) != (_t(shot.get("left")), _t(shot.get("right")))
+
+
+def _cast_in_frame(shot: dict, names: dict[str, str]) -> Optional[set[str]]:
+    """Who is in the picture: state in_frame first, then cast named inside left/right text."""
+    state = normalize_state(shot.get("state"))
+    if state and state["characters"]:
+        return {cid for cid, item in state["characters"].items() if item.get("in_frame")}
+    placed = _placement(shot, names)
+    if placed:
+        return set(placed)
+    who = framing_subjects(shot, names)
+    return set(who) if who is not None else None
+
+
+def _subject_changed(prev: dict, shot: dict, names: dict[str, str]) -> bool:
+    """The subject changes when no person carries across the cut."""
+    if names:
+        before, after = _cast_in_frame(prev, names), _cast_in_frame(shot, names)
+        if before is not None and after is not None:
+            return bool(before or after) and not (before & after)
+    return _primary_subject(prev) != _primary_subject(shot)
+
+
+def neighbor_changes(prev: dict, shot: dict, names: Optional[dict[str, str]] = None) -> list[str]:
+    names = names or {}
     changes: list[str] = []
     if rank_of(_t(prev.get("scale"))) != rank_of(_t(shot.get("scale"))):
         changes.append(f"scale {_t(prev.get('scale'))}→{_t(shot.get('scale'))}")
     if _t(prev.get("angle") or "eye") != _t(shot.get("angle") or "eye"):
         changes.append(f"angle {_t(prev.get('angle') or 'eye')}→{_t(shot.get('angle') or 'eye')}")
-    if (_t(prev.get("left")), _t(prev.get("right"))) != (_t(shot.get("left")), _t(shot.get("right"))):
+    if _sides_changed(prev, shot, names):
         changes.append("sides")
     if _t(prev.get("move_type") or "static") != _t(shot.get("move_type") or "static"):
         changes.append(f"move {_t(prev.get('move_type') or 'static')}→{_t(shot.get('move_type') or 'static')}")
-    if _primary_subject(prev) != _primary_subject(shot):
+    if _subject_changed(prev, shot, names):
         changes.append("subject")
     return changes
 
 
-def neighbor_checks(table: dict, max_changes: int = 2) -> tuple[list[str], list[str]]:
+def neighbor_checks(table: dict, max_changes: int = 2, names: Optional[dict[str, str]] = None) -> tuple[list[str], list[str]]:
     warnings: list[str] = []
     prev: Optional[dict] = None
     for shot in list(table.get("shots") or []):
         if prev is not None and _t(prev.get("scene_id")) == _t(shot.get("scene_id")):
             if _t(shot.get("coverage_type")) not in ("insert", "pov", "empty"):
-                changes = neighbor_changes(prev, shot)
+                changes = neighbor_changes(prev, shot, names)
                 if len(changes) > max_changes:
                     warnings.append(
                         f"{_t(shot.get('shot_id'))} changes {len(changes)} things at once ({', '.join(changes)}); neighbours should change one, at most two"
@@ -558,10 +648,12 @@ def film_grade_checks(table: dict, writer: Optional[dict] = None) -> tuple[list[
     r_err, r_warn = rhythm_checks(table, cards)
     errors.extend(r_err)
     warnings.extend(r_warn)
+    _, d_warn = duration_rhythm_checks(table)
+    warnings.extend(d_warn)
     l_err, l_warn = light_checks(table)
     errors.extend(l_err)
     warnings.extend(l_warn)
-    _, n_warn = neighbor_checks(table)
+    _, n_warn = neighbor_checks(table, names=cast_names(writer))
     warnings.extend(n_warn)
     return errors, warnings
 

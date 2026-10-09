@@ -34,6 +34,7 @@ from director.direction import (  # noqa: E402
     film_grade_checks,
     grammar_violations,
     light_checks,
+    neighbor_changes,
     neighbor_checks,
     render_scene_cards_md,
     rhythm_checks,
@@ -271,6 +272,19 @@ class Neighbours(unittest.TestCase):
         _, warnings = neighbor_checks({"shots": shots})
         self.assertEqual(warnings, [])
 
+    def test_sides_and_subject_follow_cast_not_wording(self) -> None:
+        names = {"vibol": "维波", "dara": "达拉"}
+        a = shot(shot_id="SH001", scale="otc", left="维波的手和直播手机（前景）", right="坑底跪着的达拉")
+        b = shot(shot_id="SH002", scale="otc", left="坑沿上的维波", right="达拉的肩（前景）")
+        self.assertEqual(neighbor_changes(a, b, names), [])
+        self.assertIn("sides", neighbor_changes(a, b))
+        flipped = shot(shot_id="SH002", scale="otc", left="达拉", right="维波")
+        self.assertIn("sides", neighbor_changes(a, flipped, names))
+        lone_a = shot(shot_id="SH003", scale="close", left="坑壁", right="达拉")
+        lone_b = shot(shot_id="SH004", scale="close", left="维波", right="铅灰的天")
+        self.assertEqual(neighbor_changes(lone_a, lone_b, names), ["subject"])
+        self.assertEqual(neighbor_changes(lone_a, b, names), ["scale close→otc"])
+
 
 class FilmGradeGate(unittest.TestCase):
     def setUp(self) -> None:
@@ -420,7 +434,23 @@ class FrameDescriptions(unittest.TestCase):
         }
         errors = validate_frame_descriptions(data, ["SH010", "SH011"], shots=shots)
         self.assertTrue(any("otc frame_desc facing" in e for e in errors), errors)
-        self.assertTrue(any("facing flips" in e for e in errors), errors)
+        # close -> otc is a new camera setup; like orientation_errors, the flip itself is not a turn error.
+        self.assertFalse(any("facing flips" in e for e in errors), errors)
+
+    def test_frame_desc_facing_flip_needs_turn_only_in_same_setup(self) -> None:
+        def row(sid, **over):
+            base = {"shot_id": sid, "scene_id": "EP01_SC02", "coverage_type": "single", "camera_side": "front", "scale": "medium", "one_action": "她站着", "in_from": "站着", "out_to": "站着"}
+            base.update(over)
+            return base
+
+        def item(sid, facing):
+            return frame_item(sid, subject={"facing": facing, "hands": "垂着", "holding": "空手", "micro_expression": "嘴闭着"})
+
+        data = {"schema": FRAME_DESC_SCHEMA, "items": [item("SH001", "朝镜头"), item("SH002", "背对镜头")]}
+        same = validate_frame_descriptions(data, ["SH001", "SH002"], shots=[row("SH001"), row("SH002")])
+        self.assertTrue(any("SH002 frame_desc facing flips" in e for e in same), same)
+        moved = validate_frame_descriptions(data, ["SH001", "SH002"], shots=[row("SH001"), row("SH002", coverage_type="reverse", camera_side="behind")])
+        self.assertFalse(any("facing flips" in e for e in moved), moved)
 
     def test_sentence_and_keyframe_prompt(self) -> None:
         from director.prompts import compile_keyframe_prompt_zh
@@ -434,6 +464,16 @@ class FrameDescriptions(unittest.TestCase):
         self.assertIn("画面描述：", prompt)
         self.assertNotIn("画面描述：", compile_keyframe_prompt_zh({}, good_shots()[1]))
         self.assertEqual(list(index_by_shot({"items": [frame_item("SH001")]})), ["SH001"])
+
+    def test_angkor_guard_lifts_only_where_the_shot_wants_angkor(self) -> None:
+        from director.prompts import compile_keyframe_prompt_zh
+
+        plain = good_shots()[1]
+        self.assertIn("无吴哥塔", compile_keyframe_prompt_zh({}, plain))
+        temple = dict(plain, right="天边的吴哥五塔（远景，虚）")
+        prompt = compile_keyframe_prompt_zh({}, temple)
+        self.assertNotIn("无吴哥塔", prompt)
+        self.assertIn("无字幕", prompt)
 
     def test_pick_up_first_still_rejects_result_accepts_pre_state(self) -> None:
         shot = {
@@ -1102,3 +1142,25 @@ class ModelNotes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DurationRhythm(unittest.TestCase):
+    def test_even_durations_silent_close_short_wide(self) -> None:
+        from director.direction import duration_rhythm_checks
+        from director.shot_table import finding_group
+
+        shots = [shot(shot_id=f"SH{i:03d}", scale="medium", duration_sec=3.5) for i in range(1, 11)]
+        _, warnings = duration_rhythm_checks({"shots": shots})
+        self.assertTrue(any(w.startswith("durations bunch between 2 and 5s (10 of 10") for w in warnings), warnings)
+        shots[0].update(scale="close", duration_sec=4)
+        shots[1].update(scale="wide", duration_sec=3)
+        shots[2].update(scale="close", duration_sec=4, move_reason="慢推给足时间")
+        shots[3].update(scale="close", duration_sec=5, dialogue_ref=[{"character": "速卡", "line": "水往哪走，河床都替你记着。"}])
+        _, warnings = duration_rhythm_checks({"shots": shots})
+        self.assertIn("SH001 close with no line holds 4s; a silent close usually reads in 3s or less", warnings)
+        self.assertIn("SH002 wide holds only 3s; give the audience time to read it (4s+)", warnings)
+        self.assertFalse(any(w.startswith(("SH003", "SH004")) for w in warnings), warnings)
+        self.assertEqual(finding_group(warnings[-1]), "director")
+        varied = [shot(shot_id=f"SH{i:03d}", scale="medium", duration_sec=d) for i, d in enumerate([1.5, 6, 2, 7, 1.5, 3, 6, 2, 5.5, 1.5], 1)]
+        _, warnings = duration_rhythm_checks({"shots": varied})
+        self.assertFalse(any("bunch" in w for w in warnings), warnings)

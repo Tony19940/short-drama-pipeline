@@ -31,7 +31,12 @@ TIGHT_SCALES = {"close", "otc", "insert"}
 ANGLES = ("eye", "high", "low")
 HEIGHTS = ("standing", "chest", "low", "ground", "high", "underwater", "eye")
 COVERAGE = ("master", "otc", "ots", "reverse", "reaction", "insert", "empty", "continuous", "close", "single", "pov", "follow")
-DELIVERY = ("none", "post", "on_camera")
+# How a line is heard. Everything but `none` and legacy `post` is spoken by the video model: the Khmer dub
+# clones each voice from the Chinese in the clip (012 EP01: post lines came out silent, nothing to clone).
+DELIVERY = ("none", "post", "on_camera", "off_camera", "phone", "inner", "narration")
+VOICED = ("on_camera", "off_camera", "phone", "inner", "narration")
+# Human sounds in key_sfx compete with the line for the voice track: one voice per shot.
+VOCAL_SFX = re.compile(r"尖叫|惨叫|喊|吼|哭|笑声|呻吟|喘叫|嚎")
 FORBIDDEN_KEYS = ("prompt", "video_prompt", "image_prompt", "motion_prompt", "asset_id", "image_file", "keyframe_file", "frame_description")
 # Per-shot world state. Costume is a free state id that must resolve to an asset; binding is an enum so the
 # machine can tell "hands behind" from "hands in front" without reading Chinese.
@@ -81,6 +86,11 @@ MUST_HOLD_ACTION = re.compile(r"穿过|穿进|穿出|笔尖|透身|透出|门槛
 MOVE_INTENSITY = {"static": 0, "push": 3, "pull": 3, "pan": 3, "tilt": 3, "track": 5, "follow": 5, "handheld": 4, "crane": 6}
 CHARS_PER_SEC = 4.0
 LINE_PAUSE_SEC = 0.8
+# Khmer voice-clone speech, calibrated on 004-yuye-jinlian's real dub (8 cues, 2026-10-08):
+# Khmer letters (U+1780–U+17B3, subscripts included) per second. Dialogue ran 5.6–8.2,
+# narration 8.5–9.1; dialogue sits at the slow end so a shot keeps some air.
+KM_LETTERS_PER_SEC = {"dialogue": 6.0, "inner": 6.0, "narration": 8.5, "intro": 8.5}
+KM_PAUSE_SEC = 0.4
 CLAUSE_SEC = 1.5
 BASE_ACTION_SEC = 2.0
 
@@ -152,6 +162,80 @@ def record_human_design_review(
     if errors:
         raise ValueError(" / ".join(errors))
     return payload
+
+
+# Validator messages grouped by what they cost the audience, so a reviewer sees "too short to read"
+# before a misspelled enum. Matching runs in MATCH order; reports print in DISPLAY order.
+FINDING_GROUPS: dict[str, tuple[str, re.Pattern]] = {
+    "audience": ("影响看懂", re.compile(
+        r"needs about [\d.]+s for its action and lines|\b(?:may )?repeats? SH|cannot show distant content"
+        r"|^evidence |scene card says the shot is|the_shot says 同框|changes topic; review attention"
+    )),
+    "continuity": ("连戏与空间", re.compile(
+        r"flips|facing|axis|key light|light quality|day_night|state|after its last scene|before its first scene"
+        r"|camera_id|camera \S+ belongs to|differs from writer scene|behind the foreground|over-shoulder|^set \S+:"
+    )),
+    "model": ("模型能力", re.compile(
+        r"model (?:min|max)|exceeds model|internal cut|internal_cuts|not allowed for|not supported by"
+        r"|forbidden for this model|cannot visit two sets|outside to inside|clauses; review information"
+        r"|two verbs|consecutive long takes|s > [\d.]+s; review whether"
+    )),
+    "script": ("台词与剧本", re.compile(
+        r"writer line|line not assigned|line appears in|carries \d+ lines|has lines but"
+    )),
+    "director": ("导演层（场卡、母题、表演）", re.compile(
+        r"scene card|motif|emotion|ending hook|the shot \(|tightest|flat rhythm|three shots in a row"
+        r"|only one scale|visual_grammar|acting_adjective|durations bunch|with no line holds|wide holds only"
+    )),
+    "review": ("审阅状态", re.compile(
+        r"not reviewed|narrative_review|legacy pass|declaration|visible_change_without_dialogue"
+    )),
+    "format": ("格式", re.compile(
+        r"must be one of|schema must be|shot table empty|duplicate shot_id|must look like|bad coverage_type"
+        r"|must be a positive number|total_sec .* != sum|left_right_lock|continuity_bible missing"
+        r"|design cannot carry|not in sets\.json|move needs a reason|needs a note|must be 0–10"
+        r"|^\S+ missing (?:scene_id|beat|shot_job|coverage_type|scale|lens|one_action|in_from|out_to|move_type)$"
+    )),
+}
+FINDING_MATCH_ORDER = ("review", "audience", "format", "continuity", "model", "script", "director")
+FINDING_DISPLAY_ORDER = ("audience", "continuity", "model", "script", "director", "review", "format", "other")
+
+
+def finding_group(message: str) -> str:
+    text = _t(message)
+    for key in FINDING_MATCH_ORDER:
+        if FINDING_GROUPS[key][1].search(text):
+            return key
+    return "other"
+
+
+def triage_findings(messages: list[str]) -> list[tuple[str, str, list[str]]]:
+    """(group key, label, messages) in display order; empty groups are left out."""
+    buckets: dict[str, list[str]] = {}
+    for message in messages:
+        buckets.setdefault(finding_group(message), []).append(_t(message))
+    out = []
+    for key in FINDING_DISPLAY_ORDER:
+        if buckets.get(key):
+            label = FINDING_GROUPS[key][0] if key in FINDING_GROUPS else "其他"
+            out.append((key, label, buckets[key]))
+    return out
+
+
+def findings_report(messages: list[str], *, title: str, per_group: int = 10) -> list[str]:
+    """Readable lines for a CLI or review page. The audience group is always printed in full."""
+    groups = triage_findings(messages)
+    if not groups:
+        return []
+    counts = " · ".join(f"{label} {len(items)}" for _key, label, items in groups)
+    lines = [f"{title} {len(messages)}（{counts}）"]
+    for key, label, items in groups:
+        lines.append(f"[{label}] {len(items)}")
+        shown = items if key == "audience" else items[:per_group]
+        lines.extend(f"  {item}" for item in shown)
+        if len(items) > len(shown):
+            lines.append(f"  … 另有 {len(items) - len(shown)} 条")
+    return lines
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -234,7 +318,7 @@ def dialogue_seconds(lines: list[str]) -> float:
             continue
         if KHMER_RE.search(text):
             consonants = len(KHMER_CONSONANT.findall(text))
-            total += (consonants / 5.2) + 0.5
+            total += consonants / KM_LETTERS_PER_SEC["dialogue"] + KM_PAUSE_SEC
         else:
             total += len(text) / CHARS_PER_SEC + LINE_PAUSE_SEC
     return round(total, 1)
@@ -414,20 +498,38 @@ def paper_floor_waived(data: dict, shot: dict) -> bool:
     return bool(shot.get("opening_hook"))
 
 
+def line_seconds(item: dict) -> float:
+    """One dialogue_ref line: the Chinese take or the Khmer dub (`km_sec`, from the dialogue gate), whichever is longer."""
+    zh = dialogue_seconds([_t(item.get("line"))])
+    try:
+        km = float(item.get("km_sec") or 0)
+    except (TypeError, ValueError):
+        km = 0.0
+    return max(zh, km)
+
+
 def needed_seconds(shot: dict) -> float:
     """Minimum paper seconds this shot must hold. Reaction/insert can sit under 2s."""
-    lines = [_t(item.get("line")) for item in (shot.get("dialogue_ref") or []) if isinstance(item, dict)]
-    spoken = dialogue_seconds(lines)
+    items = [item for item in (shot.get("dialogue_ref") or []) if isinstance(item, dict)]
+    lines = [_t(item.get("line")) for item in items]
+    if any(item.get("km_sec") for item in items):
+        spoken = round(sum(line_seconds(item) for item in items if _t(item.get("line"))), 1)
+    else:
+        spoken = dialogue_seconds(lines)
     coverage = _t(shot.get("coverage_type"))
     if coverage == "reaction" and not spoken:
         return PAPER_REACTION[0]
     if coverage == "insert" and not spoken:
         return PAPER_INSERT[0]
+    # A landing that adds a posture or a walk (站起 / 走向) needs its own time after the line (012 SH005).
+    from .action_lint import added_action_seconds
+
+    landing = added_action_seconds(shot)
     if spoken:
         extra = 0.4 if coverage == "reaction" or len(lines) == 1 else BASE_ACTION_SEC
-        return round(max(PAPER_DIALOGUE[0], spoken + extra), 1)
+        return round(max(PAPER_DIALOGUE[0], spoken + extra + landing), 1)
     clauses = clauses_of(shot.get("one_action") or shot.get("action_ref") or "")
-    action_sec = BASE_ACTION_SEC + CLAUSE_SEC * max(0, len(clauses) - 1)
+    action_sec = BASE_ACTION_SEC + CLAUSE_SEC * max(0, len(clauses) - 1) + landing
     return round(action_sec, 1)
 
 
@@ -655,15 +757,59 @@ def normalize_state(state: Any) -> Optional[dict]:
             "carrying": sorted(_t(x) for x in (carrying or []) if _t(x)),
             "in_frame": item.get("in_frame", True) is not False,
         }
+        # where the body is (continuity.py): pose 站/蹲/跪…, spot 坑底/坑沿…, and the end values if the shot moves them
+        for key in ("pose", "pose_end", "spot", "spot_end"):
+            if _t(item.get(key)):
+                characters[_t(cid)][key] = _t(item.get(key))
     props = state.get("props")
     if isinstance(props, str):
         props = [props]
+    # Prop condition the story depends on, as a sentence the camera can see:
+    # {"bamboo-tube": "竹筒里的水是满的"}. A change from the last shot that stated it is a state change.
+    raw_states = state.get("prop_states") if isinstance(state.get("prop_states"), dict) else {}
+    prop_states = {_t(k): _t(v) for k, v in raw_states.items() if _t(k) and _t(v)}
     return {
         "characters": characters,
         "props": [_t(x) for x in (props or []) if _t(x)],
+        "prop_states": prop_states,
         "location": _t(state.get("location")),
         "note": _t(state.get("note")),
     }
+
+
+EMPTY_SIDES = ("空", "—", "-", "无")
+
+
+def framing_subjects(shot: dict, names: Optional[dict[str, str]] = None) -> Optional[tuple[str, ...]]:
+    """Who the picture shows, as cast ids where known; None when the table does not say.
+
+    Sources in order: per-shot state (in_frame), named left/right, on-camera speakers,
+    then the first cast name in one_action. An empty tuple means a known empty frame.
+    """
+    names = names or {}
+    to_id = {name: cid for cid, name in names.items() if name}
+
+    def canon(items) -> tuple[str, ...]:
+        return tuple(sorted({to_id.get(x, x) for x in items}))
+
+    state = normalize_state(shot.get("state"))
+    if state and state["characters"]:
+        return canon(cid for cid, item in state["characters"].items() if item.get("in_frame"))
+    sides = [x for x in (_t(shot.get("left")), _t(shot.get("right"))) if x and x not in EMPTY_SIDES]
+    if sides:
+        return canon(sides)
+    if _t(shot.get("dialogue_delivery")) == "on_camera":
+        speakers = [_t(d.get("character")) for d in shot.get("dialogue_ref") or [] if isinstance(d, dict) and _t(d.get("character"))]
+        if speakers:
+            return canon(speakers)
+    action = _t(shot.get("one_action"))
+    lead: Optional[tuple[int, str]] = None
+    for cid, name in names.items():
+        for word in (cid, name):
+            at = action.find(word) if word else -1
+            if at >= 0 and (lead is None or at < lead[0]):
+                lead = (at, cid)
+    return (lead[1],) if lead else None
 
 
 def shot_text(shot: dict) -> str:
@@ -747,7 +893,8 @@ def state_sentence(state: Optional[dict], bible: Optional[dict] = None) -> str:
     if not state:
         return ""
     if state.get("note"):
-        return state["note"]
+        extra = [v for v in (state.get("prop_states") or {}).values() if v and v not in state["note"]]
+        return "；".join([state["note"].rstrip("。；")] + extra) if extra else state["note"]
     index = bible_prop_index(bible or {})
     bits: list[str] = []
     for cid, item in (state.get("characters") or {}).items():
@@ -780,6 +927,7 @@ def validate_state_chain(data: dict, *, writer: Optional[dict] = None) -> tuple[
     for sid in scene_ids:
         scene_order.setdefault(sid, len(scene_order))
     current: dict[str, dict] = {}
+    current_props: dict[str, tuple[str, str]] = {}  # prop id -> (state sentence, shot that stated it)
 
     def check_span(sid: str, here: int, pid: str, role: str) -> None:
         prop = prop_index.get(pid)
@@ -828,10 +976,26 @@ def validate_state_chain(data: dict, *, writer: Optional[dict] = None) -> tuple[
             for pid in item["carrying"]:
                 check_span(sid, here, pid, "carried prop")
             if item["bound_with"]:
-                check_span(sid, here, item["bound_with"], "binding prop")
+                if item["binding"] == "held" and item["bound_with"] in cast:
+                    # held by a person: bound_with names who holds them, not a prop
+                    if item["bound_with"] not in state["characters"]:
+                        warnings.append(f"{sid} {cid} is held by {item['bound_with']}, who is not in state.characters")
+                else:
+                    check_span(sid, here, item["bound_with"], "binding prop")
             current[cid] = item
         for pid in state["props"]:
             check_span(sid, here, pid, "prop")
+        for pid, value in state["prop_states"].items():
+            tag = f"prop.{pid}"
+            before = current_props.get(pid)
+            if before and before[0] != value:
+                seen.add(tag)
+                if tag not in declared:
+                    errors.append(
+                        f"{sid} {tag} changes 「{before[0]}」({before[1]})→「{value}」 without state_changes; "
+                        "if the story needs it unchanged, the earlier shot must not use it up (held_action)"
+                    )
+            current_props[pid] = (value, sid)
         for tag in sorted(declared - seen):
             warnings.append(f"{sid} declares state change {tag} but nothing changed")
         text = shot_text(shot)
@@ -898,6 +1062,7 @@ def validate_shot_table(
     partial: bool = False,
     prod: Any = None,
     require_review: bool = False,
+    lines: Optional[dict] = None,
 ) -> tuple[list[str], list[str]]:
     """Return (errors, warnings).
 
@@ -914,6 +1079,9 @@ def validate_shot_table(
     forbidden_moves = set(profile.get("forbidden_moves") or ())
     max_cuts = int(profile.get("max_internal_cuts") or 0)
     native_dialogue = bool(profile.get("native_dialogue_audio"))
+    from .speech import table_says_post_dub
+
+    post_dub_table = _t(data.get("speech_mode")) == "post_dub" or table_says_post_dub(data)
     look_tokens = look_forbidden_tokens(look_text)
 
     if _t(data.get("schema")) != SCHEMA:
@@ -955,6 +1123,7 @@ def validate_shot_table(
     scene_location = writer_locations(writer)
     lines_by_scene = writer_lines(writer)
     all_writer_lines = {line for lines in lines_by_scene.values() for line in lines}
+    names = cast_names(writer)
 
     ids: list[str] = []
     order: dict[str, int] = {}
@@ -1033,6 +1202,18 @@ def validate_shot_table(
                 f"{sid} one_action has two verbs (和/再/然后/并); review continuity and information, splitting is optional",
             )
 
+        # The video model acts out every verb and fills spare seconds (012 SH022 drank, SH005 stood out of frame).
+        from .action_lint import action_findings
+
+        action_errors, action_warnings = action_findings(shot, sid)
+        errors.extend(action_errors)
+        warnings.extend(action_warnings)
+        from .continuity import shot_findings
+
+        cont_errors, cont_warnings = shot_findings(shot, sid)
+        errors.extend(cont_errors)
+        warnings.extend(cont_warnings)
+
         move = _t(shot.get("move_type") or ("static" if _t(shot.get("move_needed")) in ("", "static") else ""))
         if not move:
             errors.append(f"{sid} missing move_type")
@@ -1068,13 +1249,33 @@ def validate_shot_table(
         dialogue = [item for item in (shot.get("dialogue_ref") or []) if isinstance(item, dict)]
         if len(dialogue) > 2:
             errors.append(f"{sid} carries {len(dialogue)} lines; max 2 per shot, give the rest a reverse")
-        delivery = _t(shot.get("dialogue_delivery") or ("none" if not dialogue else "post"))
+        delivery = _t(shot.get("dialogue_delivery") or ("none" if not dialogue else "on_camera"))
         if delivery not in DELIVERY:
             errors.append(f"{sid} dialogue_delivery must be one of {list(DELIVERY)}")
-        if delivery == "on_camera" and not native_dialogue:
-            errors.append(f"{sid} on_camera dialogue not supported by {profile.get('id') or 'this model'}; use post")
+        if delivery in VOICED and not native_dialogue:
+            errors.append(f"{sid} {delivery} dialogue not supported by {profile.get('id') or 'this model'}; use post")
         if dialogue and delivery == "none":
             errors.append(f"{sid} has lines but dialogue_delivery=none")
+        if dialogue and delivery == "post" and native_dialogue and not post_dub_table:
+            errors.append(
+                f"{sid} dialogue_delivery=post leaves the line silent, and the Khmer dub clones from the Chinese voice; "
+                "use on_camera, off_camera, phone, inner or narration"
+            )
+        if dialogue and delivery in VOICED:
+            in_frame_ids = {cid for cid, item in ((normalize_state(shot.get("state")) or {}).get("characters") or {}).items()
+                            if item.get("in_frame")}
+            in_frame_ids |= {names.get(cid, "") for cid in in_frame_ids} - {""}  # lines may name people by display name
+            for item in dialogue:
+                how = _t(item.get("delivery")) or delivery
+                who = _t(item.get("character"))
+                if how == "on_camera" and in_frame_ids and who and who not in in_frame_ids:
+                    errors.append(f"{sid} on_camera line by {who}, who is not in frame; use off_camera or phone")
+            vocal = [x for x in (shot.get("key_sfx") or []) if VOCAL_SFX.search(_t(x))]
+            if vocal:
+                errors.append(
+                    f"{sid} key_sfx {vocal} puts a second voice under the line; one voice per shot "
+                    "(the clone needs a clean voice, and viewers must hear who speaks). Give that sound its own shot"
+                )
         for item in dialogue:
             line = _t(item.get("line"))
             if all_writer_lines and line and not is_writer_line_or_fragment(line, all_writer_lines):
@@ -1111,15 +1312,27 @@ def validate_shot_table(
         if scale:
             per_scene_scales.setdefault(scene_id, set()).add(scale)
         if prev is not None and _t(prev.get("scene_id")) == scene_id:
-            same = (
+            prev_camera, camera = _t(prev.get("camera_id")), _t(shot.get("camera_id"))
+            same_frame = (
                 _t(prev.get("scale")) == scale
                 and _t(prev.get("coverage_type")) == coverage
                 and _t(prev.get("left")) == left
                 and _t(prev.get("right")) == right
+                and _t(prev.get("angle") or "eye") == angle
+                and not (prev_camera and camera and prev_camera != camera)
                 and coverage not in ("pov", "insert", "continuous")
             )
-            if same:
-                errors.append(f"{sid} repeats {_t(prev.get('shot_id'))}: same scene, scale, coverage, and sides in a row")
+            if same_frame:
+                prev_who, who = framing_subjects(prev, names), framing_subjects(shot, names)
+                if prev_who is None or who is None:
+                    warnings.append(
+                        f"{sid} may repeat {_t(prev.get('shot_id'))}: same scale, angle and coverage; "
+                        "add state.characters or left/right so the check can tell who is in frame"
+                    )
+                elif prev_who == who:
+                    errors.append(
+                        f"{sid} repeats {_t(prev.get('shot_id'))}: same subject, scale, angle and coverage in a row reads as a jump cut"
+                    )
         prev = shot
 
     if len(ids) != len(set(ids)):
@@ -1199,6 +1412,13 @@ def validate_shot_table(
 
     errors.extend(orientation_errors(shots))
 
+    # Bodies carry their pose and spot from shot to shot; events have a setup; scenes end with a transition.
+    from .continuity import sequence_findings
+
+    seq_errors, seq_warnings = sequence_findings(shots, names)
+    errors.extend(seq_errors)
+    warnings.extend(seq_warnings)
+
     # Acting is behavior: feeling words in expression / business / muscle / change only warn.
     from .acting import acting_warnings
 
@@ -1211,6 +1431,18 @@ def validate_shot_table(
         direction_errors, direction_warnings = film_grade_checks(data, writer=writer)
         errors.extend(direction_errors)
         warnings.extend(direction_warnings)
+
+    # Dialogue gate: once an episode has a lines artifact, every line carries its Khmer seconds.
+    if lines and lines.get("lines"):
+        from .lines import timing_stamp_errors
+
+        errors.extend(timing_stamp_errors(data, lines))
+    # Name cards: placed on a shot where the person is in frame, above the subtitle band, text from the dialogue gate.
+    from .name_cards import validate_name_cards
+
+    card_errors, card_warnings = validate_name_cards(data, lines)
+    errors.extend(card_errors)
+    warnings.extend(card_warnings)
     return errors, warnings
 
 
@@ -1445,6 +1677,7 @@ def table_context(prod, target_model: Optional[str] = None, episode=1) -> dict:
         "look_text": read_text(prod, "02-assets/LOOK.md"),
         "profile": get_profile(model),
         "prod": prod,
+        "lines": read_artifact(prod, episode_artifact_name("lines.json", episode)),
     }
 
 
@@ -1487,7 +1720,10 @@ def render_shot_table_md(
     if dropped:
         lines.append(f"- **删掉的镜**：{'；'.join(_t(d) for d in dropped)}")
     if warnings:
-        lines.append("- **警告**：" + "；".join(warnings))
+        groups = triage_findings(warnings)
+        lines.append("- **警告**：" + " · ".join(f"{label} {len(items)}" for _key, label, items in groups))
+        for _key, label, items in groups:
+            lines.append(f"  - {label}：" + "；".join(items))
     if data.get("scene_cards"):
         lines.append("- **场卡**：见 `03-storyboard/scene-cards.draft.md`（导演阐述层，拆镜依据）")
     picks = data.get("candidate_picks") if isinstance(data.get("candidate_picks"), dict) else {}

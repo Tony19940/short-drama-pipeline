@@ -138,9 +138,12 @@ class PackagePlanHonorTests(unittest.TestCase):
 class CompileEpisodeTwoTests(unittest.TestCase):
     def test_ep02_table_validates_and_packages_keep_empty_keyframe_files(self):
         errors, warnings, table = validate_episode(PROD, 2)
-        self.assertEqual(errors, [], msg=errors)
+        # 009 EP02 was written before the action-text rule (012 EP01 draft, 2026-10-08): its only errors are
+        # intention phrases (要动 / 准备把板 …) the video model would act out. Fix them before rendering EP02.
+        self.assertTrue(errors, "009 EP02 still carries intention phrases; update this test once they are rewritten")
+        self.assertTrue(all("an intention the camera cannot see" in e for e in errors), msg=errors)
         self.assertGreaterEqual(len(table.get("shots") or []), 20)
-        result = compile_episode(PROD, 2, confirm=True, write=False)
+        result = compile_episode(PROD, 2, confirm=True, write=False, from_table=True)
         self.assertTrue(result["ok"], result.get("errors"))
         packages = result["packages"]["packages"]
         self.assertEqual(len(packages), len(table["shots"]))

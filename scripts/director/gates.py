@@ -41,10 +41,25 @@ def _shots(prod: Path) -> list[dict]:
 
         return list_shots(ctx)
     path = prod / "03-storyboard" / "shots.json"
-    if not path.exists():
+    if not path.exists() or is_template_copy(prod, "03-storyboard/shots.json"):
         return []
     data = json.loads(path.read_text(encoding="utf-8"))
     return list(data.get("shots") or [])
+
+
+TEMPLATE_ROOT = ROOT / "productions" / "_template"
+
+
+def is_template_copy(prod: Path, rel: str) -> bool:
+    """True when prod/<rel> is still the untouched _template placeholder (whitespace aside).
+
+    New shows are copied from _template, so placeholder files exist from day one;
+    existence alone must not count as a script, a storyboard or a shot.
+    """
+    try:
+        return (Path(prod) / rel).read_text(encoding="utf-8").strip() == (TEMPLATE_ROOT / rel).read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
 
 
 def _costume_state_dirs(prod: Path) -> set[str]:
@@ -378,9 +393,12 @@ def _c2_still_t0_note(prod: Path) -> str:
     from .pipeline import read_artifact
     from .still_t0 import issues_for_table
 
+    from .shot_table import cast_names
+
     table = read_artifact(prod, "shot_list.json")
     descs = index_by_shot(read_artifact(prod, "frame_descriptions.json"))
-    warns = issues_for_table(list(table.get("shots") or []), descs)
+    names = cast_names(read_artifact(prod, "writer.json")).values()
+    warns = issues_for_table(list(table.get("shots") or []), descs, names)
     if not warns:
         return ""
     return f"（首帧 t=0 警告 {len(warns)}：{warns[0]}）"
@@ -404,6 +422,13 @@ def gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, epis
             return False, str(exc)
 
 
+GATE_A_FILES = (("confirm", "confirm.md"), ("blueprint", "blueprint.md"), ("episode", "ep01.md"))
+
+
+def _still_template(prod: Path, name: str) -> bool:
+    return is_template_copy(prod, f"01-bible/{name}")
+
+
 def _gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, episode=1) -> tuple[bool, str]:
     files = files or inspect_files(prod, episode)
     if gate_id == "0":
@@ -416,7 +441,16 @@ def _gate_file_ready(prod: Path, gate_id: str, files: Optional[dict] = None, epi
         return False, "还没有故事源。填简报后上传 Inkos 导出，或上传小说/剧本"
     if gate_id == "A":
         missing = [name for name in ("confirm", "blueprint", "episode") if not files[name]]
-        return (not missing, "缺 " + ", ".join(missing) if missing else "剧本/确认/蓝图齐全")
+        # A new show is copied from _template, so these files exist from day one; an untouched copy is not a script.
+        blank = [name for name, rel in GATE_A_FILES if files[name] and _still_template(prod, rel)]
+        if missing or blank:
+            parts = (["缺 " + ", ".join(missing)] if missing else []) + (["仍是空模板 " + ", ".join(blank)] if blank else [])
+            return False, "；".join(parts)
+        return True, "剧本/确认/蓝图齐全"
+    if gate_id == "L":
+        from .lines import gate_ready
+
+        return gate_ready(prod, episode)
     if gate_id == "B":
         if not files["characters"]:
             return False, "还没有角色主图"

@@ -13,7 +13,7 @@ import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 SCRIPTS = Path(__file__).resolve().parent
 ROOT = SCRIPTS.parent
@@ -584,20 +584,58 @@ def require_render_plan_review(prod: Path, plan: dict) -> None:
                         raise PermissionError(f"{item['shot_id']} confirmed request media changed after review: {rel}")
 
 
-def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
+def draft_dir(plan: dict, resolution: str) -> str:
+    return f"{plan.get('dest_dir') or episode_shot_dir(plan.get('episode') or 1)}/draft-{resolution}"
+
+
+def asset_resolver(prod: Path, plan: dict, shot_id: Callable[[], str]):
+    """Frames go to the private portrait library; Seedance gets asset:// instead of image bytes."""
+    from director.ark_assets import ensure_asset
+
+    group = f"{prod.name[:40]} {plan.get('episode_label') or episode_label(plan.get('episode') or 1) or 'ep'}"
+
+    def resolve(path: Path, data: bytes) -> str:
+        try:
+            rel = str(path.resolve().relative_to(prod.resolve()))
+        except ValueError:
+            rel = path.name
+        url = ensure_asset(prod, data, source=rel, group_name=group, label=f"{shot_id()}-{path.stem}")
+        print(f"  {rel} -> {url}", flush=True)
+        return url
+
+    return resolve
+
+
+def render_plan(
+    prod: Path,
+    plan: dict,
+    *,
+    skip_existing: bool = True,
+    via_assets: bool = False,
+    draft_resolution: str = "",
+) -> None:
     require_render_plan_review(prod, plan)
     load_dotenv()
-    out_dir = prod / (plan.get("dest_dir") or episode_shot_dir(plan.get("episode") or 1))
+    draft = bool(draft_resolution)
+    out_rel = draft_dir(plan, draft_resolution) if draft else (plan.get("dest_dir") or episode_shot_dir(plan.get("episode") or 1))
+    out_dir = prod / out_rel
     out_dir.mkdir(parents=True, exist_ok=True)
+    current = {"sid": ""}
     for item in plan["shots"]:
         sid = item["shot_id"]
+        current["sid"] = sid
         if not item.get("ok"):
             raise SystemExit(f"{sid} 还不能出片：" + "; ".join(item.get("errors") or []))
+        if draft:
+            # Drafts are for finding problems: own folder, no take record, no extracted-end sidecar.
+            item = {**item, "dest": f"{out_rel}/{sid}.mp4", "extracted_last": f"{out_rel}/{sid}-last.jpg"}
         dest = prod / item["dest"]
         dest.parent.mkdir(parents=True, exist_ok=True)
         request = VendorRequest.from_dict(item["vendor_request"]) if item.get("vendor_request") else None
         if skip_existing and request is not None and SeedanceArk.clip_matches_request(dest, request.fingerprint()):
             print(f"  {sid} reusable {item['dest']}, skip")
+            if draft:
+                continue
             _record_plan_take(prod, plan, item, dest, request, record={"backend": "reuse"}, new_attempt=False)
             _record_extracted_end(prod, item, dest, plan.get("episode") or 1)
             continue
@@ -620,6 +658,10 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
             source = safe_under(prod, item["source_video"])
         refs = [safe_under(prod, rel) for rel in ((request.refs if request else item.get("refs")) or []) if rel]
         backend = _backend_for_item(item)
+        if draft:
+            backend.resolution = draft_resolution
+        if via_assets:
+            backend.asset_resolver = asset_resolver(prod, plan, lambda: current["sid"])
         allow_h3 = bool(item.get("force_h3_fallback") or item.get("allow_h3_fallback") or (request and request.allow_h3_fallback))
         if item.get("force_h3_fallback"):
             from director.video_fallback import official_h3_fallback
@@ -654,6 +696,9 @@ def render_plan(prod: Path, plan: dict, *, skip_existing: bool = True) -> None:
                 prod=prod,
             )
         item["clip"] = record
+        if draft:
+            print(f"  draft {item['dest']} ({draft_resolution}, not a take)", flush=True)
+            continue
         _record_plan_take(prod, plan, item, dest, request, record, new_attempt=not skip_existing)
         _record_extracted_end(prod, item, dest, plan.get("episode") or 1)
         print(f"  extracted last {item['extracted_last']} (identity review pending)")
@@ -776,6 +821,17 @@ def main() -> None:
         help="集数或标签：1、2、ep01-v2。标签成片落到 05-shots/<label>/，不覆盖无后缀 05-shots/",
     )
     parser.add_argument(
+        "--via-assets",
+        action="store_true",
+        help="send frames as asset:// from the Ark portrait library (AI faces); needs VOLC_* keys and TOS bucket in .env",
+    )
+    parser.add_argument(
+        "--draft",
+        default="",
+        choices=["", "480p", "720p"],
+        help="draft pass: override resolution, write to 05-shots/<ep>/draft-<res>/, no take records",
+    )
+    parser.add_argument(
         "--from-snapshot",
         default="",
         help="confirmed request snapshot (.pipeline/confirmed-requests/<hash>.json). Worker must pass this.",
@@ -835,7 +891,9 @@ def main() -> None:
             raise SystemExit("--h3-fallback needs --only SHxxx (do not dump a whole episode onto H3)")
         for item in plan["shots"]:
             item["force_h3_fallback"] = True
-    render_plan(prod, plan, skip_existing=not args.force)
+    if args.draft and args.h3_fallback:
+        raise SystemExit("--draft does not mix with --h3-fallback")
+    render_plan(prod, plan, skip_existing=not args.force, via_assets=args.via_assets, draft_resolution=args.draft)
 
 
 if __name__ == "__main__":

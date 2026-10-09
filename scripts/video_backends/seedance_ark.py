@@ -210,6 +210,8 @@ class SeedanceArk:
         self.max_duration = int(max_duration if max_duration is not None else os.environ.get("ARK_MAX_DURATION", "15"))
         self.generate_audio = bool(generate_audio) if generate_audio is not None else _truthy("ARK_GENERATE_AUDIO", "1")
         self.watermark = _truthy("ARK_WATERMARK", "0")
+        # Optional: (path, bytes) -> "asset://..." so AI faces go through the private portrait library.
+        self.asset_resolver = None
 
     @classmethod
     def from_request(cls, request: object) -> "SeedanceArk":
@@ -266,10 +268,21 @@ class SeedanceArk:
             )
         return value
 
+    def _media_bytes(self, image: Path) -> bytes:
+        cache = getattr(self, "_verified_media", None) or {}
+        if cache:
+            data = cache.get(str(Path(image).resolve()))
+            if data is None:
+                raise RuntimeError(f"no verified bytes for {image}")
+            return data
+        return Path(image).read_bytes()
+
     def _image_item(self, image: Path, role: str | None = None) -> dict:
+        resolver = getattr(self, "asset_resolver", None)
+        url = resolver(Path(image), self._media_bytes(image)) if resolver else self._data_url(image)
         item = {
             "type": "image_url",
-            "image_url": {"url": self._data_url(image)},
+            "image_url": {"url": url},
         }
         if role:
             item["role"] = role

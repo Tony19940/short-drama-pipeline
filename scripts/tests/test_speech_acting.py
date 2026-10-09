@@ -244,6 +244,18 @@ class AudioBlock(unittest.TestCase):
         self.assertTrue(block.endswith("环境声只保留七线缝纫机运转声、布甩在地上，无音乐，无字幕。"))
         self.assertNotIn("对白不进画面", block)
 
+    def test_speaker_written_as_cast_id_is_on_screen_and_speaks(self) -> None:
+        from director.speech import name_speakers
+
+        raw = [{"character": "chanthy", "line": "车底下塞的什么？"}]
+        broken = compile_audio_block(raw, cards=self.CARDS, in_frame=["琳", "春安"])
+        self.assertIn("画外传来chanthy的声音", broken)
+        block = compile_audio_block(name_speakers(raw, {"chanthy": "春安", "rin": "琳"}), cards=self.CARDS, in_frame=["琳", "春安"])
+        self.assertNotIn("画外音", block)
+        self.assertIn("春安（", block)
+        self.assertIn("琳不说话，嘴闭着。", block)
+        self.assertNotIn("春安不说话", block)
+
     def test_monologue_default_manner_and_offscreen_speaker(self) -> None:
         block = compile_audio_block(
             [{"character": "琳", "line": "她脚下怎么没有影子？", "track": "琳-独白"}],
@@ -251,9 +263,22 @@ class AudioBlock(unittest.TestCase):
             in_frame=["波帕"],
             sound_bed="闷热杂物间底噪",
         )
-        self.assertIn("琳画外音（", block)
+        self.assertIn("画外传来琳的声音（", block)
         self.assertIn("用普通话低声自语地说：“她脚下怎么没有影子？”", block)
-        self.assertIn("波帕不说话，嘴闭着。", block)
+        self.assertIn("波帕不说话，嘴闭着，在听。", block)
+
+    def test_phone_inner_and_narration_are_voiced_with_mouths_closed(self) -> None:
+        phone = compile_audio_block([{"character": "奶奶", "line": "孙儿，手上的线别摘。", "delivery": "phone"}],
+                                    in_frame=["达拉"], sound_bed="风声")
+        self.assertIn("电话里传来奶奶的声音（隔着手机听筒，声音发闷、有点失真）用普通话说：“孙儿，手上的线别摘。”", phone)
+        self.assertIn("达拉不说话，嘴闭着，在听。", phone)
+        inner = compile_audio_block([{"character": "达拉", "line": "我回到了暹粒之战的前夜。"}], in_frame=["达拉"],
+                                    sound_bed="虫鸣", delivery="inner")
+        self.assertIn("达拉的内心独白（画外音，达拉自己的声音；压低、平静，像在心里对自己说）", inner)
+        self.assertIn("画中达拉嘴唇一直闭着，不开口。", inner)
+        self.assertNotIn("达拉不说话", inner)
+        story = compile_audio_block([{"character": "说书人", "line": "那一夜，雨下个不停。"}], in_frame=[], delivery="narration")
+        self.assertIn("旁白，说书人的声音（画外音）用普通话说", story)
 
     def test_two_lines_sequential_each_with_card(self) -> None:
         block = compile_audio_block(
@@ -341,6 +366,17 @@ class FirstFrameOnset(unittest.TestCase):
         self.assertTrue(any("mid/result" in e for e in errors), errors)
         self.assertTrue(is_onset_state("手已伸出"))
         self.assertIn("已起手", ONSET_OK)
+
+    def test_verb_is_not_read_across_a_name(self) -> None:
+        from director.still_t0 import action_span
+
+        self.assertEqual(action_span("果萨盯着达拉开口问")["matched"], "拉开")
+        self.assertIsNone(action_span("果萨盯着达拉开口问", names=["达拉", "果萨"]))
+        self.assertEqual(action_span("达拉一把拉开门", names=["达拉"])["matched"], "拉开")
+        shot = {"shot_id": "SH027", "one_action": "果萨低头盯着达拉开口问", "in_from": "他低头盯着达拉"}
+        still = {"one_paragraph": "果萨低头盯着画右下方，嘴唇刚动"}
+        self.assertTrue(start_still_errors(shot, still))
+        self.assertEqual(start_still_errors(shot, still, names=["达拉"]), [])
 
     def test_result_clause_is_positive(self) -> None:
         clause = forbidden_result_clause("琳弯腰捡起脚边旧钥匙")
@@ -470,6 +506,27 @@ class MotionPrompt(unittest.TestCase):
         self.assertEqual(small["dropped"], [])
         self.assertFalse(small["over_limit"])
 
+    def test_inner_acting_then_geo_axis_trim_and_photoreal_style(self) -> None:
+        from director.prompts import compile_seedance_motion_detail
+
+        geo = "【空间锁·坟地】" + "坟地在画左中景，每座坟头插一支火把，" * 30 + "。"
+        axis = "【空间锁·坟地】果萨在画左，达拉在画右；黎明光在画右。"
+        acting = ["果萨：想判断这人是不是在耍花招；藏着营里一个接一个倒下；手上竹筒停在嘴边；眼睛不眨。"]
+        spec = {"action_now": "达拉朝坟地偏了偏头", "in_from": "达拉正扭头", "out_to": "士兵互相看", "duration_sec": 6}
+        full = compile_seedance_motion_detail(spec, {}, geo_layout=geo, geo_short=axis, acting_lines=acting,
+                                              audio_block="达拉用普通话说：“上游是坟。”。", art_direction="photoreal")
+        # want / hide never reach the video model, so only the GEO axis is left to trim
+        self.assertEqual(full["dropped"][-1:], ["geo_axis"])
+        self.assertNotIn("acting_inner", full["dropped"])
+        self.assertIn(axis, full["prompt"])
+        self.assertNotIn("想判断", full["prompt"])
+        self.assertNotIn("藏着", full["prompt"])
+        self.assertIn("手上竹筒停在嘴边", full["prompt"])
+        self.assertIn("“上游是坟。”", full["prompt"])
+        short = compile_seedance_motion_detail(spec, {}, art_direction="photoreal")
+        self.assertIn("电影写实质感", short["prompt"])
+        self.assertNotIn("CG", short["prompt"])
+
     def test_ban_dictionary_default_and_override(self) -> None:
         self.assertEqual(apply_ban_dictionary("走进黑暗的杂物间"), "走进低调光的杂物间")
         with tempfile.TemporaryDirectory() as tmp:
@@ -534,7 +591,8 @@ class PackageCompile(unittest.TestCase):
             self.assertEqual(by_id["SH052"]["voice_card"], {})
             # descriptor follows the costume state; acting compiled; timing beats recorded
             self.assertTrue(any(d.startswith("琳：瘦小缩肩，发网") for d in by_id["SH021"]["descriptor"]))
-            self.assertIn("【表演】琳：想看看里面；藏着手在抖；手搭柜门；一把拉开，眼跟着探进去；柜门从虚掩到全开。", by_id["SH021"]["motion_prompt"])
+            self.assertIn("【表演】琳：手搭柜门；一把拉开，眼跟着探进去；柜门从虚掩到全开。", by_id["SH021"]["motion_prompt"])
+            self.assertNotIn("想看看里面", by_id["SH021"]["motion_prompt"])
             self.assertIn("对方话没说完，琳的脸已经在答。", spoken["motion_prompt"])
             self.assertEqual(len(by_id["SH021"]["action_timing"]), 2)
             self.assertIn("0.0s 起就在动（首帧已起手：手已搭上柜内仍暗）", by_id["SH021"]["motion_prompt"])

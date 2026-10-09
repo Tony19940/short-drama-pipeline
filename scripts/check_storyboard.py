@@ -409,7 +409,7 @@ def check_v2(prod: Path, table: dict, context=None) -> None:
     scripts = Path(__file__).resolve().parent
     if str(scripts) not in sys.path:
         sys.path.insert(0, str(scripts))
-    from director.shot_table import table_context, validate_shot_table
+    from director.shot_table import findings_report, table_context, triage_findings, validate_shot_table
 
     for rel in (
         "03-storyboard/beats.md",
@@ -429,10 +429,14 @@ def check_v2(prod: Path, table: dict, context=None) -> None:
         # missing revision writer must not silently borrow an old episode.
         ctx["writer"] = context.read_artifact("writer.json", required=True)
     errors, warnings = validate_shot_table(table, **ctx)
+    # Print every finding grouped by what it costs the audience; the first raw error is often format noise.
+    for line in findings_report(errors, title="Gate C2 errors"):
+        print(line, file=sys.stderr)
+    for line in findings_report(warnings, title="Gate C2 warnings"):
+        print(line, file=sys.stderr)
     if errors:
-        fail(errors[0])
-    for warning in warnings:
-        print(f"Gate C2 warning: {warning}", file=sys.stderr)
+        _key, label, items = triage_findings(errors)[0]
+        fail(f"{len(errors)} errors; first [{label}] {items[0]}")
     total = table.get("total_sec")
     if total in (None, ""):
         total = sum(float(s.get("duration_sec") or 0) for s in table.get("shots") or [])
