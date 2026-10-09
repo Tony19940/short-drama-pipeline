@@ -323,8 +323,10 @@ CAMERA_SIDE_ZH = {
 MAX_ZH_PROMPT_CHARS = 500
 # Trim order when a motion prompt runs long. Continuity, line, voice, GEO, timing
 # and the first-frame lock are never dropped — report over_limit instead.
-TRIM_ORDER = ("style", "lock_detail")
-TRIM_LABEL_ZH = {"style": "装饰风格词", "lock_detail": "人物描述细节"}
+TRIM_ORDER = ("style", "lock_detail", "acting_inner", "geo_axis")
+TRIM_LABEL_ZH = {"style": "装饰风格词", "lock_detail": "人物描述细节", "acting_inner": "表演里的内心动机（想/藏着）", "geo_axis": "场景布局压成一句轴线"}
+# shortening tiers swap a segment for its `short` form; the others drop the segment
+SHORT_TIER_TAG = {"lock_detail": "lock", "acting_inner": "acting", "geo_axis": "geo"}
 NEGATIVE_RE = re.compile(r"禁止|不要|不得|严禁")
 # Designer notes are written as bans; the motion prompt restates the few that matter as facts.
 NEGATIVE_REWRITES = (
@@ -440,6 +442,18 @@ def geo_layout_for(location_id: str, sets: Optional[dict] = None) -> str:
     return ""
 
 
+def geo_axis_for(location_id: str, sets: Optional[dict] = None) -> str:
+    """One-line GEO: the set's `axis` sentence (who is left / right, where the light is). Used when the
+    full layout pushes the motion prompt over the limit; the first frame already carries the space."""
+    loc = str(location_id or "").strip()
+    for entry in (sets or {}).get("sets") or []:
+        if isinstance(entry, dict) and str(entry.get("id") or "").strip() == loc:
+            body = str(entry.get("axis") or "").strip().rstrip("。")
+            name = str(entry.get("name") or loc).strip()
+            return f"【空间锁·{name}】{body}。" if body else ""
+    return ""
+
+
 def has_geo_zh(location_id: str, sets: Optional[dict] = None) -> bool:
     loc = str(location_id or "").strip()
     for entry in (sets or {}).get("sets") or []:
@@ -534,25 +548,46 @@ def action_timing_zh(
     if coverage == "reaction" and phase == "onset" and not planned:
         phase = "hold"
     head = _t0_head(phase, onset)
+    # Spare seconds invite the model to play the next natural step (012 SH022 drank the water it was
+    # only lifting). A held action stops where stop_at says; padding past the paper length holds the landing.
+    from .action_lint import added_actions, held_action, is_exit
+
+    held = held_action(shot)
+    freeze = ""
+    if held and held["stop_at"]:
+        land = held["stop_at"].rstrip("。")
+        freeze = "，定在这里直到镜头结束" + (f"，{held['keep'].rstrip('。')}" if held["keep"] else "")
+    else:
+        try:
+            paper = float(shot.get("duration_sec") or spec.get("paper_duration_sec") or total)
+        except (TypeError, ValueError):
+            paper = total
+        posture, travel = added_actions("", land)
+        if land and paper < total - 0.4 and not is_exit(land) and not posture and not travel:
+            freeze = "，定在这个姿势直到镜头结束"
+    stop = freeze or "，停住"
     if planned:
-        return head + "".join(beat["text"] for beat in planned), planned
+        text = head + "".join(beat["text"] for beat in planned)
+        if held and held["stop_at"]:
+            text += f"{land}{freeze}。"
+        return text, planned
     total_label = f"{total:g}s"
     if total < 4.0:
-        one = f"0.0–{total_label}：{act}" + (f"，落幅——{land}" if land else "") + "，气还没平。"
+        one = f"0.0–{total_label}：{act}" + (f"，落幅——{land}" if land else "") + freeze + "，气还没平。"
         beats = [{"from_sec": 0.0, "to_sec": total, "text": one}]
         return head + one, beats
     action_end = round(min(max(total * 0.375, 1.2), max(1.2, total - 1.0)), 1)
     if phase == "hold":
         hold_end = round(min(max(total * 0.55, 1.5), max(1.5, total - 0.8)), 1)
         first = f"0.0–{hold_end:g}s：" + (f"先停住听，{act}。" if act else "先停住听。")
-        tail = f"{hold_end:g}–{total_label}：" + (f"落幅——{land}，停住，气还没平。" if land else "微动收住，气还没平。")
+        tail = f"{hold_end:g}–{total_label}：" + (f"落幅——{land}{stop}，气还没平。" if land else "微动收住，气还没平。")
         beats = [
             {"from_sec": 0.0, "to_sec": hold_end, "text": first},
             {"from_sec": hold_end, "to_sec": total, "text": tail},
         ]
         return head + "".join(beat["text"] for beat in beats), beats
     first = f"0.0–{action_end:g}s：{act}。" if act else f"0.0–{action_end:g}s：动作已在进行。"
-    tail = f"{action_end:g}–{total_label}：" + (f"落幅——{land}，停住，气还没平。" if land else "动作收住，停在落幅，气还没平。")
+    tail = f"{action_end:g}–{total_label}：" + (f"落幅——{land}{stop}，气还没平。" if land else "动作收住，停在落幅，气还没平。")
     beats = [
         {"from_sec": 0.0, "to_sec": action_end, "text": first},
         {"from_sec": action_end, "to_sec": total, "text": tail},
@@ -577,10 +612,10 @@ def assemble_motion_prompt(segments: list[dict], *, limit: int = MAX_ZH_PROMPT_C
     for tier in TRIM_ORDER:
         if len(text) <= limit:
             break
-        if tier == "lock_detail":
+        if tier in SHORT_TIER_TAG:
             changed = False
             for seg in live:
-                if seg.get("tag") == "lock" and seg.get("short") and seg["text"] != seg["short"]:
+                if seg.get("tag") == SHORT_TIER_TAG[tier] and seg.get("short") and seg["text"] != seg["short"]:
                     seg["text"] = seg["short"]
                     changed = True
             if not changed:
@@ -719,7 +754,7 @@ def compile_keyframe_prompt_zh(
             light_line,
             "画动作已经完成的那一格，对得上 out_to。",
             closer,
-            "画面干净：无字幕、无水印、无国旗、无现代天际线、无吴哥塔、无环绕构图。",
+            clean_frame_line(shot, item),
         ]
         return dedupe_sentences("".join(bit for bit in bits if bit))
     still = first_still_text(item) if item else ""
@@ -751,9 +786,27 @@ def compile_keyframe_prompt_zh(
         first_still_action_line(action, shot, spec),
         first_still_forbid_line(action, shot, spec),
         closer,
-        "画面干净：无字幕、无水印、无国旗、无现代天际线、无吴哥塔、无环绕构图。",
+        clean_frame_line(shot, item),
     ]
     return dedupe_sentences("".join(bit for bit in bits if bit))
+
+
+ANGKOR_WORDS = ("吴哥", "Angkor")
+
+
+def clean_frame_line(shot: Optional[dict], item: Optional[dict] = None) -> str:
+    """Clean-frame guard. Image models drop Angkor Wat into any Cambodian background, so it stays
+    forbidden by default, except in a shot whose own fields put Angkor in the picture."""
+    shot = shot or {}
+    item = item or {}
+    state = shot.get("state") if isinstance(shot.get("state"), dict) else {}
+    blob = " ".join(str(x or "") for x in (
+        shot.get("left"), shot.get("right"), shot.get("one_action"), shot.get("in_from"), state.get("note"),
+        item.get("one_paragraph"), (item.get("layers") or {}).get("background") if isinstance(item.get("layers"), dict) else "",
+    ))
+    wants_angkor = any(word in blob for word in ANGKOR_WORDS)
+    banned = ["无字幕", "无水印", "无国旗", "无现代天际线"] + ([] if wants_angkor else ["无吴哥塔"]) + ["无环绕构图"]
+    return "画面干净：" + "、".join(banned) + "。"
 
 
 REFERENCE_ROLE_MARK = re.compile(r"\[图\s*\d+\]|@(?:图)?\s*\d+")
@@ -979,6 +1032,8 @@ def compile_seedance_motion_detail(
     render_sec: Optional[float] = None,
     ban_dictionary: Optional[dict[str, str]] = None,
     limit: int = MAX_ZH_PROMPT_CHARS,
+    geo_short: str = "",
+    art_direction: str = "",
 ) -> dict:
     """Motion prompt for Seedance, Hell Grind order: GEO → character lock → action timing from
     0.0s → acting → camera → continuity → audio. Positive statements only, each once.
@@ -1005,7 +1060,7 @@ def compile_seedance_motion_detail(
     timing, beats = action_timing_zh(action, start, end, duration, shot=shot, spec=spec)
     segments: list[dict] = []
     if str(geo_layout or "").strip():
-        segments.append({"tag": "geo", "text": str(geo_layout).strip()})
+        segments.append({"tag": "geo", "text": str(geo_layout).strip(), "short": str(geo_short or "").strip()})
     if descriptors:
         names = []
         for sentence in descriptors:
@@ -1031,12 +1086,32 @@ def compile_seedance_motion_detail(
         if cuts:
             segments.append({"tag": "cuts", "text": "".join(cuts)})
     if acting_lines:
-        segments.append({"tag": "acting", "text": "【表演】" + "".join(str(s).strip() for s in acting_lines if str(s).strip())})
+        from .action_lint import completion_cues, held_action, strip_cues
+
+        held = held_action(shot)
+        cues = completion_cues(held["unfinished"]) if held else []
+        kept_lines: list[str] = []
+        for raw_line in acting_lines:
+            line = str(raw_line).strip()
+            if not line:
+                continue
+            # want / hide are the actor's inner notes. A video model plays 想… as an action, so it only gets
+            # business, muscle and change (012 EP01 draft).
+            line = re.sub(r"(?<=[：；])(?:想|藏着)[^；。]*[；。]", "", line)
+            if cues:
+                name, sep, body = line.partition("：")
+                body = strip_cues(body if sep else line, cues)
+                line = (name + sep + body) if sep and body else ("" if sep else body)
+            if line and not line.endswith("："):
+                kept_lines.append(line if line.endswith("。") else line.rstrip("；，") + "。")
+        if kept_lines:
+            segments.append({"tag": "acting", "text": "【表演】" + "".join(kept_lines)})
     segments.append({"tag": "camera", "text": "【机位】" + camera_sentence_zh(move, side)})
     note = positive_text(state_note_of(spec, shot))
     if note:
         segments.append({"tag": "continuity", "text": f"【连戏】{note.rstrip('。')}。"})
-    segments.append({"tag": "style", "text": "数字电影 CG 质感。"})
+    art = str(art_direction or _spec_text(spec, "art_direction") or str(shot.get("art_direction") or "")).strip()
+    segments.append({"tag": "style", "text": "电影写实质感。" if art == "photoreal" else "数字电影 CG 质感。"})
     block = str(audio_block or "").strip()
     if not block:
         from .speech import compile_audio_block

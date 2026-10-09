@@ -247,8 +247,12 @@ def validate_shot_specs(data: dict, writer: Optional[dict] = None) -> list[str]:
             if key in spec and _text(spec.get(key)):
                 errors.append(f"{sid} spec cannot carry {key}")
         line = _text(spec.get("dialogue_line"))
-        if line and allowed_lines and line not in allowed_lines:
-            errors.append(f"{sid} dialogue is not the writer line")
+        if line and allowed_lines:
+            from .shot_table import is_writer_line_or_fragment
+
+            # same rule as the shot table: a whole writer line or whole sentences of one
+            if not is_writer_line_or_fragment(line, allowed_lines):
+                errors.append(f"{sid} dialogue is not the writer line")
         move = _text(spec.get("move_type")).lower()
         if move == "static" and int(spec.get("intensity") or 0) != 0:
             errors.append(f"{sid} static intensity must be 0")
@@ -409,6 +413,13 @@ def keyframe_context(prod: Path, episode: int = 1) -> dict:
         "table": read_artifact(prod, episode_artifact_name("shot_list.json", episode)),
         "prod": prod,
     }
+
+
+def whole_seconds_up(seconds: float) -> int:
+    """Whole render seconds that still hold the paper seconds (6.5 -> 7, 4.0 -> 4)."""
+    import math
+
+    return int(math.ceil(round(float(seconds), 3)))
 
 
 def validate_keyframes(
@@ -1169,6 +1180,7 @@ def compile_packages_from_specs(
         MAX_ZH_PROMPT_CHARS,
         TRIM_LABEL_ZH,
         compile_seedance_motion_detail,
+        geo_axis_for,
         geo_layout_for,
         load_ban_dictionary,
         shot_dialogue_items,
@@ -1181,6 +1193,7 @@ def compile_packages_from_specs(
         compile_audio_block,
         descriptor_for,
         load_character_cards,
+        name_speakers,
         sound_bed_for,
         speech_mode_for,
         voice_card_for,
@@ -1197,6 +1210,9 @@ def compile_packages_from_specs(
     warnings: list[str] = []
     compile_errors: list[str] = []
     post_under_native: list[str] = []
+    from .speech import voice_card_warnings
+
+    warnings.extend(voice_card_warnings(cards))
     packages = []
     for spec in specs.get("shot_specs") or []:
         sid = spec.get("shot_id")
@@ -1227,25 +1243,43 @@ def compile_packages_from_specs(
                 compile_errors.append(
                     f"{sid} duration {paper_sec:g}s exceeds {target_model} max {max_sec}s; replan, do not clamp"
                 )
-                render_sec = int(round(paper_sec))
+                render_sec = whole_seconds_up(paper_sec)
             elif paper_sec < min_sec:
                 render_sec = int(min_sec)
             else:
-                render_sec = int(round(paper_sec))
+                # never render shorter than the paper: round(6.5) is 6 in Python and cuts the line's tail
+                render_sec = whole_seconds_up(paper_sec)
             duration_sec = paper_sec if shot_list.get("keep_paper_duration") else render_sec
             # Who is in frame (display names), who speaks, what each looks like.
             in_frame = [_text(name) for name in (table_shot.get("characters") or []) if _text(name)]
             if not in_frame and state:
                 in_frame = [cast.get(cid, cid) for cid, item in state["characters"].items() if item.get("in_frame", True)]
-            lines = shot_dialogue_items(spec, table_shot)
+            # Where each body is goes into both prompts, so the frame cannot drift (012 SH006 drawn above the pit).
+            from .continuity import pose_sentence
+
+            pose_line = pose_sentence(table_shot, cast)
+            if pose_line and isinstance(table_shot.get("state"), dict):
+                note_now = _text(table_shot["state"].get("note"))
+                if pose_line not in note_now:
+                    joined = (note_now.rstrip("。；") + "；" if note_now else "") + pose_line
+                    table_shot = {**table_shot, "state": {**table_shot["state"], "note": joined}}
+            # display names, like in_frame; otherwise a speaker written as an id reads as off-screen and silent
+            lines = name_speakers(shot_dialogue_items(spec, table_shot), cast)
             if len(lines) > 2:
                 warnings.append(
                     f"{sid} has {len(lines)} dialogue lines; Seedance line budget is 2 — replan, do not truncate"
                 )
-            speakers = [item["character"] for item in lines if item.get("character")]
-            # dialogue_delivery is the per-shot switch: on_camera = the model speaks it (native),
-            # post = dubbed later. Under a native table a `post` shot opts out to post_dub.
-            delivery = _text(table_shot.get("dialogue_delivery")) or ("post" if lines else "none")
+            # dialogue_delivery is the per-shot switch. on_camera / off_camera / phone / inner / narration are all
+            # spoken by the model (the Khmer dub clones the Chinese voice); only legacy `post` opts out to post_dub.
+            delivery = _text(table_shot.get("dialogue_delivery")) or ("on_camera" if lines else "none")
+            for item, ref in zip(lines, [r for r in (table_shot.get("dialogue_ref") or []) if isinstance(r, dict)]):
+                if _text(ref.get("delivery")):
+                    item["delivery"] = _text(ref.get("delivery"))
+            on_camera_lines = [
+                item for item in lines
+                if (_text(item.get("delivery")) or delivery) == "on_camera" and item.get("character") in in_frame
+            ]
+            speakers = [item["character"] for item in on_camera_lines if item.get("character")]
             shot_speech_mode = speech_mode
             if lines and speech_mode == "seedance_native" and delivery == "post":
                 shot_speech_mode = "post_dub"
@@ -1267,7 +1301,7 @@ def compile_packages_from_specs(
             if lang == "zh" and known_set and not geo_layout and loc_key not in geo_warned:
                 geo_warned.add(loc_key)
                 warnings.append(f"set {loc_key} has no geo_zh / axis in sets.json; shots there carry no GEO block")
-            voice_card = {name: voice_card_for(name, cards) for name in speakers}
+            voice_card = {item["character"]: voice_card_for(item["character"], cards) for item in lines if item.get("character")}
             audio_block = ""
             acting_lines: list[str] = []
             if lang == "zh":
@@ -1278,9 +1312,11 @@ def compile_packages_from_specs(
                     key_sfx=list(spec.get("key_sfx") or table_shot.get("key_sfx") or []),
                     sound_bed=sound_bed_for(loc_key, sets),
                     language=dialogue_language,
+                    delivery=delivery if delivery != "post" else "on_camera",
                 )
                 acting_lines = compile_acting_zh(
-                    table_shot, spec, in_frame=in_frame, speakers=speakers, override=(frame_desc or {}).get("acting")
+                    table_shot, spec, in_frame=in_frame, speakers=speakers,
+                    override={cast.get(k, k): v for k, v in ((frame_desc or {}).get("acting") or {}).items()},
                 )
             policy = load_show_policy(prod)
             prompt_spec = dict(spec)
@@ -1305,6 +1341,11 @@ def compile_packages_from_specs(
                     image_prompt.rstrip()
                     + "底板无高棉文、无汉字；厂牌拉丁文可留；不要让模型在招牌或工牌上新写高棉文。"
                 )
+            from .name_cards import space_note_zh
+
+            card_space = space_note_zh(table_shot)
+            if card_space:
+                image_prompt = image_prompt.rstrip() + card_space
             motion_detail: dict = {}
             if lang == "zh":
                 motion_detail = compile_seedance_motion_detail(
@@ -1318,6 +1359,8 @@ def compile_packages_from_specs(
                     speech_mode=shot_speech_mode,
                     render_sec=render_sec,
                     ban_dictionary=ban_dictionary,
+                    geo_short=geo_axis_for(location_id or spec.get("location_state_id"), sets),
+                    art_direction=policy.art_direction,
                 )
                 motion = motion_detail["prompt"]
                 if motion_detail.get("dropped"):

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 STILL_KEYS = ("pose", "holding", "prop_state", "one_paragraph")
 
@@ -128,9 +128,16 @@ def normalize_still(raw: Any) -> dict[str, str]:
     return {key: _t(block.get(key)) for key in STILL_KEYS}
 
 
-def action_span(one_action: str) -> Optional[dict[str, Any]]:
+def _mask_names(text: str, names: Optional[Iterable[str]]) -> str:
+    """Blank out character names so a verb is not read across a name boundary (达拉+开口 is not 拉开)."""
+    for name in sorted({_t(n) for n in names or [] if _t(n)}, key=len, reverse=True):
+        text = text.replace(name, "·")
+    return text
+
+
+def action_span(one_action: str, names: Optional[Iterable[str]] = None) -> Optional[dict[str, Any]]:
     """Return {verb, pre, post, id} for the first transform verb in one_action."""
-    text = _t(one_action)
+    text = _mask_names(_t(one_action), names)
     if not text:
         return None
     for rule in TRANSFORM_RULES:
@@ -225,7 +232,7 @@ def is_onset_state(text: str) -> bool:
     return bool(_ONSET.search(_t(text)))
 
 
-def start_still_errors(shot: dict, frame_desc: Optional[dict]) -> list[str]:
+def start_still_errors(shot: dict, frame_desc: Optional[dict], names: Optional[Iterable[str]] = None) -> list[str]:
     """Machine check: transform verb + first-still already shows the *result*.
 
     Onset states (`ONSET_OK`) pass: the first frame may already be mid-gesture,
@@ -233,7 +240,7 @@ def start_still_errors(shot: dict, frame_desc: Optional[dict]) -> list[str]:
     """
     sid = _t(shot.get("shot_id")) or "?"
     action = _t(shot.get("one_action") or shot.get("action_now") or shot.get("action_ref"))
-    span = action_span(action)
+    span = action_span(action, names)
     if not span:
         return []
     blob = first_still_text(frame_desc)
@@ -280,24 +287,24 @@ def last_still_errors(shot: dict, frame_desc: Optional[dict]) -> list[str]:
     return [f"{sid} first_last missing still_end / last_paragraph"]
 
 
-def still_t0_errors(shot: dict, frame_desc: Optional[dict]) -> list[str]:
-    return start_still_errors(shot, frame_desc) + last_still_errors(shot, frame_desc)
+def still_t0_errors(shot: dict, frame_desc: Optional[dict], names: Optional[Iterable[str]] = None) -> list[str]:
+    return start_still_errors(shot, frame_desc, names) + last_still_errors(shot, frame_desc)
 
 
-def issues_for_table(shots: list[dict], descriptions_by_id: dict) -> list[str]:
+def issues_for_table(shots: list[dict], descriptions_by_id: dict, names: Optional[Iterable[str]] = None) -> list[str]:
     """All t=0 issues for a shot list. Used as Gate C2 warnings."""
     out: list[str] = []
     for shot in shots or []:
         sid = _t(shot.get("shot_id"))
         if not sid:
             continue
-        out.extend(still_t0_errors(shot, descriptions_by_id.get(sid)))
+        out.extend(still_t0_errors(shot, descriptions_by_id.get(sid), names))
     return out
 
 
-def result_tokens(one_action: str, limit: int = 6) -> list[str]:
+def result_tokens(one_action: str, limit: int = 6, names: Optional[Iterable[str]] = None) -> list[str]:
     """Result states of the transform verb — the things a first still must not show."""
-    span = action_span(one_action)
+    span = action_span(one_action, names)
     if not span:
         return []
     return [token for token in span["post"] if token][:limit]

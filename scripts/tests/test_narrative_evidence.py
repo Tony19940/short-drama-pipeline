@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from director.context import ProductionContext
 from director.narrative import (digest, file_hash, check_event_coverage, contract_errors,
     write_export_receipt, record_sequence_review, check_sequence_reviews, normalize_cut,
-    require_design_review, require_cut_media_reviews)
+    require_design_review, require_cut_media_reviews, speed_findings)
 from director.revisions import register_revision
 from director.review_actions import record_design
 from director.shot_table import design_review_digest
@@ -37,10 +37,10 @@ class NarrativeEvidence(unittest.TestCase):
             "allowed_uncertainty": ["the magical mechanism is unknown"]}],
             "events": [{"event_id": "coin-flash", "sequence_id": "first-return", "shot_ids": ["SH015"],
                         "expected_observation": "copper coin flashes", "channel": "visual", "required": True,
-                        "min_visible_sec": 0.1}]}
+                        "min_visible_sec": 0.5}]}
         self.evidence = {"contract_sha256": digest(self.contract), "observations": [{
             "event_id": "coin-flash", "shot_id": "SH015", "source": self.source,
-            "source_sha256": file_hash(self.prod / self.source), "start_sec": 1.2, "end_sec": 1.5,
+            "source_sha256": file_hash(self.prod / self.source), "start_sec": 1.0, "end_sec": 1.6,
             "status": "observed", "reviewer": "frame inspector", "reviewed_at": 1,
             "method": "visual_inspection", "notes": "actual source interval reviewed"}]}
         self.cut = {"timeline": [{"shot_id": "SH015", "source": self.source, "in_sec": 1, "out_sec": 2}]}
@@ -101,8 +101,57 @@ class NarrativeEvidence(unittest.TestCase):
     def test_reverse_dependency_is_rejected(self):
         self.contract["events"].append({**self.contract["events"][0], "event_id": "money-appears", "depends_on": ["coin-flash"]})
         self.evidence["contract_sha256"] = digest(self.contract)
-        self.evidence["observations"].append({**self.evidence["observations"][0], "event_id": "money-appears", "start_sec": 1.05, "end_sec": 1.15})
+        self.evidence["observations"].append({**self.evidence["observations"][0], "event_id": "money-appears", "start_sec": 1.05, "end_sec": 1.6})
         self.assertTrue(any("before prerequisite" in e for e in self.report()["errors"]))
+
+    def test_one_frame_visual_event_is_below_readable_floor(self):
+        # 011 set every event to 0.03s: one frame proves existence, not that a viewer can read it.
+        self.contract["events"][0]["min_visible_sec"] = 0.03
+        errors = contract_errors(self.contract)
+        self.assertTrue(any("readable floor" in e for e in errors), errors)
+        self.contract["events"][0]["brief_reason"] = "intentional two-frame glint; the next shot carries the reveal"
+        self.assertEqual(contract_errors(self.contract), [])
+
+    def test_missing_min_visible_defaults_to_readable_floor(self):
+        del self.contract["events"][0]["min_visible_sec"]
+        self.assertEqual(contract_errors(self.contract), [])
+        self.evidence["contract_sha256"] = digest(self.contract)
+        self.evidence["observations"][0].update(start_sec=1.0, end_sec=1.2)
+        report = self.report()
+        self.assertEqual(report["status"], "fail")
+        self.assertIn("too short", report["errors"][0])
+
+    def test_floor_applies_to_required_visual_events_only(self):
+        self.contract["events"][0]["min_visible_sec"] = 0.03
+        self.contract["events"][0]["channel"] = "audio"
+        self.assertEqual(contract_errors(self.contract), [])
+        self.contract["events"][0]["channel"] = "visual"
+        self.contract["events"][0]["required"] = False
+        self.assertEqual(contract_errors(self.contract), [])
+
+    def test_speed_change_needs_a_reason(self):
+        row = self.cut["timeline"][0]
+        self.assertEqual(speed_findings(self.cut), [])
+        row["speed"] = 1.1
+        self.assertEqual(speed_findings(self.cut), [])
+        row["speed"] = 2
+        self.assertTrue(any("SH015 speed 2x" in f for f in speed_findings(self.cut)))
+        row["speed"] = 0.5
+        self.assertTrue(speed_findings(self.cut))
+        row["speed_reason"] = "slow motion on the trigger, designed in the scene card"
+        self.assertEqual(speed_findings(self.cut), [])
+        row.pop("speed_reason")
+        row["used"] = False
+        self.assertEqual(speed_findings(self.cut), [])
+
+    def test_formal_assembly_blocks_uncapped_speed_before_ffmpeg(self):
+        self.register()
+        self.cut["timeline"][0]["speed"] = 2
+        self.write(".pipeline/cut.ep01-v2.json", self.cut)
+        with patch("director.jobs.subprocess.run") as runner:
+            with self.assertRaisesRegex(PermissionError, "变速"):
+                assemble_episode(self.prod)
+            runner.assert_not_called()
 
     def test_cycle_and_malformed_contract_rejected(self):
         self.contract["events"][0]["depends_on"] = ["coin-flash"]

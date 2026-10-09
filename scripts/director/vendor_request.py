@@ -160,7 +160,9 @@ def resolve_render_seconds(pkg: dict) -> int:
     if raw in (None, ""):
         raw = pkg.get("duration_sec") or min_sec
     try:
-        seconds = int(round(float(raw)))
+        from .pipeline import whole_seconds_up
+
+        seconds = whole_seconds_up(float(raw))
     except (TypeError, ValueError) as exc:
         raise DurationOutOfRange(f"invalid duration {raw!r}") from exc
     if seconds < min_sec:

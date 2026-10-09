@@ -6,6 +6,7 @@ import { CutPage } from "./pages/CutPage";
 import { DirectorPage } from "./pages/DirectorPage";
 import { EditPage } from "./pages/EditPage";
 import { FramesPage } from "./pages/FramesPage";
+import { LinesPage } from "./pages/LinesPage";
 import { PackagePage } from "./pages/PackagePage";
 import { RenderPage } from "./pages/RenderPage";
 import { SpecPage } from "./pages/SpecPage";
@@ -14,7 +15,8 @@ import { Guide } from "./Guide";
 
 const TABS = [
   { id: "story", label: "小说", now: "写或上传故事。这里不写镜头。" },
-  { id: "writer", label: "编剧", now: "改成能拍的分场本，台词在这里定稿。" },
+  { id: "writer", label: "编剧", now: "改成能拍的分场本，写台词初稿。" },
+  { id: "lines", label: "台词", now: "中文工作稿 + 高棉语成片稿 + 时长，人审签字后才进分镜。" },
   { id: "art", label: "资产", now: "锁脸、空镜、道具。资产不是某一镜。" },
   { id: "design", label: "分镜", now: "决定拍哪些镜头、左右和覆盖。不写提示词。" },
   { id: "spec", label: "说明书", now: "把每一镜写成 7 组给人看的说明。" },
@@ -298,6 +300,7 @@ export function App() {
         ) : null}
         {tab === "story" ? <StoryPage slug={slug} gate={currentGate} onChanged={refresh} /> : null}
         {tab === "writer" ? <BiblePage slug={slug} onChanged={refresh} /> : null}
+        {tab === "lines" ? <LinesPage slug={slug} /> : null}
         {tab === "art" ? <AssetsPage slug={slug} onChanged={refresh} /> : null}
         {tab === "design" ? <DirectorPage slug={slug} gate={currentGate} onChanged={refresh} /> : null}
         {tab === "spec" ? <SpecPage slug={slug} onChanged={refresh} /> : null}

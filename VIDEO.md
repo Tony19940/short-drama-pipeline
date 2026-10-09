@@ -74,7 +74,15 @@ python3 scripts/render_seedance_packages.py --prod productions/010-gongpai --onl
 
 真人脸拦没有官方预检接口（内容安全 ImageModeration / `+understand` / `doctor +verify-origin` 都不是这套 `PrivacyInformation` 分类器）。出图后跑 `python3 scripts/check_seedance_frame.py --prod productions/<slug> --image 04-frames/SHxxx.jpg`：只发 first_frame、480p、最短 4 秒；**submit 400 就是检查**（无 task id，审核失败不收费）；200 立刻 DELETE（仅 queued 能取消，已 running 的 4s 480p 仍可能出片计费）。1–2 秒非法，会被参数拒，测不到脸。
 
-### 拦截来源与方舟授信（探针，未采纳）
+### 拦截来源与方舟授信
+
+**2026-10-08 探针 2 已通过**：Codex 写实首帧上传到私域虚拟人像库后，用 `asset://` 当 `first_frame` 提交 Seedance 2.0-mini 不再被拦（012 SH015、SH027，见 `knowledge/model-notes/seedance_2_0.md`）。写实剧的主路径改为：每镜首帧先入库，再按素材 ID 出片。
+
+入库已经接进出片脚本：`render_seedance_packages.py --via-assets`（`.env` 里要有子用户 AK/SK `VOLC_ACCESSKEY`/`VOLC_SECRETKEY` 和私有 TOS 桶 `VOLC_TOS_BUCKET`）。首帧先传进私有桶，生成 15 分钟的签名链接给方舟入库，审核 Active 后删掉桶里的图；同一份字节只传一次（`.pipeline/ark_assets.json`），素材库 50 个名额用完可 `ark_assets.release` 回收。012 第 1 集 31 镜全部这样出片，没有一镜被拦。
+
+**先跑草稿再出正式**：`--draft 480p` 用 2.0 mini 480p 把整集跑一遍（012 第 1 集约 ¥35，每秒约 1 万 token），草稿放 `05-shots/draft-480p/`，不记 take。然后 `scripts/review_draft.py` 出逐帧图（每 0.25 秒一帧）、本地听写和审片页，`scripts/assemble_review_cut.py` 按纸面时长、转场和名片拼整集审片版给人看。人审过、改完分镜，再用 2.5 出正式。动作没发生之类的判断要看逐帧图，不看几张缩略图（012 SH001 就看漏过）。
+
+#### 旧记录（探针前）
 
 拦截在字节模型侧，不是提示词问题。Higgsfield《Hell Grind》写实脸能过，是因为脸由平台自家模型（Soul Cinema）生成，平台信任本账号内自家模型的产物。字节两边对应：BytePlus ModelArk 明说**同账号、30 天内、Seedance 2.0 / 2.5 视频及其尾帧、Seedream 5.0 lite 文生图的原始产物**可作输入不触发拦截，**压缩、编辑过就不算**；火山方舟叫「特定模型生成内容授信 / 隐形数字护照」，另有公共虚拟人像库（`asset://`）、私域虚拟人像库、真人认证入库。
 
@@ -96,7 +104,8 @@ python3 scripts/render_seedance_packages.py --prod productions/010-gongpai --onl
 2026-09-18 起，中文工作轨的对白由 Seedance 自己说、自己对口型，不再后期重录。生成包 `speech_mode=seedance_native`（默认），提交 `generate_audio=true`。
 
 - 台词只在 `audio_block` 里，顺序固定：`voice_card` 逐字 → 「引号台词」+ 语种 + 语气（怎么说，不是什么心情）→ 只说这一句 → 不说话的人嘴闭着 → 环境声、无音乐、无字幕。说话时的动作和表情（肌肉）在紧跟的【表演】句里，不进 `audio_block`；动作句里不出现台词。
-- 每镜开关是 `dialogue_delivery`：`on_camera` = 模型说这句（原声），`post` = 后期配。原声表（`speech_mode=seedance_native`，或目标模型能唇同步且表未声明）里没写的有词镜默认 `on_camera`；写了 `post` 的镜单独退成 `post_dub`，编包会列出来。全表都是 `post` 的老表按 `post_dub` 处理，不报。
+- 每镜开关是 `dialogue_delivery`，**每一句都由模型用中文读出来**（高棉语配音从这段原声克隆，没声音就没得克隆）：`on_camera` 画里开口对口型；`phone` 电话里的声音（听筒音质，画里的人嘴闭着在听）；`off_camera` 画外的人说话；`inner` 内心独白（本人嘴唇一直闭着）；`narration` 旁白。2026-10-09 在 012 上测过电话和内心独白：声音都出来了，画里的人嘴没动。原声表里写 `post` 是错误；全表都是 `post` 的老表按 `post_dub` 处理。
+- 一镜一个人声：有台词的镜，`key_sfx` 不放别人的尖叫哭喊，画外台词底下画里的人不喘叫（012 探测 SH012：喘叫盖住了士兵喊的"鬼"）。
 - 块尾一句写死：每人只说引号里的那句话，不说话的人**嘴闭着**；只有环境声，**没有音乐，没有字幕**。不写这句模型会加碎话、哼唱和配乐。
 - 原生语种：中 / 英 / 日 / 韩 / 西 / 法 / 德。**没有高棉语**——高棉语仍是配音 / 字幕轨（Gate F，`DUBBING.md`）。`reference_audio` 能驱动口型，但它属多模态参考模式，与 `first_frame` 互斥；不为口型丢掉硬首帧。
 - 中文提示词 ≤500 字软闸，只写肯定句（否定句被忽略或反做，`ban_dictionary` 翻成正向替代）。

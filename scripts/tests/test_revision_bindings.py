@@ -110,6 +110,21 @@ class RevisionBindings(unittest.TestCase):
         self.assertNotIn("05-shots/SH001.mp4", videos)
         self.assertIn(".pipeline/revisions.json", frames)
 
+    def test_pipeline_show_does_not_virtually_lock_specs_packages_or_frames(self) -> None:
+        from director.agents import previous_satisfied
+
+        approvals = {"gates": {"C": {"locked": True}}}
+        files = {"locked_frame_count": 31, "shot_count": 31}
+        for gate in ("C1", "C2", "D"):
+            self.assertFalse(virtual_locked(self.prod, gate, files, approvals), gate)
+        self.assertFalse(previous_satisfied(self.prod, "D", files, approvals))
+        self.assertFalse(previous_satisfied(self.prod, "E", files, approvals))
+        approvals["gates"]["C2"] = {"locked": True}
+        self.assertTrue(previous_satisfied(self.prod, "D", files, approvals))
+        legacy = Path(self.tmp.name) / "legacy"
+        legacy.mkdir()
+        self.assertTrue(virtual_locked(legacy, "C1", files, {"gates": {"C": {"locked": True}}}))
+
     def test_registered_revision_cannot_inherit_file_only_virtual_lock(self) -> None:
         self.register()
         approvals = {"gates": {"C": {"locked": True}}}

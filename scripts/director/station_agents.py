@@ -64,6 +64,7 @@ from .pipeline import (
 )
 from .production import load_json, read_text, write_text
 from .shot_table import (
+    cast_names,
     compile_specs_from_shot_table,
     needed_seconds,
     render_shot_table_md,
@@ -190,8 +191,9 @@ def _validate_frame_desc_artifact(data: dict, prod: Path) -> list[str]:
     table = read_artifact(prod, "shot_list.json")
     ids = [str(s.get("shot_id") or "") for s in table.get("shots") or [] if s.get("shot_id")]
     # still_t0 issues are errors when the agent writes; PUT of old later-ep files stays warning.
+    names = cast_names(read_artifact(prod, "writer.json")).values()
     return validate_frame_descriptions(
-        data, ids or None, shots=list(table.get("shots") or []), still_t0="warning"
+        data, ids or None, shots=list(table.get("shots") or []), still_t0="warning", names=names
     )
 
 
@@ -1243,7 +1245,7 @@ def _run_frame_descriptions_body(prod: Path, *, brief: str = "", scene_ids: Opti
             payload = _design_chat(system, ctx, temperature=0.3)
             _dump_station(prod, "frame_desc", f"{sid}.raw{attempt + 1}", payload)
             candidate = {"schema": FRAME_DESC_SCHEMA, "items": [normalize_frame_desc(i) for i in payload.get("items") or []]}
-            last_errors = validate_frame_descriptions(candidate, ids, shots=scene_shots)
+            last_errors = validate_frame_descriptions(candidate, ids, shots=scene_shots, names=cast_names(writer).values())
             if not last_errors:
                 accepted = candidate["items"]
                 break
@@ -1260,6 +1262,7 @@ def _run_frame_descriptions_body(prod: Path, *, brief: str = "", scene_ids: Opti
         [str(s.get("shot_id") or "") for s in shots] if not scene_ids else None,
         shots=shots,
         still_t0="error" if not scene_ids else "warning",
+        names=cast_names(writer).values(),
     )
     if errors:
         _dump_station(prod, "frame_desc", "invalid", {"errors": errors, "payload": payload})

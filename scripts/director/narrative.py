@@ -15,6 +15,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+# A required visual event kept for one frame proves it exists, not that a viewer can read it.
+# This is a floor, not a film standard: an object or state change usually needs longer, set per event.
+MIN_READABLE_VISUAL_SEC = 0.5
+# Speed changes compress or stretch the generated performance; beyond this the cut must say why.
+SPEED_CAP = 1.15
+
 
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -99,10 +105,22 @@ def contract_errors(contract: dict, shot_ids: list[str] | None = None) -> list[s
         if not item.get("expected_observation"):
             errors.append(f"{eid} needs expected_observation")
         try:
-            if number(item.get("min_visible_sec", 0)) < 0:
+            min_visible = required_visible_sec(item)
+            if min_visible < 0:
                 raise ValueError()
         except (ValueError, TypeError):
             errors.append(f"{eid} min_visible_sec must be finite and nonnegative")
+        else:
+            if (
+                item.get("channel", "visual") == "visual"
+                and item.get("required", True)
+                and min_visible < MIN_READABLE_VISUAL_SEC
+                and not str(item.get("brief_reason") or "").strip()
+            ):
+                errors.append(
+                    f"{eid} min_visible_sec {min_visible:g}s is below the {MIN_READABLE_VISUAL_SEC:g}s readable floor; "
+                    "raise it, or record brief_reason for an intentional flash"
+                )
     for item in events:
         if not isinstance(item.get("depends_on", []), list) or any(not isinstance(d, str) for d in item.get("depends_on", [])):
             errors.append(f"{item.get('event_id')} depends_on must be strings")
@@ -132,6 +150,38 @@ def contract_errors(contract: dict, shot_ids: list[str] | None = None) -> list[s
     for eid in by_id:
         visit(eid)
     return errors
+
+
+def required_visible_sec(event: dict) -> float:
+    """Seconds an observed event must survive the cut; a visual event without a value gets the readable floor."""
+    default = MIN_READABLE_VISUAL_SEC if event.get("channel", "visual") == "visual" else 0.0
+    return number(event.get("min_visible_sec", default))
+
+
+def speed_findings(cut: dict, cap: float = SPEED_CAP) -> list[str]:
+    """Used segments whose speed change carries no speed_reason.
+
+    Speeding a generated performance to fit paper seconds makes motion jerky and can push
+    story events out of the cut. Re-cut, regenerate or redesign instead; a deliberate
+    effect (slow motion, a still insert) records speed_reason on the timeline row.
+    """
+    rows = cut.get("timeline") if "timeline" in cut else cut.get("cuts")
+    findings: list[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict) or not row.get("used", True):
+            continue
+        try:
+            speed = number(row.get("speed", 1))
+        except (TypeError, ValueError):
+            continue  # normalize_cut reports a malformed speed
+        if speed <= 0 or str(row.get("speed_reason") or "").strip():
+            continue
+        if speed > cap + 1e-9 or speed < 1 / cap - 1e-9:
+            findings.append(
+                f"{row.get('shot_id') or '?'} speed {speed:g}x is outside {1 / cap:.2f}–{cap:.2f}x without speed_reason; "
+                "re-cut or redesign instead of compressing the performance"
+            )
+    return findings
 
 
 def normalize_cut(prod: Path, cut: dict, episode: Any = 1) -> list[dict]:
@@ -275,7 +325,7 @@ def check_event_coverage(prod: Path, contract: dict, evidence: dict, cut: dict, 
         if local_errors:
             details["status"] = "fail"
             errors.extend(local_errors)
-        elif event.get("required", True) and observed and (not merged or visible + 0.001 < number(event.get("min_visible_sec", 0))):
+        elif event.get("required", True) and observed and (not merged or visible + 0.001 < required_visible_sec(event)):
             details["status"] = "fail"
             errors.append(f"{eid} required observed event is omitted or too short in this cut")
         elif merged:

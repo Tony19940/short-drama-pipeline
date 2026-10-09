@@ -13,6 +13,7 @@ from .store import approvals_path, load_approvals, save_approvals
 AGENTS = [
     {"id": "0", "label": "小说", "tab": "story"},
     {"id": "A", "label": "编剧", "tab": "writer"},
+    {"id": "L", "label": "台词", "tab": "lines"},
     {"id": "B", "label": "资产", "tab": "art"},
     {"id": "C", "label": "分镜", "tab": "design"},
     {"id": "C1", "label": "说明书", "tab": "spec"},
@@ -23,15 +24,16 @@ AGENTS = [
     {"id": "F", "label": "剪辑", "tab": "edit"},
 ]
 AGENT_ORDER = [item["id"] for item in AGENTS]
-LOCKABLE = ["0", "A", "P", "B", "S", "C", "C1", "C2", "D", "E", "E+", "F"]
+LOCKABLE = ["0", "A", "L", "P", "B", "S", "C", "C1", "C2", "D", "E", "E+", "F"]
 
 UPSTREAM: dict[str, list[str]] = {
     "0": [],
     "A": ["0"],
+    "L": ["A"],
     "P": ["A"],
     "B": ["P", "A"],
     "S": ["B"],
-    "C": ["B", "P", "A", "0", "S"],
+    "C": ["B", "P", "A", "0", "S", "L"],
     "C1": ["C"],
     "C2": ["C1", "C", "B"],
     "D": ["C2", "C1", "C"],
@@ -41,8 +43,9 @@ UPSTREAM: dict[str, list[str]] = {
 }
 
 UNLOCK_DOWNSTREAM: dict[str, list[str]] = {
-    "0": ["A", "P", "B", "S", "C", "C1", "C2", "D", "E", "E+", "F"],
-    "A": ["P", "B", "S", "C", "C1", "C2", "D", "E", "E+", "F"],
+    "0": ["A", "L", "P", "B", "S", "C", "C1", "C2", "D", "E", "E+", "F"],
+    "A": ["L", "P", "B", "S", "C", "C1", "C2", "D", "E", "E+", "F"],
+    "L": ["C", "C1", "C2", "D", "E", "E+", "F"],
     "P": ["B", "S", "C", "C1", "C2", "D", "E", "E+", "F"],
     "B": ["S", "C", "C1", "C2", "D", "E", "E+", "F"],
     "S": ["C", "C1", "C2", "D", "E", "E+", "F"],
@@ -136,6 +139,9 @@ def agent_files(prod: Path, agent_id: str) -> list[Path]:
                 if path.is_file() and not _is_draft(path):
                     files.append(path)
         return files
+    if agent_id == "L":
+        _add_if_file(prod, ".pipeline/lines.json", files)
+        return files
     if agent_id == "P":
         for rel in ("01-bible/producer/plan.md", "01-bible/producer/manifest.json"):
             _add_if_file(prod, rel, files)
@@ -220,7 +226,7 @@ def _revision_agent_files(ctx, agent_id: str) -> list[Path]:
     files: list[Path] = []
     _add_if_file(prod, REGISTRY_REL, files)
     bases = {
-        "0": ("novel.json",), "A": ("writer.json",), "B": ("assets.json",),
+        "0": ("novel.json",), "A": ("writer.json",), "L": ("lines.json",), "B": ("assets.json",),
         "C": ("shot_list.json", "events.json", "narrative_reviews.json"),
         "C1": ("shot_specs.json",), "C2": ("gen_packages.json", "frame_descriptions.json"),
         "D": ("keyframes.json",), "E": ("clips.json", "event_evidence.json"),
@@ -309,16 +315,38 @@ def story_migrated(prod: Path) -> bool:
     return any(_exists(bible / name) for name in ("CAST.md", "blueprint.md", "ep01.md"))
 
 
+def _uses_pipeline(prod: Path) -> bool:
+    from .pipeline import uses_pipeline
+
+    return uses_pipeline(prod)
+
+
 def actually_locked(approvals: dict, agent_id: str) -> bool:
     return bool((approvals.get("gates") or {}).get(agent_id, {}).get("locked"))
+
+
+def lines_gate_in_use(prod: Path) -> bool:
+    """The dialogue gate binds an episode once its lines artifact exists."""
+    from .context import context_for
+
+    try:
+        return _exists(Path(prod) / context_for(prod).artifact_rel("lines.json"))
+    except (OSError, ValueError):
+        return False
 
 
 def virtual_locked(prod: Path, agent_id: str, files: dict, approvals: dict) -> bool:
     from .context import context_for
 
+    if agent_id == "L" and not actually_locked(approvals, "L"):
+        # Shows that never had a dialogue gate keep working; a written lines artifact must be reviewed.
+        return not lines_gate_in_use(prod)
     if context_for(prod).mode == "registered":
         return False
     if actually_locked(approvals, agent_id):
+        return False
+    if agent_id in {"C1", "C2", "D"} and _uses_pipeline(prod):
+        # Pipeline shows produce specs, packages and reviewed keyframes; an absent artifact is not a pass.
         return False
     if agent_id == "0":
         return story_migrated(prod) or actually_locked(approvals, "A")
@@ -389,6 +417,8 @@ def previous_satisfied(prod: Path, gate_id: str, files: dict, approvals: dict) -
             if has_source:
                 return is_locked(prod, "0", files, approvals)
         return True
+    if gate_id == "L":
+        return is_locked(prod, "A", files, approvals)
     if gate_id == "P":
         return is_locked(prod, "A", files, approvals)
     if gate_id == "B":
@@ -396,14 +426,19 @@ def previous_satisfied(prod: Path, gate_id: str, files: dict, approvals: dict) -
     if gate_id == "S":
         return is_locked(prod, "B", files, approvals)
     if gate_id == "C":
-        return actually_locked(approvals, "S") or is_locked(prod, "B", files, approvals)
+        staged = actually_locked(approvals, "S") or is_locked(prod, "B", files, approvals)
+        return staged and is_locked(prod, "L", files, approvals)
     if gate_id == "C1":
         return is_locked(prod, "C", files, approvals)
     if gate_id == "C2":
         return is_locked(prod, "C1", files, approvals) or is_locked(prod, "C", files, approvals)
     if gate_id == "D":
+        if _uses_pipeline(prod):
+            return is_locked(prod, "C2", files, approvals)
         return is_locked(prod, "C2", files, approvals) or actually_locked(approvals, "C")
     if gate_id == "E":
+        if _uses_pipeline(prod):
+            return is_locked(prod, "D", files, approvals)
         return is_locked(prod, "D", files, approvals) or actually_locked(approvals, "C")
     if gate_id == "E+":
         return is_locked(prod, "E", files, approvals) or actually_locked(approvals, "D")
@@ -427,6 +462,7 @@ def draft_paths(prod: Path, agent_id: str) -> list[str]:
             "01-bible/script.draft.txt",
             "01-bible/overview.draft.json",
         ],
+        "L": [".pipeline/lines.json"],
         "P": [
             "01-bible/producer/plan.draft.md",
             "01-bible/producer/manifest.draft.json",

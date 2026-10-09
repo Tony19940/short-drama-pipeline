@@ -36,6 +36,21 @@ CAST_ALIASES = {
 }
 
 
+def _writer_scenes(prod: Path, episode: int = 1) -> list[dict]:
+    """This episode's scenes from the writer handoff; shows without `.pipeline/writer.json` return []."""
+    from .pipeline import read_artifact
+
+    scenes = read_artifact(prod, "writer.json").get("scenes") or []
+    out = []
+    for scene in scenes:
+        try:
+            if int(scene.get("episode_no") or 1) == int(episode):
+                out.append(scene)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _cast_slugs(prod: Path) -> list[str]:
     slugs: list[str] = []
     cast = read_text(prod, "01-bible/CAST.md")
@@ -44,6 +59,12 @@ def _cast_slugs(prod: Path) -> list[str]:
         slug = CAST_ALIASES.get(first, _slug_token(first))
         if slug and slug not in slugs:
             slugs.append(slug)
+    # Pipeline shows keep their cast in writer.json (present_cast ids); CAST.md is the older layout.
+    for scene in _writer_scenes(prod):
+        for raw in scene.get("present_cast") or []:
+            slug = _slug_token(str(raw))
+            if slug and slug not in slugs:
+                slugs.append(slug)
     char_root = prod / "02-assets" / "characters"
     if char_root.exists():
         for child in sorted(char_root.iterdir()):
@@ -60,6 +81,10 @@ def _scene_ids(prod: Path) -> list[str]:
         for item in data.get("sets") or []:
             if item.get("id") and item["id"] not in ids:
                 ids.append(item["id"])
+    for scene in _writer_scenes(prod):
+        loc = _slug_token(str(scene.get("location_id") or ""))
+        if loc and loc not in ids:
+            ids.append(loc)
     scene_root = prod / "02-assets" / "scenes"
     if scene_root.exists():
         for child in sorted(scene_root.iterdir()):
@@ -139,7 +164,9 @@ def build_manifest(prod: Path) -> dict:
     shot_count = int(files.get("shot_count") or 0)
     seconds = 0
     shots_path = prod / "03-storyboard" / "shots.json"
-    if shots_path.exists():
+    from .gates import is_template_copy
+
+    if shots_path.exists() and not is_template_copy(prod, "03-storyboard/shots.json"):
         shots = json.loads(shots_path.read_text(encoding="utf-8")).get("shots") or []
         seconds = sum(int(s.get("seconds") or 0) for s in shots)
         shot_count = shot_count or len(shots)

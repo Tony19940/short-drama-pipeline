@@ -220,7 +220,7 @@ class DirectorTests(unittest.TestCase):
         self.assertTrue(health.json()["ok"])
         prod = client.get("/api/productions/003-sreymom-engagement")
         self.assertEqual(prod.status_code, 200)
-        self.assertEqual(len(prod.json()["gates"]["gates"]), 10)
+        self.assertEqual(len(prod.json()["gates"]["gates"]), 11)
         blocked = client.post("/api/productions/003-sreymom-engagement/render", json={"shotIds": ["SH001"]})
         self.assertEqual(blocked.status_code, 409)
 
@@ -465,6 +465,26 @@ class DirectorTests(unittest.TestCase):
                 self.assertFalse((dest / "03-storyboard" / "shots.draft.json").exists())
             finally:
                 paths.PRODUCTIONS = old
+
+    def test_gate_a_rejects_untouched_template_copies(self) -> None:
+        # 012 found it: a fresh copy of _template made Gate A report "剧本/确认/蓝图齐全" with no script at all.
+        from director.gates import gate_file_ready
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = Path(tmp) / "012-demo"
+            shutil.copytree(ROOT / "productions" / "_template", prod)
+            ready, reason = gate_file_ready(prod, "A")
+            self.assertFalse(ready)
+            self.assertIn("仍是空模板", reason)
+            for name in ("confirm.md", "blueprint.md"):
+                path = prod / "01-bible" / name
+                path.write_text(path.read_text(encoding="utf-8") + "\n| 画风 | 二维赛璐璐 |\n", encoding="utf-8")
+            ready, reason = gate_file_ready(prod, "A")
+            self.assertFalse(ready)
+            self.assertIn("episode", reason)
+            (prod / "01-bible" / "ep01.md").write_text("# 第 01 集：坑\n\n场 1 · 考古探方 · 黄昏\n", encoding="utf-8")
+            ready, reason = gate_file_ready(prod, "A")
+            self.assertTrue(ready, reason)
 
 
     def test_reverse_video_writes_draft_not_official_shots(self) -> None:
@@ -1170,8 +1190,8 @@ class DirectorTests(unittest.TestCase):
 
     def test_eight_agents_and_legacy_locks(self) -> None:
         snap = snapshot(PROD)
-        self.assertEqual(len(snap["gates"]), 10)
-        self.assertEqual([g["id"] for g in snap["gates"]], ["0", "A", "B", "C", "C1", "C2", "D", "E", "E+", "F"])
+        self.assertEqual(len(snap["gates"]), 11)
+        self.assertEqual([g["id"] for g in snap["gates"]], ["0", "A", "L", "B", "C", "C1", "C2", "D", "E", "E+", "F"])
         with tempfile.TemporaryDirectory() as tmp:
             prod = Path(tmp) / "003"
             shutil.copytree(PROD, prod, ignore=shutil.ignore_patterns(".director", "05-shots", "06-export"))
@@ -1243,6 +1263,29 @@ class DirectorTests(unittest.TestCase):
             self.assertIn("manifest.draft.json", tasks["drafts"])
             self.assertFalse((prod / "01-bible" / "producer" / "manifest.json").exists())
 
+    def test_producer_reads_cast_and_sets_from_writer_handoff(self) -> None:
+        # 012 found it: with no CAST.md and no asset folders the gap list was empty and claimed "filmable".
+        from director.producer import build_manifest
+
+        with tempfile.TemporaryDirectory() as tmp:
+            prod = Path(tmp) / "012-demo"
+            shutil.copytree(ROOT / "productions" / "_template", prod)
+            (prod / ".pipeline").mkdir()
+            (prod / ".pipeline" / "writer.json").write_text(json.dumps({"scenes": [
+                {"scene_id": "EP01_SC01", "episode_no": 1, "location_id": "modern-dig", "present_cast": ["dara", "vibol"]},
+                {"scene_id": "EP01_SC02", "episode_no": 1, "location_id": "camp-graves", "present_cast": ["dara", "kosal"]},
+                {"scene_id": "EP02_SC01", "episode_no": 2, "location_id": "camp", "present_cast": ["sambath"]},
+            ]}, ensure_ascii=False), encoding="utf-8")
+            manifest = build_manifest(prod)
+            self.assertEqual(manifest["characters"], ["dara", "vibol", "kosal"])
+            self.assertEqual(manifest["scenes"], ["modern-dig", "camp-graves"])
+            self.assertEqual(manifest["task_count"], 5)
+            self.assertFalse(manifest["filmable"])
+            # The template's placeholder shots.json (one SH001) is not a storyboard.
+            self.assertEqual(manifest["shot_count"], 0)
+            from director.gates import inspect_files
+            self.assertEqual(inspect_files(prod)["frames"], [])
+
     def test_line_kind_aliases_and_gpu_caps(self) -> None:
         from director.gpu_caps import gpu_capabilities
         from director.production import save_shots
@@ -1274,7 +1317,7 @@ class DirectorTests(unittest.TestCase):
             prod = Path(tmp) / "004"
             shutil.copytree(src, prod)
             data = snapshot(prod)
-            self.assertEqual(len(data["gates"]), 10)
+            self.assertEqual(len(data["gates"]), 11)
             by_id = {g["id"]: g for g in data["gates"]}
             self.assertTrue(by_id["0"]["locked"] or by_id["0"].get("migrated"))
             self.assertTrue(by_id["C"]["locked"])
@@ -1305,6 +1348,17 @@ class DirectorTests(unittest.TestCase):
         sound = prompt_block("edit")
         self.assertIn("意图", sound)
         self.assertNotIn("可灵 9 字段", writer)
+
+    def test_knowledge_budget_flows_to_truncated_layers(self) -> None:
+        from director.knowledge import DIRECTOR_BUDGET, load_for
+
+        frame = load_for("frame_desc")
+        design = load_for("design")
+        # frame_desc splits the budget four ways; small art/camera layers must not leave the playbook cut off.
+        self.assertEqual(frame["director"], design["director"])
+        self.assertIn("情绪值", frame["director"])
+        self.assertLessEqual(sum(len(v) for v in frame.values()), DIRECTOR_BUDGET)
+        self.assertLessEqual(len(design["cases"]), DIRECTOR_BUDGET // 3)
 
     def test_storyboard_grid_is_preview_only(self) -> None:
         from director.grid import storyboard_grid
